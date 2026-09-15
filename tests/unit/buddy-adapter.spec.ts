@@ -978,7 +978,7 @@ export { CHAT_API_BASE }
 describe('产品参数化', () => {
   it('默认构造时 providerInfo 返回 buddy', () => {
     expect(makeAdapter().providerInfo('buddy')).toMatchObject({
-      id: 'buddy', name: 'CodeBuddy (腾讯)',
+      id: 'buddy', name: 'CodeBuddy (国内版)',
     })
   })
 

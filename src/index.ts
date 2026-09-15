@@ -8,7 +8,7 @@ import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { AccountPool } from './account-pool.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
-import { CODEBUDDY, WORKBUDDY } from './product.js'
+import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY } from './product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 
 export const name = 'codearts-auth'
@@ -101,23 +101,9 @@ export function apply(ctx: Context): void {
   // WorkBuddy（workbuddy）路由 —— 后者由 registerBuddyLlm 以
   // `llm-${product.id}` 派生，漏注册会让模型设置页在
   // `refFor → deriveKeyRef(provider)` 处以 `provider.toUpperCase is not a function` 崩溃。
-  registerProviderSettings(ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts')
+  registerProviderSettings(ctx, 'llm-codearts', ...ALL_PRODUCTS.map((p) => `llm-${p.id}`))
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
-
-  // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
-  // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
-  // 用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理掉。
-  // 判据是「凭据 domain ≠ 产品 apiDomain」，只清真正失配的条目。
-  void pool.pruneAccountsWithForeignDomain(WORKBUDDY).then((removed) => {
-    if (removed.length > 0) {
-      ctx.logger.info(
-        `[jet-hub] 已清理 ${removed.length} 个 WorkBuddy 旧版（中国版）账号，请重新登录：${removed.join(', ')}`,
-      )
-    }
-  }).catch((error: unknown) => {
-    ctx.logger.warn(`[jet-hub] 清理 WorkBuddy 旧版账号失败：${String(error)}`)
-  })
 
   ctx.commands.register({
     name: 'codearts-login',
@@ -186,90 +172,63 @@ export function apply(ctx: Context): void {
     refresh: () => service.refresh(),
     fetchRemoteModels: () => service.refreshModels(),
     accountPool: pool,
+    skipConfigurableRegistration: true,
   })
 
-  // ===== Buddy (腾讯 CodeBuddy) 服务 =====
-  // 不注册斜杠命令：登录/状态/续期都在 Jet Hub 设置页完成（多账号 + 账号池），
-  // 命令式的单凭据入口已无必要。
-  const buddy = new BuddyAuth(ctx)
-  registerBuddyLlm(ctx, {
-    credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
-    resolveCredential: async () => {
-      // 优先使用账号池获取可用账号，回退到单凭据解析
-      if (pool) {
-        const available = await pool.getAvailableAccount('buddy', '')
-        if (available) return available.credential as BuddyCredential
-      }
-      const resolved = await ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as BuddyCredential
-      } catch {
-        return undefined
-      }
-    },
-    refresh: () => buddy.refresh(),
-    fetchRemoteModels: () => buddy.fetchModels(pool),
-    readImage: makeReadImage(ctx),
-    accountPool: pool,
-    product: CODEBUDDY,
-  })
+  // ===== CodeBuddy / WorkBuddy 系服务注册 =====
+  const buddyServices = new Map<string, BuddyAuth>()
+  for (const product of ALL_PRODUCTS) {
+    const auth = new BuddyAuth(ctx, { product })
+    buddyServices.set(product.id, auth)
 
-  // ===== WorkBuddy (腾讯 WorkBuddy) 服务 =====
-  // 与 CodeBuddy 同源（同后端、同协议），差异全部由 product 配置承载。
-  // 服务名由 BuddyAuth 依 product.id 派生，故两个产品分别注册为
-  // ctx.buddyAuth / ctx.workbuddyAuth，互不覆盖。
-  // 同样不注册斜杠命令：入口在 Jet Hub 的 WorkBuddy 面板。
-  const workbuddy = new BuddyAuth(ctx, { product: WORKBUDDY })
-  registerBuddyLlm(ctx, {
-    credentialRef: credentialRef(WORKBUDDY.defaultCredentialRef),
-    resolveCredential: async () => {
-      // 只从 workbuddy 的账号池取账号，回退到 WorkBuddy 自己的单凭据 ref，
-      // 保证不会串用 CodeBuddy 的凭据。
-      const available = await pool.getAvailableAccount('workbuddy', '')
-      if (available) return available.credential as BuddyCredential
-      const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY.defaultCredentialRef))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as BuddyCredential
-      } catch {
-        return undefined
-      }
-    },
-    refresh: () => workbuddy.refresh(),
-    fetchRemoteModels: () => workbuddy.fetchModels(pool),
-    readImage: makeReadImage(ctx),
-    accountPool: pool,
-    product: WORKBUDDY,
-  })
+    registerBuddyLlm(ctx, {
+      credentialRef: credentialRef(product.defaultCredentialRef),
+      resolveCredential: async () => {
+        if (pool) {
+          const available = await pool.getAvailableAccount(product.id, '')
+          if (available) return available.credential as BuddyCredential
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(product.defaultCredentialRef))
+        if (!resolved) return undefined
+        try {
+          return JSON.parse(resolved.value) as BuddyCredential
+        } catch {
+          return undefined
+        }
+      },
+      refresh: () => auth.refresh(),
+      fetchRemoteModels: () => auth.fetchModels(pool),
+      readImage: makeReadImage(ctx),
+      accountPool: pool,
+      product,
+      skipConfigurableRegistration: true,
+    })
+  }
 
   // ===== 多账号静默续期调度 =====
-  // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
-  const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
+  const REFRESH_INTERVAL_MS = 30 * 60 * 1000 // 每 30 分钟检查一次
 
   async function refreshAllCredentials(): Promise<void> {
     try {
       await service.refreshAll(pool)
     } catch { /* 静默 */ }
-    try {
-      await buddy.refreshAll(pool)
-    } catch { /* 静默 */ }
-    try {
-      await workbuddy.refreshAll(pool)
-    } catch { /* 静默 */ }
+    for (const auth of buddyServices.values()) {
+      try {
+        await auth.refreshAll(pool)
+      } catch { /* 静默 */ }
+    }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期
-  pool.listAllAccounts().then(accounts => {
-    const hasRefreshable = accounts.some(a => a.refreshable && a.enabled)
+  pool.listAllAccounts().then((accounts) => {
+    const hasRefreshable = accounts.some((a) => a.refreshable && a.enabled)
     if (hasRefreshable) {
       const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
       refreshTimer.unref?.()
       ctx.effect(() => () => {
         clearInterval(refreshTimer)
         service.stop()
-        buddy.stop()
-        workbuddy.stop()
+        for (const auth of buddyServices.values()) auth.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -277,11 +236,114 @@ export function apply(ctx: Context): void {
   // 保留旧的 stop scheduler（兼容旧命令）
   ctx.effect(() => () => {
     service.stop()
-    buddy.stop()
-    workbuddy.stop()
+    for (const auth of buddyServices.values()) auth.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
+  // ===== 动态同步“设置 -> 模型”可配置提供方列表 =====
+  // 规则：删除对应账号后，没有可用/生效账号的提供方从模型列表中移除；
+  // 仍有有效/启用账号的提供方予以保留，不予删除。
+  interface ConfigurableProviderEntry {
+    provider: string
+    displayName: string
+    settingsNs: string
+    settingsPath: string[]
+  }
+
+  const CODEARTS_DIRECTORY_ENTRY: ConfigurableProviderEntry = {
+    provider: 'codearts',
+    displayName: 'CodeArts Agent',
+    settingsNs: 'llm-codearts',
+    settingsPath: [],
+  }
+
+  let dirHandle: { replace(entries: ConfigurableProviderEntry[]): void } | undefined
+  let currentRegistered = new Set<string>()
+
+  async function syncConfigurableProviders(): Promise<void> {
+    const accounts = await pool.listAllAccounts()
+    const activeEntries: ConfigurableProviderEntry[] = []
+
+    // 1. 检查 CodeArts 是否有可用账号或有效凭据
+    const hasCodeArtsAccount = accounts.some((a) => a.provider === 'codearts' && a.enabled !== false)
+    let hasCodeArtsCred = false
+    if (!hasCodeArtsAccount) {
+      try {
+        const resolved = await ctx.credentials?.resolve?.(credentialRef(CODEARTS_CREDENTIAL_REF))
+        if (resolved && resolved.value) hasCodeArtsCred = true
+      } catch { /* 静默 */ }
+    }
+    if (hasCodeArtsAccount || hasCodeArtsCred) {
+      activeEntries.push(CODEARTS_DIRECTORY_ENTRY)
+    }
+
+    // 2. 检查 CodeBuddy / WorkBuddy 各产品是否有可用账号或有效凭据
+    for (const product of ALL_PRODUCTS) {
+      const hasAccount = accounts.some((a) => a.provider === product.id && a.enabled !== false)
+      let hasCred = false
+      if (!hasAccount) {
+        try {
+          const resolved = await ctx.credentials?.resolve?.(credentialRef(product.defaultCredentialRef))
+          if (resolved && resolved.value) hasCred = true
+        } catch { /* 静默 */ }
+      }
+      if (hasAccount || hasCred) {
+        activeEntries.push({
+          provider: product.id,
+          displayName: product.displayName,
+          settingsNs: `llm-${product.id}`,
+          settingsPath: [],
+        })
+      }
+    }
+
+    const nextSet = new Set(activeEntries.map((e) => e.provider))
+    if (
+      dirHandle !== undefined &&
+      nextSet.size === currentRegistered.size &&
+      [...nextSet].every((p) => currentRegistered.has(p))
+    ) {
+      return
+    }
+
+    if (dirHandle !== undefined) {
+      dirHandle.replace(activeEntries)
+      currentRegistered = nextSet
+    } else if (activeEntries.length > 0) {
+      dirHandle = ctx.llm.registerConfigurableProviders(activeEntries)
+      currentRegistered = nextSet
+    }
+  }
+
+  // 顺序 Promise 队列，杜绝启动与事件监听间的并发竞态
+  let syncQueue = Promise.resolve()
+
+  function queueSync(): Promise<void> {
+    syncQueue = syncQueue.then(async () => {
+      await syncConfigurableProviders()
+    }).catch((err) => {
+      ctx.logger?.warn?.(`[jet-hub] syncConfigurableProviders failed: ${String(err)}`)
+    })
+    return syncQueue
+  }
+
+  // 初始触发一次同步
+  void queueSync()
+
+  // 账号池变更（添加账号、删除账号、切换启用状态）时联动刷新
+  const unbindAccountsListener = pool.onAccountsChanged(() => queueSync())
+
+  ctx.effect(() => () => {
+    unbindAccountsListener()
+    if (dirHandle) {
+      try {
+        (dirHandle as unknown as () => void)()
+      } catch { /* 静默 */ }
+      dirHandle = undefined
+      currentRegistered.clear()
+    }
+  }, 'jet-hub: dynamic configurable providers sync')
+
   // ===== Jet Hub RPC 注册 =====
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy)
+  registerJetHubRpc(ctx, pool, service, buddyServices)
   ctx.provide('accountPool', pool)
 }

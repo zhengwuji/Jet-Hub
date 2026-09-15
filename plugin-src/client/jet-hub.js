@@ -9,7 +9,9 @@ const WORKBUDDY_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEgAAABICA
 
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
-  { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
+  { id: 'buddy', label: 'CodeBuddy (国内版)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
+  { id: 'buddy-intl', label: 'CodeBuddy (国际版)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
+  { id: 'workbuddy-cn', label: 'WorkBuddy (国内版)', icon: WORKBUDDY_ICON, logoClass: 'workbuddy' },
   { id: 'workbuddy', label: 'WorkBuddy (国际版)', icon: WORKBUDDY_ICON, logoClass: 'workbuddy' },
 ]);
 
@@ -21,7 +23,7 @@ const PROVIDERS = Object.freeze([
  * `/v2/billing/meter/get-dosage-notify` 用量通知），故其面板不渲染领取按钮。
  * CodeArts 是华为云账号体系，同样不参与。
  */
-const CREDITS_PROVIDERS = Object.freeze(['buddy'])
+const CREDITS_PROVIDERS = Object.freeze(['buddy', 'workbuddy-cn'])
 
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find(p => p.id === provider);

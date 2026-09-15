@@ -83,6 +83,25 @@ export class AccountPool {
   private cache: ProviderAccountEntry[] = []
   /** 是否已从 settings scope 完成首次载入。 */
   private loaded = false
+  private listeners: Array<() => void | Promise<void>> = []
+
+  /** 订阅账号池变更事件（新增/删除/更新/清理时触发）。返回退订函数。 */
+  onAccountsChanged(listener: () => void | Promise<void>): () => void {
+    this.listeners.push(listener)
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== listener)
+    }
+  }
+
+  private async notifyAccountsChanged(): Promise<void> {
+    for (const listener of this.listeners) {
+      try {
+        await listener()
+      } catch (error) {
+        this.ctx.logger?.warn?.(`[jet-hub] onAccountsChanged listener error: ${String(error)}`)
+      }
+    }
+  }
 
   constructor(private readonly ctx: Context) {
     const settings = this.ctx.get('settings') as SettingsServiceLike | undefined
@@ -126,9 +145,11 @@ export class AccountPool {
     this.loaded = true
     if (!this.scope) {
       this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，账号变更未持久化')
+      await this.notifyAccountsChanged()
       return
     }
     await this.scope.replace({ accounts })
+    await this.notifyAccountsChanged()
   }
 
   /** 列出某个 provider 的所有账号（含状态信息） */

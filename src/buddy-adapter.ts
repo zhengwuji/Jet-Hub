@@ -146,6 +146,8 @@ const EFFORT_NAMES: Readonly<Record<string, string>> = {
 }
 
 export interface BuddyAdapterOptions {
+  /** 跳过由本函数主动向 ctx.llm 注册 configurableProviders（由外部按账号存在性动态管理）。 */
+  skipConfigurableRegistration?: boolean
   credentialRef: CredentialRef
   /** 前缀缓存会话标识（prompt_cache_key）；未提供时随机生成一个。 */
   sessionId?: string
@@ -1059,8 +1061,10 @@ function isCredentialExpired(credential: BuddyCredential): boolean {
  */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): void {
   const product = options.product ?? CODEBUDDY
-  ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
-  ])
+  if (!options.skipConfigurableRegistration) {
+    ctx.llm.registerConfigurableProviders([
+      { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    ])
+  }
   ctx.llm.registerAdapter([product.id], new BuddyAdapter(options))
 }

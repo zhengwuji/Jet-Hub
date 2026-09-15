@@ -1,301 +1,222 @@
-# dsh-codearts-auth
+# Jet Hub - DeepSeek Harness 凭据管理与多账号统一网关插件
 
-deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走新式 IAM OAuth
-（portal `/authorize` 授权 → 本地 `/oauth/callback` 回调 → STS token 端点换取含
-`refresh_token` 的凭据），到期前静默续期，无需再次打开浏览器；旧 ticket 流程保留
-为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
-凭证可直接用于 CodeArts 后端模型调用。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-DeepSeek%20Harness%20%7C%20DSH%20Desktop-orange.svg)](#)
+[![Node](https://img.shields.io/badge/Node-%3E%3D22.0.0-green.svg)](#)
 
-此外插件内置另外两个 provider 路由：
+**Jet Hub** 是专为 **DeepSeek Harness (DSH Desktop)** 深度定制的第三方多模型渠道凭据托管与统一接入网关插件。
 
-- **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
-  另支持「一键领取积分」（每日签到）。
-- **workbuddy（腾讯 WorkBuddy 国际版）** — 见 [WorkBuddy provider](#workbuddy-provider)。
+它支持将**华为云 CodeArts**、**腾讯 CodeBuddy（国内版/国际版）**、**腾讯 WorkBuddy（国内版/国际版）** 等平台的 AI 模型无缝接入 DSH 环境中，提供现代化的图形管理面板、多账号池智能轮换、后台静默自动续期、以及与 DSH 模型目录的动态联动管理。
 
-## 安装
+---
 
-该包尚未发布到 npm registry。提供两种安装方式：**git 仓库安装**（推荐，自动拉取
-并构建）和**源码目录安装**（本地开发联调）。
+## 目录
 
-### 方式一：从 git 仓库安装（推荐）
+- [核心特性](#-核心特性)
+- [支持渠道与模型](#-支持渠道与模型)
+- [架构设计与工作原理](#-架构设计与工作原理)
+- [安装教程](#-安装教程)
+- [详细使用教程](#-详细使用教程)
+- [动态模型联动机制说明](#-动态模型联动机制说明)
+- [常见问题排查 (FAQ)](#-常见问题排查-faq)
+- [本地开发与编译](#-本地开发与编译)
+- [开源协议](#-开源协议)
 
-先在 profile 的 `pnpm-workspace.yaml` 中放行该包的 build 脚本
-（路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）：
+---
 
-```yaml
-allowBuilds:
-  dsh-codearts-auth@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git: true
+## 🌟 核心特性
+
+1. **全渠道平台原生适配**
+   - **华为云 CodeArts Agent**：基于 IAM OAuth2 授权与 STS 临时凭据，接入华为 Snap-Access 网关，完整支持 `SDK-HMAC-SHA256` 鉴权与实时推理。
+   - **腾讯 CodeBuddy / WorkBuddy**：完整支持国内版（`copilot.tencent.com`）与国际版（`codebuddy.ai` / `workbuddy.ai`）全系生态。
+2. **多账号池管理与智能轮换 (Account Pool)**
+   - 支持在单一平台下配置多个账号。
+   - 自动检测账号健康状态、配额与限流情况，支持跨账号轮换或故障转移，轻松突破单账号频率上限。
+3. **静默自动保活与平滑续期 (Auto-Refresh)**
+   - 后台调度器以 30 分钟为周期自动巡检所有已启用账号。
+   - 在 Access Token 或临时凭证过期前通过 Refresh Token 自动静默置换新凭证，保障日常会话不中断。
+4. **动态模型目录联动（按需加载，干净整洁）**
+   - **有账号则自动挂载**：在 Jet Hub 中成功配置账号后，DSH“设置 -> 模型”列表会自动挂载对应 Provider。
+   - **无账号则自动清理**：当删除某渠道下的所有账号且无遗留凭据时，模型列表中会自动注销并隐藏对应 Provider（例如删除华为云账号后，`CodeArts Agent` 会自动消失），杜绝僵尸配置堆叠。
+5. **深度集成 DSH Desktop 流式与思考生态**
+   - 严格对齐 DSH LLM 协议标准，完整支持 SSE 流式分块传输。
+   - 完美适配大模型深度思考链（`<think>...</think>` 推理内容折叠展示）。
+   - 支持超长上下文窗口及多模态图文输入。
+6. **现代化可视化控制面板 (Jet Hub UI)**
+   - 基于 WebComponent 构建的高颜值界面，集成于 DSH 侧边栏与设置中心。
+   - 提供直观的多 Tab 切换、账号测速（Ping/Probe）、一键签到领积分、一键启用/禁用等管理功能。
+
+---
+
+## 🎯 支持渠道与模型
+
+| 渠道标识 | 界面显示名称 | 服务端点 | 认证方式 | 代表模型 | 独家特性 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `codearts` | **CodeArts Agent** | `snap-access.cn-north-4.myhuaweicloud.com` | 华为云 IAM OAuth | GLM-5.2 / GLM-5.3-Flash / DeepSeek-V4 | SDK-HMAC 签名、自动换取 STS 凭证 |
+| `buddy` | **CodeBuddy (国内版)** | `copilot.tencent.com` | 腾讯 OAuth / 扫码 / 验证码 | DeepSeek-V4-Pro / GLM-5.3 / MiniMax-M3 | 每日签到领积分、额度实时查询 |
+| `buddy-intl` | **CodeBuddy (国际版)** | `codebuddy.ai` | 国际站 OAuth 授权 | GPT-6-Astra / GPT-5.6-Sol / Gemini-3.5-Flash | 海外高规格模型直连 |
+| `workbuddy-cn`| **WorkBuddy (国内版)** | `copilot.tencent.com` | 企微 / 企业协同凭据 | DeepSeek-V4-Flash / GLM-5.2 / Kimi-K3 | 企业/团队专属配额支持 |
+| `workbuddy` | **WorkBuddy (国际版)** | `workbuddy.ai` | 国际企业工作站授权 | GPT-5.6-Terra / GPT-5.5 / Kimi-K3 | 全球化多模型智能路由 |
+
+---
+
+## 🏗️ 架构设计与工作原理
+
+```
+   ┌──────────────────────────────────────────────────────────┐
+   │                    DSH Desktop (前端)                    │
+   │   [设置 -> Jet Hub 面板]          [设置 -> 模型配置列表]   │
+   └───────────────┬──────────────────────────▲───────────────┘
+                   │ RPC (jet-hub/*)          │ 动态 Provider 注册/注销
+                   ▼                          │
+   ┌──────────────────────────────────────────────────────────┐
+   │                  Jet Hub 插件核心 (Cordis)                │
+   │                                                          │
+   │   ┌──────────────────┐          ┌────────────────────┐   │
+   │   │  AccountPool     ├─────────►│ syncConfigurable   │   │
+   │   │  多账号池持久化   │ 事件广播  │ Providers          │   │
+   │   └────────┬─────────┘          └────────────────────┘   │
+   │            │                                             │
+   │            ▼                                             │
+   │   ┌──────────────────┐          ┌────────────────────┐   │
+   │   │ Auto Refresh     │          │ LLM Adapters       │   │
+   │   │ 周期静默续期     │          │ CodeArts / Buddy   │   │
+   │   └──────────────────┘          └─────────┬──────────┘   │
+   └───────────────────────────────────────────┼──────────────┘
+                                               ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │                     云端模型网关 API                      │
+   │   - 华为云 Snap Access (IAM / STS 签名)                   │
+   │   - 腾讯云 Copilot / CodeBuddy / WorkBuddy API           │
+   └──────────────────────────────────────────────────────────┘
 ```
 
-再用 `dsh plugin add` 从 gitee 拉取并安装：
+1. **凭据隔离**：账号敏感 Token 保存在 DSH 内部凭据系统（`.credentials.yaml`），配置元数据保存在 `settings.yaml`，保障多账号安全性。
+2. **事件总线**：账号的增添、删除、开关状态切换统一通过 `AccountPool.notifyAccountsChanged` 广播。
+3. **动态同步**：收到广播后，`syncConfigurableProviders` 计算当前活跃渠道集合，调用 `ctx.llm.registerConfigurableProviders` 原子替换模型目录，实现与界面的毫秒级联动。
 
-```sh
-dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codearts.git"
+---
+
+## 📦 安装教程
+
+### 方式一：通过 Git 仓库直接安装（推荐）
+
+在 DSH Desktop 所属运行环境或通过终端执行命令：
+
+```bash
+dsh plugin --profile web add "https://github.com/zhengwuji/Jet-Hub.git"
 ```
 
-`add` 以 `git+https` 方式安装，pnpm 会运行 `prepare` 脚本自动构建 `lib/`，无需
-手动 `pnpm build`。每次升级时重新 `add` 即可拉取最新版本并重建。
+> **提示**：安装过程中，`pnpm` 会自动调用 `prepare` 脚本编译生成产物，无需额外手动打包。
 
-### 方式二：从源码目录安装（本地开发）
+---
 
-先在本仓库中构建 `lib/`，再用 `dsh plugin install` 将本地检出安装为 pnpm `link:`
-依赖（指向本目录）：
+### 方式二：本地源码编译与部署
 
-```sh
+如果你下载了本项目源码或需要进行二次开发：
+
+1. **克隆代码仓库**：
+   ```bash
+   git clone https://github.com/zhengwuji/Jet-Hub.git
+   cd Jet-Hub
+   ```
+
+2. **安装依赖并编译**：
+   ```bash
+   pnpm install
+   pnpm build:all
+   ```
+
+3. **部署至 DSH 插件目录**：
+   将编译后的目录整体放置或软链接到 DSH Desktop 的 profile 扩展目录中：
+   - **Windows 生产目录**：
+     `%APPDATA%\dsh-desktop\harness\profiles\.generations\live\dsh-codearts-auth+0.1.0+xxxx\node_modules\dsh-codearts-auth`
+   - 重启 DSH Desktop 即可生效。
+
+---
+
+## 📖 详细使用教程
+
+### 步骤一：进入 Jet Hub 管理界面
+1. 启动 **DSH Desktop**。
+2. 点击左侧工具栏底部的 **设置 (Settings)** 图标。
+3. 在左侧菜单列表中找到并点击 **Jet Hub**，即可打开凭据与多账号管理中心。
+
+### 步骤二：添加新账号
+1. 在 Jet Hub 界面左侧选择需要添加的目标渠道（例如：`CodeArts (华为云)` 或 `CodeBuddy (国内版)`）。
+2. 点击右上角的 **+ 新建账号** 按钮。
+3. 系统会自动调起默认系统浏览器，打开官方授权登录页面：
+   - **华为云**：登录您的华为云账户并点击“确认授权”。
+   - **CodeBuddy / WorkBuddy**：支持微信扫码、手机号验证码或企业微信授权。
+4. 授权成功后，浏览器会重定向到本地回调端口，Jet Hub 将自动完成 Token 兑换，并展示“账号授权成功”提示。
+5. 此时返回 Jet Hub，界面将展示当前账号的昵称、账号 ID、过期时间与有效状态。
+
+### 步骤三：账号管理与功能操作
+- **一键测速 (重测所有 / 单账号重测)**：点击卡片上的测速按钮，系统会向对应平台发送探针请求，返回当前网络延迟与连通状态。
+- **每日领积分 (CodeBuddy 专属)**：CodeBuddy 渠道卡片提供了“一键领取 / 签到”按钮，可直接获取官方免费赠送额度。
+- **启用 / 停用账号**：通过开关按钮可以临时停用某个账号，被停用的账号不会参与模型调用。
+- **删除账号**：点击垃圾桶图标即可移除不再使用的账号。
+
+### 步骤四：在模型列表中使用
+1. 账号添加成功后，切换到设置菜单中的 **模型 (Models)** 分页。
+2. 此时对应的 Provider（例如 `CodeBuddy (国内版)` 或 `CodeArts Agent`）已自动挂载至列表中。
+3. 点击提供商卡片右侧的 **编辑**，可以选择当前会话使用的默认模型（如 `deepseek-v4-pro`、`glm-5.3` 等）。
+4. 在主聊天窗口直接提问，即可享受全速无缝的模型推理体验。
+
+---
+
+## 🔄 动态模型联动机制说明
+
+为了防止用户在卸载或清理账号后，设置中心残留大量无法使用的空白 Provider，Jet Hub 引入了严格的**动态生命周期同步**规范：
+
+- **展示原则**：只有**至少存在一个已启用有效账号**的渠道，才会在“设置 -> 模型”中注册可见。
+- **清理原则**：当某个渠道的账号被**全部删除**（或处于未配置状态）时，插件会自动撤销该渠道的 Provider 声明。
+- **无感刷新**：无需重启 DSH Desktop，删除账号的瞬间，模型列表即刻自动刷新脱挂。
+
+---
+
+## ❓ 常见问题排查 (FAQ)
+
+#### Q1：点击“+ 新建账号”后浏览器打开了，但显示连接被拒绝或 404？
+- **原因**：本地授权回调服务监听在 `10000` 以上端口（华为云与各大 OAuth 门户的要求）。
+- **解决办法**：请检查是否有代理软件（如 Clash、V2Ray 等）拦截了 `127.0.0.1` 本地回环流量，建议在代理软件中将 `127.0.0.1` 和 `localhost` 加入 Bypass 直连白名单。
+
+#### Q2：为什么我在 Jet Hub 中删除了华为云账号，模型列表里还有 CodeArts？
+- **原因**：这是因为旧版本插件采用静态无条件注册。
+- **解决办法**：请确保已更新至最新版本的 Jet Hub 插件代码，新版已全面支持 `onAccountsChanged` 动态注销逻辑，删除后即自动消失。
+
+#### Q3：账号到期后需要手动重新登录吗？
+- **不需要**。只要授权时获取到了 Refresh Token，后台调度器会在到期前自动续期。仅当官方服务端主动注销凭证（例如修改密码、撤销授权）时，才需要重新点击登录。
+
+#### Q4：多账号如何轮换？
+- 当配置了多个同一渠道的账号时，系统会自动挑选当前处于健康、未被限流的账号执行请求。若遇到单账号频率超限（TPM/RPM Rate Limit），适配器会自动捕获并尝试调度备用账号。
+
+---
+
+## 💻 本地开发与编译
+
+本项目采用 TypeScript + ESM 构建体系，UI 部分采用原生现代 WebComponent (Lit 架构)。
+
+```bash
+# 1. 安装项目依赖
+pnpm install
+
+# 2. 静态类型检查
+pnpm typecheck
+
+# 3. 运行全量单元测试
+pnpm test
+
+# 4. 执行全量构建 (TS 编译 + 前端打包)
 pnpm build:all
-dsh plugin --profile <name> install <path-to-this-repo>
 ```
 
-> `dsh plugin install` 以 `link:` 方式安装，pnpm 不会为 `link:` 依赖运行
-> `prepare` 脚本，因此必须先手动执行 `pnpm build:all` 生成 `lib/`，否则 dsh 启动时
-> 报 `ERR_MODULE_NOT_FOUND: ... dsh-codearts-auth/lib/index.js`。
-> 注意必须用 `build:all` 而非 `build`：后者只编译宿主侧，不产出
-> `lib/client/jet-hub.js`。
+构建完成后产物分布如下：
+- `lib/`：后端 TypeScript 编译产物与适配器核心。
+- `lib/client/jet-hub.js`：打包完成的前端客户端面板脚本。
 
-每次修改 `src/` 或 `plugin-src/` 后都需要重新执行 `pnpm build:all`——dsh 启动时
-不会自动重建。
+---
 
-### 通用说明
+## 📄 开源协议
 
-该包声明了 `dsh.bundle` 补丁（`cordis.patch.yml`），因此 profile 的 layer 栈会
-自动拾取 `codearts-auth` 行。插件注入由 dsh base 提供的 `credentials`、
-`commands` 和 `llm` 服务。
-
-## 用法
-
-- `/codearts-login` — 在浏览器中打开华为云 portal 授权页；授权后，插件经本地
-  `/oauth/callback` 回调收取 `code`，并由 STS token 端点换取含 `refresh_token` 的
-  AK/SK/SecurityToken 凭据。
-- `/codearts-status` — 显示 `configured`、`source`、`expiresAt`、
-  `refreshable` 以及最新的 `refreshError`。
-- `/codearts-refresh` — 手动静默续期凭据（refresh_token 换取；无 refresh_token 时提示重新登录）。
-- 编程式调用：`ctx.codeartsAuth.login()`、`ctx.codeartsAuth.status()`、
-  `ctx.codeartsAuth.refresh()`、`ctx.codeartsAuth.logout()`。
-
-## LLM provider
-
-插件在 `ctx.llm` 上注册了一个 `codearts` provider 路由（OpenAI 兼容端点
-`https://snap-access.cn-north-4.myhuaweicloud.com/api/v2`）。每个模型请求都使用
-存储的 AK/SK/SecurityToken 按华为 `SDK-HMAC-SHA256` 方案签名，并附带
-`Chat-Id`/`Session-Id` 请求头。默认广告的模型为 GLM-5.2、GLM-5.1、
-GLM-5、GLM-5.3 Flash（`glm-5.3-flash`，1M 上下文）、盘古
-openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
-以及 DeepSeek V4 deepseek-v4-flash / deepseek-v4-pro（UI 标注每日 1000 万免费
-Tokens 福利）。
-登录后在 dsh Models 页面选择该 provider 即可。
-
-> 注 1：CodeArts Agent IDE 模型列表显示的 flash ID 为 `deepseek-v4-flash-0731`
-> （带日期后缀），但后端实际注册的可用 ID 是 `deepseek-v4-flash`（无后缀）。
-> 用 `deepseek-v4-flash-0731` 调用会返回 `InferHub.002002009.404 The model is
-> not registered`，因此本插件只注册无后缀的 `deepseek-v4-flash`。
->
-> 注 2：`glm-5.3-flash`（GLM-5.3 Flash，2026-08 加入，1M 上下文）是 benefit
-> （免费额度）模型：其 chat 请求必须携带 `maas_type: benefit` 请求头且该头
-> 参与 `SDK-HMAC-SHA256` 签名，否则后端返回 `InferHub.002002009.404 The model
-> is not registered`。适配器已自动处理，无需手动配置。
-> （逆向自 CodeArts Agent IDE mitmproxy 抓包，对齐 deveco-code-rust 90aeb17d。）
-
-凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
-凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
-
-除 `codearts` 外，插件另注册两个独立的腾讯系路由：`buddy`（见
-[buddy provider](#buddy-provider)）与 `workbuddy`（见
-[WorkBuddy provider](#workbuddy-provider)）。三者互不覆盖，可同时使用。
-
-## 凭证
-
-- Ref：`CODEARTS_ACCESS_TOKEN`（POSIX 标识符格式的凭证 ref）。
-- 值：JSON 字符串 `{ access_key_id, secret_access_key, security_token,
-  expires_at, domain_id?, user_id?, user_name? }` — AK/SK 对用于给每个 CodeArts
-  后端 API 请求签名。
-- `status()` 报告 `configured`、`source`、`expiresAt`、`refreshable` 和
-  `refreshError`。
-
-## 续期（refresh）
-
-- 默认登录流程为**新式 IAM OAuth**（PKCE + DPoP）：portal `/authorize` 授权 → 本地
-  `/oauth/callback` 回调收取 `code` → `sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens`
-  换取含 `refresh_token` 的凭据。
-- 凭据在过期前 1 小时静默续期（`getFirstRefreshTime` 语义：距过期 ≤1h 立即刷，
-  否则 `now+1h` 叠加随机秒偏移），全程无浏览器、无人工操作。
-- 刷新失败后 10 分钟重试（异常网络 1 分钟）；`refresh_token` 失效后停止续期并提示
-  重新登录（原因会体现在 `status().refreshError` 中）。
-- 旧 ticket 流程保留为显式回退：`/codearts-login` 默认走 OAuth；编程式调用
-  `ctx.codeartsAuth.login({ flow: 'ticket' })`。ticket 凭据没有 `refresh_token`，
-  其续期仍意味着重新运行浏览器登录流程。
-- 手动续期：`/codearts-refresh` 或 `ctx.codeartsAuth.refresh()`。
-- 续期定时器是 unref 的，在 `logout()` 和插件卸载时停止。
-- 运行时依赖新增 `jose`（用于 DPoP JWS 签发，与 CodeArts Agent 插件实现一致）。
-
-## 开发
-
-- `pnpm test` — 单元测试（快速，无网络）。
-- `pnpm test:e2e` — 针对华为线上端点的真实登录流程；需要在打开的浏览器中由人工
-  点击授权按钮（续期为静默刷新，无需再次点击）。
-- `pnpm typecheck`、`pnpm build:all`。
-
-### 构建
-
-- `pnpm build` — 用 tsc 将 `src/` 编译到 `lib/`（生成 `.js`、`.d.ts` 和 source
-  map）。插件**宿主侧**入口是 `lib/index.js`。
-- `pnpm build:client` — 用 esbuild 将 `plugin-src/client/` 打包为
-  `lib/client/jet-hub.js`（Jet Hub 设置页的客户端 bundle，由 `exports["./client"]`
-  引用）。它**不在** `tsc` 的编译范围内，必须单独构建。
-- `pnpm build:all` — 依次执行上面两步（`build` + `build:client`），是完整的构建。
-- `pnpm typecheck` — 只做类型检查（`tsc --noEmit`），不产出文件，可在构建前快速
-  验证。
-
-`lib/` 已被 gitignore，因此构建是安装或运行前的必需步骤。只执行 `pnpm build`
-会漏掉客户端 bundle，dsh 启动时会因 `exports["./client"]` 指向的文件不存在而
-加载失败（Jet Hub 设置页不显示），请改用 `pnpm build:all`。
-
-每次修改 `src/` 或 `plugin-src/` 后都需要重新执行 `pnpm build:all`——dsh 启动时
-不会自动重建。
-
-### 安装到 profile 之前先构建
-
-详见「安装」小节。`dsh plugin install` 以 `link:` 方式安装，pnpm 不会为 `link:`
-依赖运行 `prepare` 脚本，因此必须先 `pnpm build:all` 生成 `lib/`（含客户端
-bundle）。
-
-## 工作原理
-
-默认登录流程（新式 IAM OAuth，PKCE + DPoP）：
-
-1. 生成 PKCE 配对与 DPoP ES256 密钥对，并启动本地 `127.0.0.1` 回调服务器。
-2. 构造 portal `/authorize` URL 并打开华为云授权页面。
-3. 授权后浏览器回调本地 `/oauth/callback`，携带授权码 `code`。
-4. 向 STS token 端点（`sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens`）用
-   `code` 换取含 `refresh_token` 的凭据 JSON，并存储到 `CODEARTS_ACCESS_TOKEN` 下。
-5. 凭据到期前静默续期（见「续期（refresh）」），无需再次打开浏览器。
-
-旧 ticket 流程保留为显式回退（编程式调用 `ctx.codeartsAuth.login({ flow: 'ticket' })`）：
-生成 `ticket_id`，打开 `devcloud.cn-north-4.huaweicloud.com/doer/redirect` 认证页，
-回调后轮询 snap-manager ticket 端点（120 × 1 秒）获取临时凭证；此类凭据没有
-`refresh_token`，其续期仍意味着重新运行浏览器登录流程。
-
-## buddy provider
-
-独立路由 `buddy`（腾讯 CodeBuddy，OpenAI 兼容端点
-`https://copilot.tencent.com/v2/chat/completions`），Bearer `access_token` 鉴权。
-
-登录采用 external-link-v2 轮询式（与 CodeArts 的本地回调服务器不同，CodeBuddy
-不起本地端口，而是轮询后端 API）：
-
-1. `POST /v2/plugin/auth/state?platform=ide` → 取得 `state` 与 `authUrl`。
-2. 打开浏览器到 `https://www.codebuddy.cn/login/?platform=ide&state=...`。
-3. 轮询 `GET /v2/plugin/auth/token?state=...`（1 秒间隔、5 分钟超时）→ 令牌；
-   错误码 `11217` 表示 token 未就绪，继续轮询。
-4. 轮询 `GET /v2/plugin/login/account?state=...` → 账户信息；错误码 `12151`
-   表示账户信息未就绪，继续轮询。
-5. 续期：`POST /v2/plugin/auth/token/refresh`，通过 `X-Refresh-Token` 头提交
-   refresh_token。
-
-- **登录入口：Jet Hub 设置页的 CodeBuddy 面板**（支持多账号与账号池自动切换）。
-  已不再注册斜杠命令 —— 设置面板已覆盖登录、状态查看与续期，命令式入口冗余。
-- 编程式调用：`ctx.buddyAuth.login()` / `status()` / `refresh()` / `logout()` /
-  `fetchModels()`。
-- 模型列表：以内置的产品目录为准（`src/product.ts` 的 `fallbackModels`），
-  远端 `GET /v3/config` 可用时优先采用其元数据。
-- 请求头：除 `Authorization: Bearer` 外，还需 `X-Domain`、`X-Product`、
-  `X-Product-Code` 以及伪装为 `CodeBuddyIDE/1.106.1` 的 `User-Agent`。
-- 凭据 ref：`BUDDY_ACCESS_TOKEN`，值为含 `access_token` / `refresh_token` /
-  `expires_at` 的 JSON 字符串。
-
-> **流式工具调用 id 稳定性**：CodeBuddy 仅首个工具调用分片携带真实 id
-> （`chatcmpl-tool-xxx`），后续参数分片只有 `index`。适配器按 index 缓存并沿用
-> 真实 id（缺失时回退 `call_{index}`），保证同一工具的所有分片 id 一致——否则
-> 跨轮次（每轮都从 `call_0` 重新编号）会把 `tool/result` 配对到错误的历史条目。
-
-## WorkBuddy provider（国际版）
-
-独立路由 `workbuddy`（腾讯 **WorkBuddy 国际版 / WorkBuddy AI**），与
-[buddy provider](#buddy-provider) **同源**：共用同一 CLI 内核与同一认证协议
-（cli-external-link 轮询式），Bearer `access_token` 鉴权。差异收敛在
-`src/product.ts` 的产品配置里：
-
-| 项 | CodeBuddy（中国） | WorkBuddy（国际版） |
-|---|---|---|
-| `endpoint` | `https://copilot.tencent.com` | **`https://www.workbuddy.ai`** |
-| `platform` | `ide` | **`workbuddy-ai`** |
-| 登录 URL 附加参数 | 无 | **`version` / `loginSessionId`** |
-| `pluginVersion` | — | `5.5.2` |
-
-**模型列表不能与中国版共用**：两者的路径与响应解析完全相同
-（`GET /v3/config` → `data.data.models` / `data.data.agents`），差异只来自
-`endpoint` —— 不同区域的后端返回不同模型池（中国版含 glm / hy / deepseek 系，
-国际版含 claude / gpt / gemini / kimi 系）。因此 `endpoint` 必须随产品切换，
-不能被当成全局常量。
-
-登录流程与 CodeBuddy 一致（`auth/state` → 浏览器授权 → 轮询 `auth/token` →
-轮询 `login/account`），仅身份标识与端点按上表区分。`X-Product-Code` 为
-`workbuddy`，`X-Domain` 随 `apiDomain` 切换为 `www.workbuddy.ai`。
-
-**没有每日签到积分**：国际版后端不提供签到接口（内核中只有
-`/v2/billing/meter/get-dosage-notify` 用量通知），因此 Jet Hub 的 WorkBuddy
-面板**不显示「一键领取积分」按钮**；积分领取在 CodeBuddy 面板完成。
-
-- **登录入口：Jet Hub 设置页的 WorkBuddy 面板**（支持多账号与账号池自动切换）。
-  同样不注册斜杠命令。
-- 编程式调用：`ctx.workbuddyAuth.login()` / `status()` / `refresh()` / `logout()` /
-  `fetchModels()`。
-- 凭据 ref：
-  - 单账号：`WORKBUDDY_ACCESS_TOKEN`，值为含 `access_token` / `refresh_token` /
-    `expires_at` 的 JSON 字符串（与 `BUDDY_ACCESS_TOKEN` 同构）。
-  - 多账号：`WORKBUDDY_ACCOUNT_<UUID_SHORT>`，由 Jet Hub 设置页「+ 新建账号」
-    登录时自动生成并登记到账号池；每条账号记录带 `provider: 'workbuddy'`，
-    与 CodeBuddy 的 `BUDDY_ACCOUNT_*` 相互隔离，不会串用凭据或限流标记。
-- **从中国版升级**：本插件早期版本把 `workbuddy` 指向中国版
-  （`copilot.tencent.com`）。启动时会自动清理凭据 `domain` 与当前
-  `apiDomain` 不符的旧账号（这类凭据在新端点必然失败），清理结果记入日志，
-  请在 Jet Hub 重新登录。
-- 续期：与 CodeBuddy 共用同一套机制，插件启动后每 30 分钟对可续期账号静默刷新
-  （`refresh_token` 经 `X-Refresh-Token` 头提交），无需重新打开浏览器。
-- 请求头、模型列表拉取与流式工具调用 id 处理均与 CodeBuddy 一致，详见上一节。
-
-### 与 Jet Hub 设置页的关系
-
-Jet Hub（设置页）的账号面板按 provider 分组展示，WorkBuddy 是其中一栏：
-
-- 面板提供账号列表、新建账号（浏览器登录入池）、启用/停用、删除，以及「重测 /
-  重测所有 / 重置 / 重置所有」限流标记操作，行为与 CodeBuddy 面板一致，但
-  只操作 `provider: 'workbuddy'` 的账号。
-- 账号卡片只展示 credentialRef、有效期（含「自动续期」标记）与限流状态，
-  **不显示任何签到信息**；面板标题栏「一键领取积分」的结果来自 RPC 端点
-  `credits.claimAll`（实现见 `src/jet-hub-rpc.ts`，签到客户端见 `src/credits.ts`）。
-- 后端另实现了 `credits.status`（查询某 provider 下全部启用账号的签到状态），
-  但**前端尚无消费者**：`plugin-src/client/jet-hub.js` 只调用 `credits.claimAll`，
-  `credits.status` 目前仅供外部脚本或直接 RPC 调用使用。
-- 对应 LLM provider 的设置命名空间为 `llm-workbuddy`。
-
-### 一键领取积分（每日签到）
-
-**仅 CodeBuddy 面板提供**该按钮。CodeArts 是华为云账号体系不参与；WorkBuddy
-国际版后端没有签到接口，故其面板也不显示（积分领取在 CodeBuddy 侧完成）。
-
-在 Jet Hub → CodeBuddy 面板标题栏点击「**一键领取积分**」，插件会对该面板下
-**全部账号**顺序执行每日签到领取：
-
-> **含已停用账号。** 停用只影响账号池的自动选择与限流切换，不改变账号本身
-> 是否已签到——用户点「一键领取」时期望所有账号都尝试一遍。
-
-1. 先查签到活动状态（`POST /v2/billing/meter/checkin-activity-status`）；
-2. 活动未开启或今日已签到则跳过领取请求，只报告状态；
-3. 否则调用领取端点（`POST /v2/billing/meter/daily-checkin`）领取当日积分。
-
-完成后按钮下方给出结果摘要（如「3 个账号领取成功（+300 积分），1 个今日已领取」）。
-领取按账号隔离：单个账号凭据缺失、损坏或请求失败不会中断整批，只计入失败数；
-摘要**只显示各类计数**（如「1 个失败」），不展示每个账号的失败原因——原因保留在
-`results[].outcome.message` 中，需要时请通过 RPC 响应或日志查看。
-
-几点实现约定：
-
-- 领取是**顺序执行**的，避免并发触发风控；账号较多时需要等待片刻。
-- 重复领取是幂等的：服务端返回 HTTP 400 + `code 10001`（「今天已签到，请明天
-  再来」），插件把它识别为 `already-claimed` 而非失败。
-- 状态查询用 `checkin-activity-status` 而非 `checkin-status`；后者返回占位数据
-  （`active:false`、`checkin_dates:null`），会让人误判为活动未开启。
-- 请求**不需要** `X-Device-Token`（图灵盾）——已实测验证。
-
-想单独验证领取闭环（会真实改动账号当日签到状态）可运行
-`pnpm test:e2e:workbuddy-claim`，说明见 `tests/e2e/README.md`。
+本项目基于 [MIT License](LICENSE) 许可协议开源。

@@ -1,7 +1,37 @@
 import { describe, expect, it } from 'vitest'
-import { CODEBUDDY, WORKBUDDY, productById } from '../../src/product.js'
+import { ALL_PRODUCTS, CODEBUDDY, CODEBUDDY_INTL, WORKBUDDY_CN, WORKBUDDY, productById } from '../../src/product.js'
 
 describe('产品配置', () => {
+  it('CodeBuddy 国际版使用 ide platform 与 www.codebuddy.ai 端点', () => {
+    expect(CODEBUDDY_INTL).toMatchObject({
+      id: 'buddy-intl',
+      platform: 'ide',
+      endpoint: 'https://www.codebuddy.ai',
+      apiDomain: 'www.codebuddy.ai',
+      productCode: 'codebuddy',
+      defaultCredentialRef: 'BUDDY_INTL_ACCESS_TOKEN',
+      appendSessionParams: false,
+    })
+  })
+
+  it('WorkBuddy 国内版使用 workbuddy platform 与 copilot.tencent.com 端点', () => {
+    expect(WORKBUDDY_CN).toMatchObject({
+      id: 'workbuddy-cn',
+      platform: 'workbuddy',
+      endpoint: 'https://copilot.tencent.com',
+      apiDomain: 'copilot.tencent.com',
+      productCode: 'workbuddy',
+      defaultCredentialRef: 'WORKBUDDY_CN_ACCESS_TOKEN',
+      appendSessionParams: true,
+      pluginVersion: '5.5.4',
+    })
+  })
+
+  it('所有产品的 id 互不相同', () => {
+    const ids = ALL_PRODUCTS.map((p) => p.id)
+    expect(new Set(ids).size).toBe(ALL_PRODUCTS.length)
+  })
+
   it('CodeBuddy 使用 ide platform、codebuddy 产品码与中国区端点', () => {
     expect(CODEBUDDY).toMatchObject({
       id: 'buddy',
@@ -36,7 +66,7 @@ describe('产品配置', () => {
   })
 
   it('apiDomain 与 endpoint 的主机名一致', () => {
-    for (const product of [CODEBUDDY, WORKBUDDY]) {
+    for (const product of ALL_PRODUCTS) {
       expect(new URL(product.endpoint).hostname).toBe(product.apiDomain)
     }
   })
@@ -53,7 +83,7 @@ describe('产品配置', () => {
   })
 
   it('两个产品的 endpoint 都是 HTTPS', () => {
-    for (const product of [CODEBUDDY, WORKBUDDY]) {
+    for (const product of ALL_PRODUCTS) {
       expect(product.endpoint.startsWith('https://')).toBe(true)
     }
   })
@@ -61,7 +91,7 @@ describe('产品配置', () => {
   it('两个产品都带兜底模型目录，且条目字段完整', () => {
     // 兜底目录的用途：服务端按认证上下文下发的模型集合可能残缺，
     // 用产品自带的权威清单校正（见 BuddyAdapter.reconcileWithFallback）。
-    for (const product of [CODEBUDDY, WORKBUDDY]) {
+    for (const product of ALL_PRODUCTS) {
       expect(product.fallbackModels, product.id).toBeDefined()
       expect(product.fallbackModels!.length).toBeGreaterThan(0)
       for (const model of product.fallbackModels!) {
@@ -85,7 +115,7 @@ describe('产品配置', () => {
 
   it('兜底目录不含非对话模型与实测不可用的内部别名', () => {
     const banned = ['o4-mini', 'nes-1.1', 'nes-1.2', 'completion-1.0', 'codewise-jump', 'hunyuan-image-alpha']
-    for (const product of [CODEBUDDY, WORKBUDDY]) {
+    for (const product of ALL_PRODUCTS) {
       for (const id of banned) {
         expect(product.fallbackModels!.some((m) => m.id === id), `${product.id}:${id}`).toBe(false)
       }
@@ -93,7 +123,7 @@ describe('产品配置', () => {
   })
 
   it('思考等级非空的条目带默认等级', () => {
-    for (const product of [CODEBUDDY, WORKBUDDY]) {
+    for (const product of ALL_PRODUCTS) {
       for (const model of product.fallbackModels!) {
         if (model.reasoningEfforts !== undefined && model.reasoningEfforts.length > 0) {
           for (const effort of model.reasoningEfforts) {
@@ -106,6 +136,16 @@ describe('产品配置', () => {
 
   it('productById 能按 id 查到配置', () => {
     expect(productById('buddy')).toBe(CODEBUDDY)
+    expect(productById('buddy-intl')).toBe(CODEBUDDY_INTL)
+    expect(productById('workbuddy-cn')).toBe(WORKBUDDY_CN)
+    expect(productById('buddy-intl')).toBe(CODEBUDDY_INTL)
+    expect(productById('workbuddy-cn')).toBe(WORKBUDDY_CN)
+    expect(productById('buddy-intl')).toBe(CODEBUDDY_INTL)
+    expect(productById('workbuddy-cn')).toBe(WORKBUDDY_CN)
+    expect(productById('buddy-intl')).toBe(CODEBUDDY_INTL)
+    expect(productById('workbuddy-cn')).toBe(WORKBUDDY_CN)
+    expect(productById('buddy-intl')).toBe(CODEBUDDY_INTL)
+    expect(productById('workbuddy-cn')).toBe(WORKBUDDY_CN)
     expect(productById('workbuddy')).toBe(WORKBUDDY)
   })
 

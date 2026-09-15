@@ -57,16 +57,17 @@ export interface BuddyLoginStatus {
   refreshError?: string
 }
 
+/** 将产品 id 转换为合法的 Cordis 服务属性名（如 buddy-intl -> buddyIntlAuth）。 */
+export function toServiceName(productId: string): string {
+  const camel = productId.replace(/-([a-z])/g, (_, c) => c.toUpperCase())
+  return `${camel}Auth`
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     buddyAuth: BuddyAuth
-    /**
-     * WorkBuddy 的认证服务实例。
-     *
-     * 与 `buddyAuth`（CodeBuddy）并列存在：cordis 的 `Service` 构造时按名称
-     * 注册，同名第二次注册会抛 `service "buddyAuth" has been registered`，
-     * 故两个产品必须各占一个服务名。
-     */
+    buddyIntlAuth: BuddyAuth
+    workbuddyCnAuth: BuddyAuth
     workbuddyAuth: BuddyAuth
   }
 }
@@ -123,7 +124,7 @@ export class BuddyAuth extends Service {
     // CodeBuddy 与 WorkBuddy 需要同时存在两个实例。按产品 id 派生即可得到
     // 稳定且互不冲突的两个名字：buddy → `buddyAuth`（与改造前完全一致）、
     // workbuddy → `workbuddyAuth`；显式传入 serviceName 可覆盖。
-    super(ctx, options.serviceName ?? `${product.id}Auth`)
+    super(ctx, options.serviceName ?? toServiceName(product.id))
     this.product = product
     this.credentialRefName = this.product.defaultCredentialRef
   }

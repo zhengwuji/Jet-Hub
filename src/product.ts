@@ -46,7 +46,7 @@ export interface BuddyFallbackModel {
 /** 一个 CodeBuddy 系产品的全部差异配置。 */
 export interface BuddyProduct {
   /** provider 标识：注册到 ctx.llm 的路由名，也是账号列表的 provider 字段值 */
-  id: 'buddy' | 'workbuddy'
+  id: 'buddy' | 'buddy-intl' | 'workbuddy-cn' | 'workbuddy'
   /** auth/state 的 platform 查询参数 */
   platform: string
   /**
@@ -156,7 +156,7 @@ export const CODEBUDDY: BuddyProduct = {
   platform: 'ide',
   endpoint: 'https://copilot.tencent.com',
   apiDomain: 'copilot.tencent.com',
-  displayName: 'CodeBuddy (腾讯)',
+  displayName: 'CodeBuddy (国内版)',
   productCode: 'codebuddy',
   userAgent: 'CodeBuddyIDE/1.106.1',
   defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
@@ -238,6 +238,43 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  * 该产品**没有**每日签到积分接口（内核中只有 `/v2/billing/meter/get-dosage-notify`），
  * 因此 Jet Hub 不为其渲染「一键领取积分」按钮；积分领取在 CodeBuddy 侧完成。
  */
+export const CODEBUDDY_CN = CODEBUDDY
+
+/**
+ * CodeBuddy 国际版（CodeBuddy AI），platform = ide。
+ * endpoint = "https://www.codebuddy.ai"
+ */
+export const CODEBUDDY_INTL: BuddyProduct = {
+  id: 'buddy-intl',
+  platform: 'ide',
+  endpoint: 'https://www.codebuddy.ai',
+  apiDomain: 'www.codebuddy.ai',
+  displayName: 'CodeBuddy (国际版)',
+  productCode: 'codebuddy',
+  userAgent: 'CodeBuddyIDE/1.106.1',
+  defaultCredentialRef: 'BUDDY_INTL_ACCESS_TOKEN',
+  appendSessionParams: false,
+  fallbackModels: WORKBUDDY_FALLBACK_MODELS,
+}
+
+/**
+ * WorkBuddy 国内版（腾讯 WorkBuddy），platform = workbuddy。
+ * endpoint = "https://copilot.tencent.com"
+ */
+export const WORKBUDDY_CN: BuddyProduct = {
+  id: 'workbuddy-cn',
+  platform: 'workbuddy',
+  endpoint: 'https://copilot.tencent.com',
+  apiDomain: 'copilot.tencent.com',
+  displayName: 'WorkBuddy (国内版)',
+  productCode: 'workbuddy',
+  userAgent: 'CodeBuddyIDE/1.106.1',
+  defaultCredentialRef: 'WORKBUDDY_CN_ACCESS_TOKEN',
+  appendSessionParams: true,
+  pluginVersion: '5.5.4',
+  fallbackModels: CODEBUDDY_FALLBACK_MODELS,
+}
+
 export const WORKBUDDY: BuddyProduct = {
   id: 'workbuddy',
   platform: 'workbuddy-ai',
@@ -253,7 +290,15 @@ export const WORKBUDDY: BuddyProduct = {
 }
 
 /** 全部产品配置，供按 id 查询与遍历注册使用。 */
-export const ALL_PRODUCTS: readonly BuddyProduct[] = [CODEBUDDY, WORKBUDDY]
+export const WORKBUDDY_INTL = WORKBUDDY
+
+/** 全部产品配置，供按 id 查询与遍历注册使用。 */
+export const ALL_PRODUCTS: readonly BuddyProduct[] = [
+  CODEBUDDY,
+  CODEBUDDY_INTL,
+  WORKBUDDY_CN,
+  WORKBUDDY,
+]
 
 /** 按 provider id 取产品配置；未知 id 返回 undefined。 */
 export function productById(id: string): BuddyProduct | undefined {

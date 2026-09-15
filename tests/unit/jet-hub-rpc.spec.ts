@@ -357,3 +357,16 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(response.results.map(r => r.accountId)).toEqual(['a', 'b', 'c'])
   })
 })
+
+describe('account.create credentialRef 命名规范', () => {
+  it('所有产品的 provider 都能派生出符合 POSIX 标识符正则的 credentialRef', async () => {
+    const { credentialRef } = await import('@deepseek-ai/dsh-credentials')
+    const { ALL_PRODUCTS } = await import('../../src/product.js')
+    const providers = ['codearts', ...ALL_PRODUCTS.map((p) => p.id)]
+    for (const provider of providers) {
+      const refPrefix = provider.toUpperCase().replace(/[^A-Z0-9]+/g, '_')
+      const refName = `${refPrefix}_ACCOUNT_A1B2C3D4`
+      expect(() => credentialRef(refName)).not.toThrow()
+    }
+  })
+})

@@ -56,12 +56,23 @@ class FakeLlm {
   readonly registeredProviders: string[] = []
   registerConfigurableProviders(
     entries: Array<{ provider: string; displayName?: string; settingsNs?: string }>,
-  ): { replace: () => void } {
+  ): { replace: (next: Array<{ provider: string; displayName?: string; settingsNs?: string }>) => void } {
+    this.providers.length = 0
+    this.configurableProviders.length = 0
     for (const entry of entries) {
       this.providers.push(entry.provider)
       this.configurableProviders.push(entry)
     }
-    return { replace: () => {} }
+    return {
+      replace: (next) => {
+        this.providers.length = 0
+        this.configurableProviders.length = 0
+        for (const entry of next) {
+          this.providers.push(entry.provider)
+          this.configurableProviders.push(entry)
+        }
+      },
+    }
   }
   registerAdapter(providers: string[], _adapter: unknown): { replace: () => void } {
     this.adapters.push(...providers)
@@ -106,7 +117,16 @@ function makeContext(): { ctx: Context; commands: FakeCommands; llm: FakeLlm; se
  * 测试里可直接以 `ctx.llm` / `ctx.settings` 取回并断言。
  */
 function createMockContext(): Context & { llm: FakeLlm; commands: FakeCommands; settings: FakeSettings } {
-  return makeContext().ctx as Context & { llm: FakeLlm; commands: FakeCommands; settings: FakeSettings }
+  const m = makeContext()
+  const proxy = new Proxy(m.ctx, {
+    get(target, prop, receiver) {
+      if (prop === 'llm') return m.llm
+      if (prop === 'commands') return m.commands
+      if (prop === 'settings') return m.settings
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+  return proxy as Context & { llm: FakeLlm; commands: FakeCommands; settings: FakeSettings }
 }
 
 afterEach(() => {
@@ -153,7 +173,8 @@ describe('plugin entry', () => {
   it('registers the codearts LLM route and the status/refresh commands', () => {
     const { ctx, commands, llm } = makeContext()
     apply(ctx)
-    expect(llm.providers).toContain('codearts')
+    // 无账号时模型设置列表不显示，但 adapter 路由已就绪
+    expect(llm.providers).not.toContain('codearts')
     expect(llm.adapters).toContain('codearts')
     const names = commands.definitions.map((d) => d.name)
     expect(names).toContain('codearts-status')
@@ -198,7 +219,8 @@ describe('buddy plugin entry', () => {
   it('registers the buddy LLM route', () => {
     const { ctx, llm } = makeContext()
     apply(ctx)
-    expect(llm.providers).toContain('buddy')
+    // 无账号时模型设置列表不显示，但 adapter 路由已就绪
+    expect(llm.providers).not.toContain('buddy')
     expect(llm.adapters).toContain('buddy')
   })
 
@@ -217,6 +239,8 @@ describe('WorkBuddy provider 注册', () => {
     apply(ctx as never)
     const registered = ctx.llm.registeredProviders
     expect(registered).toContain('buddy')
+    expect(registered).toContain('buddy-intl')
+    expect(registered).toContain('workbuddy-cn')
     expect(registered).toContain('workbuddy')
   })
 
@@ -224,22 +248,41 @@ describe('WorkBuddy provider 注册', () => {
     expect(WORKBUDDY.defaultCredentialRef).toBe('WORKBUDDY_ACCESS_TOKEN')
   })
 
-  it('注册 workbuddy 的可配置 provider 目录项', () => {
+  it('动态同步模型设置目录项：有账号时注册显示，删除账号后自动移除', async () => {
     const ctx = createMockContext()
     apply(ctx as never)
-    const directory = ctx.llm.configurableProviders
-    const entry = directory.find((item: { provider: string }) => item.provider === 'workbuddy')
+    // 初始没有账号：模型侧不显示（已删除/无账号的提供方不留在模型列表中）
+    expect(ctx.llm.configurableProviders.find((p) => p.provider === 'workbuddy')).toBeUndefined()
+    expect(ctx.llm.configurableProviders.find((p) => p.provider === 'codearts')).toBeUndefined()
+
+    // 模拟在账号池新增一个 workbuddy 账号
+    await ctx.accountPool.addAccount({
+      id: 'workbuddy-test-1',
+      provider: 'workbuddy',
+      nickname: 'WB Test',
+      enabled: true,
+      credentialRef: 'WORKBUDDY_TEST_REF',
+      refreshable: false,
+      createdAt: Date.now(),
+    })
+
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'workbuddy')
     expect(entry).toMatchObject({ provider: 'workbuddy', displayName: WORKBUDDY.displayName })
+    expect(entry?.settingsNs).toBe('llm-workbuddy')
+
+    // 模拟删除该账号：模型侧自动注销移除
+    await ctx.accountPool.removeAccount('workbuddy-test-1')
+    expect(ctx.llm.configurableProviders.find((p) => p.provider === 'workbuddy')).toBeUndefined()
   })
 
-  // 关键前置：registerBuddyLlm 为 WorkBuddy 产生 settingsNs = llm-workbuddy。
-  // 该 namespace 未注册时，模型设置页会在 refFor → deriveKeyRef(provider)
-  // 处以 `provider.toUpperCase is not a function` 崩溃。
-  it('workbuddy 的 settingsNs 为 llm-workbuddy，且对应 settings namespace 已注册', () => {
+  // 关键前置：命名空间必须预先注册，防止模型设置页崩溃
+  it('全部产品的 settings namespace 始终预注册，避免未注册崩溃', () => {
     const ctx = createMockContext()
     apply(ctx as never)
-    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'workbuddy')
-    expect(entry?.settingsNs).toBe('llm-workbuddy')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-codearts')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-buddy')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-buddy-intl')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-workbuddy-cn')
     expect(ctx.settings.registeredNamespaces).toContain('llm-workbuddy')
   })
 
@@ -265,6 +308,8 @@ describe('WorkBuddy provider 注册', () => {
     const ctx = createMockContext()
     apply(ctx as never)
     expect(ctx.buddyAuth).toBeInstanceOf(BuddyAuth)
+    expect(ctx.buddyIntlAuth).toBeInstanceOf(BuddyAuth)
+    expect(ctx.workbuddyCnAuth).toBeInstanceOf(BuddyAuth)
     expect(ctx.workbuddyAuth).toBeInstanceOf(BuddyAuth)
     expect(ctx.buddyAuth).not.toBe(ctx.workbuddyAuth)
     expect(ctx.buddyAuth.product.id).toBe('buddy')

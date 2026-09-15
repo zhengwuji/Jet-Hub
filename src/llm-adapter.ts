@@ -52,6 +52,8 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
 const MAAS_TYPE_BENEFIT_MODELS: ReadonlySet<string> = new Set(['glm-5.3-flash'])
 
 export interface CodeArtsAdapterOptions {
+  /** 跳过由本函数主动向 ctx.llm 注册 configurableProviders（由外部按账号存在性动态管理）。 */
+  skipConfigurableRegistration?: boolean
   credentialRef: CredentialRef
   resolveCredential: () => Promise<CodeArtsCredential | undefined>
   refresh: () => Promise<void>
@@ -1415,9 +1417,11 @@ export class CodeArtsAdapter extends LlmAdapter {
 
 /** 在 ctx.llm 上注册 codearts 提供商路由和适配器。 */
 export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): void {
-  ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: 'CodeArts Agent', settingsNs: 'llm-codearts', settingsPath: [] },
-  ])
+  if (!options.skipConfigurableRegistration) {
+    ctx.llm.registerConfigurableProviders([
+      { provider: PROVIDER, displayName: 'CodeArts Agent', settingsNs: 'llm-codearts', settingsPath: [] },
+    ])
+  }
   ctx.llm.registerAdapter([PROVIDER], new CodeArtsAdapter(options))
 }
 

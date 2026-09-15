@@ -230,9 +230,19 @@ export function registerJetHubRpc(
   ctx: Context,
   pool: AccountPool,
   codearts: CodeArtsAuth,
-  buddy: BuddyAuth,
-  workbuddy: BuddyAuth,
+  buddyServices: Map<string, BuddyAuth> | BuddyAuth,
+  ...rest: BuddyAuth[]
 ): void {
+  const authMap = new Map<string, BuddyAuth>()
+  if (buddyServices instanceof Map) {
+    for (const [k, v] of buddyServices) authMap.set(k, v)
+  } else if (buddyServices) {
+    for (const b of [buddyServices, ...rest]) {
+      if (b && typeof b === 'object' && 'product' in b && b.product?.id) {
+        authMap.set(b.product.id, b)
+      }
+    }
+  }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
   if (!connection || typeof connection.fetch?.register !== 'function') {
@@ -301,7 +311,8 @@ export function registerJetHubRpc(
         const { provider } = req
         const id = `${provider}-${shortId()}`
         const suffix = shortId().toUpperCase()
-        const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`
+        const refPrefix = provider.toUpperCase().replace(/[^A-Z0-9]+/g, '_')
+        const refName = `${refPrefix}_ACCOUNT_${suffix}`
 
         // CodeBuddy 系（buddy / workbuddy）共用两步登录流程：
         // 只获取 loginUrl 和 state 立即返回，后台用同一个 state 异步执行
@@ -335,7 +346,7 @@ export function registerJetHubRpc(
           runBuddyLoginFlow({ openBrowser: () => {}, state, product }).then(async (flow) => {
             await ctx.credentials.set(ref, flow.access)
             // 续期定时器归属该产品自己的服务实例
-            ;(product.id === CODEBUDDY.id ? buddy : workbuddy).scheduleRefresh()
+            authMap.get(product.id)?.scheduleRefresh()
             const credential = parseBuddyCredential(flow.access)
             await pool.updateAccount(id, {
               nickname: credential?.nickname ?? id,
@@ -381,10 +392,13 @@ export function registerJetHubRpc(
 
           if (entry.provider === 'codearts') {
             await codearts.refresh()
-          } else if (entry.provider === 'buddy') {
-            await buddy.refresh()
           } else {
-            throw new Error(`Unknown provider: ${entry.provider}`)
+            const auth = authMap.get(entry.provider)
+            if (auth) {
+              await auth.refresh()
+            } else {
+              throw new Error(`Unknown provider: ${entry.provider}`)
+            }
           }
           return { ok: true, value: { success: true } }
         } catch (error) {
