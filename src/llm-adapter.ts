@@ -767,8 +767,10 @@ export class CodeArtsAdapter extends LlmAdapter {
     }
   }
 
-  listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    void this.ensureRemoteModels()
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    const cred = await this.options.resolveCredential()
+    if (!cred) return []
+    await this.ensureRemoteModels()
     const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
     // 屏蔽视觉（VL）多模态模型（id 含 -VL- 或以 -VL 结尾，如 Qwen3-VL-235B）：
     // 这类模型上下文小（32768 tokens）、不支持工具调用（vLLM 未启用

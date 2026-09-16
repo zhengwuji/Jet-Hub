@@ -229,7 +229,7 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
 /**
  * WorkBuddy 国际版（腾讯 WorkBuddy AI），platform = workbuddy-ai。
  *
- * 逆向自 `C:\Users\Jet\AppData\Local\Programs\WorkBuddyAI`（5.5.2）的 cli/product.json：
+ * 逆向自 `%LOCALAPPDATA%\Programs\WorkBuddyAI`（5.5.2）的 cli/product.json：
  * - `applicationName` = "workbuddy-ai"
  * - `endpoint` = "https://www.workbuddy.ai"（**与中国版不同**，模型池随区域变化）
  * - `authentication.attributes.platform` = "workbuddy-ai"

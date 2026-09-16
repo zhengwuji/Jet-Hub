@@ -4,6 +4,8 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
+import { registerAntigravityLocalLlm, ANTIGRAVITY_PROVIDER } from './antigravity-local-adapter.js'
+import { readAntigravityCredential } from './antigravity.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { AccountPool } from './account-pool.js'
@@ -101,7 +103,13 @@ export function apply(ctx: Context): void {
   // WorkBuddy（workbuddy）路由 —— 后者由 registerBuddyLlm 以
   // `llm-${product.id}` 派生，漏注册会让模型设置页在
   // `refFor → deriveKeyRef(provider)` 处以 `provider.toUpperCase is not a function` 崩溃。
-  registerProviderSettings(ctx, 'llm-codearts', ...ALL_PRODUCTS.map((p) => `llm-${p.id}`))
+  // antigravity 复用本机 IDE 凭据，同样需要自己的 namespace。
+  registerProviderSettings(
+    ctx,
+    'llm-codearts',
+    ...ALL_PRODUCTS.map((p) => `llm-${p.id}`),
+    `llm-${ANTIGRAVITY_PROVIDER}`,
+  )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
 
@@ -205,6 +213,24 @@ export function apply(ctx: Context): void {
     })
   }
 
+  // ===== Antigravity (Google) 注册 =====
+  //
+  // ⚠️ 刻意**不放进 ALL_PRODUCTS**，也不传入 accountPool。
+  //
+  // 原因（防封号的关键架构决策）：ALL_PRODUCTS 会被上面那个循环用于创建
+  // 多账号服务实例，并接入 refreshAll / 限流自动切换。Google 侧对"同一账号
+  // 被多客户端高频轮换调用"的判定远比腾讯侧严格，账号池那套做法套过来等同
+  // 于账号滥用。Antigravity 因此走单账号、无池、纯复用的独立注册路径。
+  //
+  // **通道选择（方案 B 为主）**：
+  //   - 首选本地私有通道：借用 IDE 自己的 language_server 进程发请求，
+  //     对 Google 而言与"用户在 IDE 里正常提问"无法区分（见 antigravity-local.ts）。
+  //     这条路**不读凭据文件**，账号身份由 IDE 运行时决定。
+  //   - 降级公共 API：仅在显式开启 `allowPublicFallback` 且 IDE 未运行时使用
+  //     （见 antigravity-adapter.ts）。本机实测该账号的公共 API 全部 403
+  //     SUBSCRIPTION_REQUIRED，故默认关闭，改为给出"请先打开 IDE"的中文提示。
+  registerAntigravityLocalLlm(ctx, { skipConfigurableRegistration: true })
+
   // ===== 多账号静默续期调度 =====
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000 // 每 30 分钟检查一次
 
@@ -295,6 +321,15 @@ export function apply(ctx: Context): void {
         })
       }
     }
+
+    // 3. Antigravity (Google)：作为本地私有 IDE 直连通道，始终注册该提供方。
+    //    用户启动 Antigravity IDE 即可自动无缝直连调用模型。
+    activeEntries.push({
+      provider: ANTIGRAVITY_PROVIDER,
+      displayName: 'Antigravity (Google)',
+      settingsNs: `llm-${ANTIGRAVITY_PROVIDER}`,
+      settingsPath: [],
+    })
 
     const nextSet = new Set(activeEntries.map((e) => e.provider))
     if (

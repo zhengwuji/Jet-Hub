@@ -11,6 +11,7 @@
 | `buddy-cache-probe.e2e.spec.ts` | `DSH_BUDDY_E2E=1` + `DSH_BUDDY_E2E_CONFIRM=yes` | 直连 `/v2/chat/completions`，发 3 组前缀做缓存对比 |
 | `buddy-pool-probe.e2e.spec.ts` | `DSH_BUDDY_POOL_E2E=1` + `DSH_BUDDY_POOL_E2E_CONFIRM=yes` | 用账号池凭据走完整 LLM 链路 |
 | `buddy-ratelimit-probe.e2e.spec.ts` | `DSH_BUDDY_RATELIMIT_E2E=1` + `DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes` | 对记录「限额重置」的账号实发一次请求，**判定是否真限流** |
+| `antigravity-local.e2e.spec.ts` | `DSH_ANTIGRAVITY_E2E=1` + `DSH_ANTIGRAVITY_E2E_CONFIRM=yes` | 走 IDE 本地私有通道发一条真实消息并取回回复。请求由 IDE 自己发出，但**确实计费**，故默认不执行 |
 
 ## 不消耗模型积分
 
@@ -21,6 +22,8 @@
 | `login.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | 只走 CodeArts 浏览器登录与凭据换取 |
 | `buddy-login-probe.e2e.spec.ts` | `DSH_BUDDY_PROBE=1` | 只打印登录流程原始响应，不发模型请求 |
 | `workbuddy-claim-probe.e2e.spec.ts` | `DSH_WORKBUDDY_CLAIM_E2E=1` + `DSH_WORKBUDDY_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（不改模型额度，但会改动账号当日签到状态） |
+| `antigravity.e2e.spec.ts` | `DSH_ANTIGRAVITY_E2E=1`（只读）<br>`+ DSH_ANTIGRAVITY_E2E_CONFIRM=yes`（发出站请求） | 读本机 IDE 凭据 → 官方客户端续期 → `loadCodeAssist` 认证。**两级闸门**：默认只跑只读用例（零网络） |
+| `antigravity-local.e2e.spec.ts` | `DSH_ANTIGRAVITY_E2E=1`（只读）<br>`+ DSH_ANTIGRAVITY_E2E_CONFIRM=yes`（消耗配额） | 发现 language_server → 拉模型清单 → 建会话。**第一级全部打向 `127.0.0.1`，零出站流量**；只有第二级才真实推理 |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -48,7 +51,22 @@ pnpm test:e2e:codearts
 
 # ⚠️ 会真实领取积分（改动当日签到状态）
 pnpm test:e2e:workbuddy-claim
+
+# Antigravity：复用本机 IDE 凭据做认证链路验证
+# 前提：本机已安装 Antigravity IDE 且已完成 Google 账号登录
+pnpm test:e2e:antigravity          # 只读：读凭据 + 解析校验（零网络）
+pnpm test:e2e:antigravity:full     # 追加：token 续期 + Cloud Code 端点调用
+
+# Antigravity：本地私有通道（方案 B，**当前主用通道**）
+# 前提：Antigravity IDE 必须正在运行
+pnpm test:e2e:antigravity-local      # 只读：发现进程 + 模型清单 + 建会话（全打 127.0.0.1，零出站）
+pnpm test:e2e:antigravity-local:full # ⚠️ 追加：真实发一条消息（消耗账号配额）
 ```
+
+> **两条 Antigravity 测试的区别**：`antigravity` 系列验证**方案 A**（插件直连
+> Google 公共 API，本机实测 403 `SUBSCRIPTION_REQUIRED`）；`antigravity-local`
+> 系列验证**方案 B**（借用 IDE 自己的 language_server 发请求，实测可用）。
+> 插件运行时默认走 B，A 仅作可选降级。
 
 ## 限流真实性判定
 
