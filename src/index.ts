@@ -88,8 +88,10 @@ function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
  * 图片附件桥接：把持久化图片读成原始字节供适配器内联。
  *
  * 用 `ctx.get` 而非 `inject` —— 附件服务缺失时 provider 仍可正常加载，
- * 只是收到图片时报 UNSUPPORTED_CONTENT。两个 CodeBuddy 系产品（CodeBuddy /
- * WorkBuddy）共用同一后端与协议，图片能力相同，故共用本实现。
+ * 只是收到图片时报 UNSUPPORTED_CONTENT。三个 provider 共用本实现：
+ * 两个 CodeBuddy 系产品（CodeBuddy / WorkBuddy）共用同一后端与协议；
+ * LobsterAI 的图片形态同为 OpenAI 兼容的 `image_url` data URL
+ * （2026-09-17 实测服务端接受并正确识别内容）。
  */
 function makeReadImage(ctx: Context) {
   return async (attachment: unknown): Promise<{ data: Uint8Array; mediaType: string } | undefined> => {
@@ -297,6 +299,7 @@ export function apply(ctx: Context): void {
     },
     fetchRemoteModels: () => lobsterai.fetchModels(pool),
     resolveClientVersion: () => lobsterai.resolveClientVersion(),
+    readImage: makeReadImage(ctx),
     accountPool: pool,
     product: LOBSTERAI,
   })

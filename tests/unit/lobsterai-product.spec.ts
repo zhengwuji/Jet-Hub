@@ -57,11 +57,11 @@ describe('LobsterAI 产品配置', () => {
     expect(LOBSTERAI.fallbackClientVersion).not.toBe('0.1.0')
   })
 
-  it('UA 与 Capabilities 与 Go 侧实测实现一致', () => {
+  it('UA 与 Capabilities 与实测实现一致', () => {
     expect(LOBSTERAI.userAgent).toBe(LOBSTERAI_USER_AGENT)
     expect(LOBSTERAI.userAgent).toBe('LobsterAI/0.1.0')
     expect(LOBSTERAI.clientCapabilities).toBe(LOBSTERAI_CLIENT_CAPABILITIES)
-    expect(LOBSTERAI.clientCapabilities).toBe('kimi-k3-agentic-v1')
+    // 能力值本身的语义断言见下方「LobsterAI 客户端能力声明」。
   })
 
   it('**不**含 CodeBuddy 系专有字段（避免被误当成 BuddyProduct 使用）', () => {
@@ -130,5 +130,33 @@ describe('lobsteraiProductById', () => {
 
   it('ALL_LOBSTERAI_PRODUCTS 含且仅含 LobsterAI', () => {
     expect(ALL_LOBSTERAI_PRODUCTS).toEqual([LOBSTERAI])
+  })
+})
+
+/**
+ * 客户端能力声明必须与「可选思考档位」配套。
+ *
+ * 实测（2026-09-17，真实凭据）：`reasoning_effort: "off"` 只在
+ * `X-LobsterAI-Client-Capabilities` **包含 `thinking-level-control-v1`** 时
+ * 返回 200；只发 `kimi-k3-agentic-v1`（Go 桥接层的硬编码值）时服务端直接
+ * HTTP 500。即「关掉思考」这条协议需要客户端先声明支持它。
+ *
+ * 注意其他档位（low/high/max/xhigh）不受此约束 —— 所以这是一个只在
+ * 「用户把档位调到 off」时才暴露的隐蔽故障，必须在配置层锁死。
+ */
+describe('LobsterAI 客户端能力声明', () => {
+  it('包含 thinking-level-control-v1（否则 off 档会 500）', () => {
+    expect(LOBSTERAI.clientCapabilities).toContain('thinking-level-control-v1')
+  })
+
+  it('保留 kimi-k3-agentic-v1（kimi-k3 上线的前提）', () => {
+    // 实测：不带该能力时模型列表少一个 kimi-k3（25 vs 26）。
+    expect(LOBSTERAI.clientCapabilities).toContain('kimi-k3-agentic-v1')
+  })
+
+  it('以逗号分隔的多值形态下发（服务端按逗号拆分）', () => {
+    expect(LOBSTERAI.clientCapabilities).toBe(
+      'kimi-k3-agentic-v1,thinking-level-control-v1',
+    )
   })
 })

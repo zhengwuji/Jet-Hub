@@ -50,6 +50,22 @@ import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reso
 export const PROVIDER = 'lobsterai'
 
 /**
+ * 思考档位 wire 值 → 展示名。
+ *
+ * 键用 `openclawLevel`（发给服务端的 `reasoning_effort` 取值），
+ * **不是**产品侧的 `level` —— 两者在 `max`/`xhigh` 上不同名，
+ * 见 {@link LobsteraiThinkingOption}。命名风格对齐 buddy 适配器。
+ */
+const EFFORT_NAMES: Readonly<Record<string, string>> = {
+  off: 'Off',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+}
+
+/**
  * 限流重置时间的本地兜底（毫秒，1 小时）。
  *
  * 仅在**解析不出服务端声明的重置时刻**时使用（如纯文本 429）。
@@ -69,23 +85,111 @@ const LOBSTERAI_RATE_LIMIT_FALLBACK_MS = 3_600_000
 const LOBSTERAI_MAX_ROTATE = 3
 
 /**
+ * 远端 `thinkingConfig.options[]` 中的一档。
+ *
+ * **两个字段语义不同，不可混用**：
+ * - `level`：**产品侧档位名**（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`），
+ *   用于 UI 展示与 `defaultLevel` 引用；
+ * - `openclawLevel`：**发给服务端的 wire 值**（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`
+ *   —— **没有 `max`**），即 `reasoning_effort` 的取值。
+ *
+ * 实测（2026-09-17，真实凭据）：远端把 `level: 'max'` 映射到
+ * `openclawLevel: 'xhigh'`。直接发 `reasoning_effort: 'max'` 与不带参数无差异
+ * （走服务端默认），发 `'xhigh'` 才真正触发最高档 —— 因此必须用 `openclawLevel`。
+ */
+export interface LobsteraiThinkingOption {
+  /** 产品侧档位名（`defaultLevel` 引用的是这个值）。 */
+  level: string
+  /** 发给服务端的 `reasoning_effort` 取值。 */
+  openclawLevel: string
+}
+
+/** 远端 `thinkingConfig`：可选档位与默认档位。 */
+export interface LobsteraiThinkingConfig {
+  options: readonly LobsteraiThinkingOption[]
+  /** 默认档位（产品侧 `level` 值，需再经 `options` 映射成 wire 值）。 */
+  defaultLevel: string
+}
+
+/**
  * LobsterAI 远端模型条目。
  *
- * 本结构刻意只保留 `id`/`name`：模型选择器与 `listModels` 只需要这两项。
- *
- * **注意远端实际返回的字段远多于这两个**（2026-09-17 实测）：
+ * 除 `id`/`name` 外，还承载远端下发的**模型参数**（2026-09-17 实测）：
  * `contextWindow`（多数为 1000000）、`supportsImage`、`supportsThinking`、
- * `thinkingConfig`、`runtimeProfile`、`maxTokens`、`supportsToolCalling`、
- * `agenticReady` 等。本适配器**目前不消费**它们 —— 因此
- * `resolveModel` 里的上下文窗口仍取产品兜底表的估计值（131072）、
- * `inputModalities` 仍硬编码为 `['text']`，与远端真值不一致。
+ * `thinkingConfig`、`requestCapabilities`、`maxTokens`、`description`。
+ * 这些是 `listModels` / `resolveModel` 的权威依据，优先于产品兜底表的估值。
  *
- * 这是**已知的待办**，不是「远端没有这些数据」：需要更精确的上下文窗口或
- * 图片能力时，应从这里的响应中解析并透传，而不是去改兜底表。
+ * **可选字段缺失一律留 `undefined`，绝不填 0/false 之类的「假值」**：
+ * 「远端说该模型不支持图片」与「远端没说」是两回事，前者可以据此拒绝图片
+ * 输入，后者只能保守按不支持处理 —— 填 false 会让将来新增的视觉模型被
+ * 静默误判。
+ *
+ * `runtimeProfile` / `supportsToolCalling` / `agenticReady` / `costMultiplier`
+ * 等字段**当前不消费**：前三个是 IDE 内置 agent 内核（OpenClaw）的编排概念，
+ * 本插件只做 OpenAI 兼容转发，没有对应语义。
  */
 export interface LobsteraiRemoteModel {
   id: string
   name: string
+  /** 上下文窗口（远端权威值；缺失时由兜底表补位）。 */
+  contextWindow?: number
+  /** 是否接受图片输入。 */
+  supportsImage?: boolean
+  /** 是否支持思考（无 `thinkingConfig` 时无可选档位，仅作展示参考）。 */
+  supportsThinking?: boolean
+  /** 可选思考档位与默认档位。 */
+  thinkingConfig?: LobsteraiThinkingConfig
+  /** 该模型声明的请求能力（如 `lobsterai-options-v1`）。 */
+  requestCapabilities?: readonly string[]
+  /** 单次输出上限。 */
+  maxTokens?: number
+  /** 远端提供的模型描述（用于模型选择器）。 */
+  description?: string
+}
+
+/** 产品侧思考档位名的合法取值（远端 `level` 字段）。 */
+const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+/** wire 侧思考档位的合法取值（远端 `openclawLevel`，**无 `max`**）。 */
+const OPENCLAW_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+
+/**
+ * 解析 `thinkingConfig`；结构不符时返回 `undefined`（丢弃而非解析出半截数据）。
+ *
+ * 严格性对齐 IDE 的 `parseModelThinkingConfig`（`modelThinking.js`）：
+ * - `options` 必须是非空数组，每项都要有合法的 `level` 与 `openclawLevel`；
+ * - 两者的「是否 off」必须一致（避免 `off` 配一个非 off 的 wire 值）；
+ * - 不允许重复档位；
+ * - `defaultLevel` 必须存在且落在 `options` 里 —— 否则 DSH 会拿一个
+ *   不存在的档位去请求，比不声明更糟。
+ *
+ * 只有 `off` 一档时视为无档位可选（等价于不支持配置思考），返回 `undefined`。
+ */
+export function parseLobsteraiThinkingConfig(value: unknown): LobsteraiThinkingConfig | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const rawOptions = record.options
+  if (!Array.isArray(rawOptions) || rawOptions.length === 0) return undefined
+
+  const options: LobsteraiThinkingOption[] = []
+  const seenLevels = new Set<string>()
+  const seenWireLevels = new Set<string>()
+  for (const raw of rawOptions) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+    const entry = raw as Record<string, unknown>
+    const level = typeof entry.level === 'string' ? entry.level : ''
+    const openclawLevel = typeof entry.openclawLevel === 'string' ? entry.openclawLevel : ''
+    if (!THINKING_LEVELS.has(level) || !OPENCLAW_THINKING_LEVELS.has(openclawLevel)) return undefined
+    if (seenLevels.has(level) || seenWireLevels.has(openclawLevel)) return undefined
+    if ((level === 'off') !== (openclawLevel === 'off')) return undefined
+    seenLevels.add(level)
+    seenWireLevels.add(openclawLevel)
+    options.push({ level, openclawLevel })
+  }
+  if (options.length === 1 && options[0]!.level === 'off') return undefined
+
+  const defaultLevel = typeof record.defaultLevel === 'string' ? record.defaultLevel : ''
+  if (!seenLevels.has(defaultLevel)) return undefined
+  return { options, defaultLevel }
 }
 
 /**
@@ -122,8 +226,9 @@ export function readLobsteraiModelArray(body: unknown): readonly unknown[] {
 /**
  * 解析 `GET /api/models/available` 的响应。
  *
- * 只取 `modelId` 与 `modelName`：`provider`/`apiFormat` 是上游内部字段，
- * 对模型选择器没有意义。
+ * 取 `modelId`/`modelName` 与模型参数（见 {@link LobsteraiRemoteModel}）。
+ * `provider`/`apiFormat`/`runtimeProfile` 等字段不取：前者是上游内部字段，
+ * 后者是 IDE 内置 agent 内核的编排概念，对 OpenAI 兼容转发没有意义。
  *
  * 形状兼容性见 {@link readLobsteraiModelArray}。
  */
@@ -136,7 +241,25 @@ export function parseLobsteraiModels(body: unknown): LobsteraiRemoteModel[] {
     const id = readStringField(record, 'modelId')
     if (id.length === 0) continue
     const name = readStringField(record, 'modelName')
-    models.push({ id, name: name.length > 0 ? name : id })
+    const model: LobsteraiRemoteModel = { id, name: name.length > 0 ? name : id }
+
+    // 可选字段：只在远端确实给出合法值时才带上（见接口注释的「不编造值」约定）。
+    const contextWindow = readNumberField(record, 'contextWindow')
+    if (contextWindow !== undefined && contextWindow > 0) model.contextWindow = contextWindow
+    const maxTokens = readNumberField(record, 'maxTokens')
+    if (maxTokens !== undefined && maxTokens > 0) model.maxTokens = maxTokens
+    if (typeof record.supportsImage === 'boolean') model.supportsImage = record.supportsImage
+    if (typeof record.supportsThinking === 'boolean') model.supportsThinking = record.supportsThinking
+    const thinkingConfig = parseLobsteraiThinkingConfig(record.thinkingConfig)
+    if (thinkingConfig !== undefined) model.thinkingConfig = thinkingConfig
+    if (Array.isArray(record.requestCapabilities)) {
+      const capabilities = record.requestCapabilities.filter((c): c is string => typeof c === 'string')
+      if (capabilities.length > 0) model.requestCapabilities = capabilities
+    }
+    const description = readStringField(record, 'description')
+    if (description.length > 0) model.description = description
+
+    models.push(model)
   }
   return models
 }
@@ -175,6 +298,13 @@ export interface LobsteraiAdapterOptions {
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号）。 */
   accountPool?: AccountPool
+  /**
+   * 读取图片附件的原始字节（内联为 data URL 用）。
+   *
+   * 由调用方桥接 `ctx.attachments.readImage(ref)`；未提供时收到图片会报
+   * `UNSUPPORTED_CONTENT`（而不是静默丢弃）。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
 }
@@ -190,6 +320,79 @@ function contentToText(content: unknown): string {
     .join('')
 }
 
+/** 工具结果内嵌图片的载体文本（与 buddy / 官方 deepseek 适配器同名同义）。 */
+const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
+
+/**
+ * 把 harness 内容块转成 OpenAI 多模态 parts。
+ *
+ * 图片必须转成 `{type:'image_url', image_url:{url}}` —— 这是服务端**唯一**接受的
+ * 形态（2026-09-17 实测）：`{type:'image'}` 与裸 base64 字符串都返回 HTTP 500。
+ *
+ * 返回 `undefined` 表示「无图」；只要出现过图片块就一定返回数组（即便字节
+ * 解析失败也留 `[image unavailable]` 占位符），以免图片被静默吞掉。
+ *
+ * 与 `collectImages` 对称地**递归**处理 `tool-result` 内层：收集侧是任意深度，
+ * 序列化侧若只走一层，深层图片会被收进 refs 却在序列化时静默丢弃。
+ */
+function userContentParts(
+  content: readonly unknown[],
+  imageUrls: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> | undefined {
+  const parts: Array<Record<string, unknown>> = []
+  let hasImage = false
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
+    if (block.type === 'text') {
+      const text = String(block.text ?? '')
+      if (text.length > 0) parts.push({ type: 'text', text })
+      continue
+    }
+    if (block.type === 'image') {
+      hasImage = true
+      const url = block.attachment?.attachmentId === undefined
+        ? undefined
+        : imageUrls.get(String(block.attachment.attachmentId))
+      // 解析不到字节时留占位文本，而不是静默吞掉整张图。
+      parts.push(url === undefined
+        ? { type: 'text', text: '[image unavailable]' }
+        : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      const inner = userContentParts(block.content, imageUrls)
+      if (inner !== undefined) {
+        hasImage = true
+        parts.push(...inner)
+      } else {
+        // 内层无图：保留其文本，避免内容丢失。
+        const text = contentToText(block.content)
+        if (text.length > 0) parts.push({ type: 'text', text })
+      }
+    }
+  }
+  return hasImage && parts.length > 0 ? parts : undefined
+}
+
+/** 收集消息中的图片附件引用（含工具结果内嵌图片），按 attachmentId 去重。 */
+function collectImages(content: readonly unknown[], refs: Map<string, unknown>): void {
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown }; content?: unknown }
+    if (block.type === 'image' && typeof block.attachment?.attachmentId === 'string') {
+      refs.set(block.attachment.attachmentId, block.attachment)
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) collectImages(block.content, refs)
+  }
+}
+
 /**
  * 将 harness 对话消息序列化为 OpenAI chat-completions 传输格式。
  *
@@ -199,17 +402,33 @@ function contentToText(content: unknown): string {
  * - 孤儿工具调用清理（见 `resolveToolPairing` 的说明，后端会 400）；
  * - 正文为空且有 `tool_calls` 时 `content` 必须为 `null`（OpenAI 规范）。
  *
- * 图片块在此**不处理**：LobsterAI 是否支持图片输入未实测，
- * `stream()` 已在更早的地方以 `UNSUPPORTED_CONTENT` 拒绝。
+ * 图片：`imageUrls` 为 `undefined` 表示整个请求没有图片；非 undefined
+ * （**含空 Map**）时把 user 消息升级为多模态 parts。空 Map 不能降级为
+ * undefined —— 那会让「图片存在但字节读取失败」的 `[image unavailable]`
+ * 占位符也被跳过，图片静默消失。
  */
 function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
+  imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
   // OpenAI 兼容协议要求 tool_call 与 tool 结果严格配对：缺任一侧后端都会
   // 以 400 拒绝整个请求，而这条坏历史会被每次请求原样重放 ——
   // 表现为「会话突然报废，此后所有消息都无回复」。发出前剔除可让会话自愈。
   const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+
+  // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
+  // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
+  // 故挂起到其后的独立 user 消息统一发出（与 buddy 适配器同款处理）。
+  let pendingToolImages: Array<Record<string, unknown>> = []
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
+    })
+    pendingToolImages = []
+  }
 
   for (const message of messages) {
     if (message.role === 'assistant') {
@@ -229,6 +448,9 @@ function serializeMessages(
         .map((block) => String(block.text))
         .join('')
       const text = contentToText(content)
+      // 挂起的工具结果图片必须在 assistant 之前发出，否则会漂到这条
+      // assistant 之后，与产生它们的工具调用脱节。
+      flushToolImages()
       wire.push({
         role: 'assistant',
         // 正文为空且有工具调用时 content 必须为 null（OpenAI 规范）。
@@ -239,6 +461,7 @@ function serializeMessages(
       continue
     }
     if (message.role === 'system') {
+      flushToolImages()
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
@@ -247,17 +470,45 @@ function serializeMessages(
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
     const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    // 工具结果之外的常规内容（含顶层图片）。
+    const regular = content.filter((block) =>
+      !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
+    const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
+    if (parts !== undefined) {
+      flushToolImages()
+      wire.push({ role: 'user', content: parts })
+    } else if (text.length > 0 || toolResults.length === 0) {
+      flushToolImages()
+      wire.push({ role: 'user', content: text })
+    }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 的结果同样会让后端 400。
       if (!keepResultIds.has(String(result.toolCallId))) continue
+      // 内嵌图片挂起到其后的 user 消息；文本留在 tool 消息里。
+      let resultText = '(no output)'
+      if (imageUrls !== undefined && Array.isArray(result.content)) {
+        const resultParts = userContentParts(result.content, imageUrls)
+        if (resultParts !== undefined) {
+          pendingToolImages.push(...resultParts.filter((part) => part.type !== 'text'))
+          const joined = resultParts
+            .filter((part) => part.type === 'text')
+            .map((part) => String(part.text))
+            .join('')
+          if (joined.length > 0) resultText = joined
+        } else {
+          resultText = contentToText(result.content) || '(no output)'
+        }
+      } else {
+        resultText = contentToText(result.content) || '(no output)'
+      }
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
+        content: resultText,
       })
     }
   }
+  flushToolImages()
   return wire
 }
 
@@ -330,6 +581,8 @@ export class LobsteraiAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: LobsteraiRemoteModel[] | undefined
+  /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
+  private remoteMeta: ReadonlyMap<string, LobsteraiRemoteModel> = new Map()
   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
   private readonly fallbackIndex: ReadonlyMap<string, LobsteraiFallbackModel>
 
@@ -365,9 +618,56 @@ export class LobsteraiAdapter extends LlmAdapter {
     if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
     try {
       const models = await this.options.fetchRemoteModels()
-      if (models.length > 0) this.remoteModels = models
+      if (models.length > 0) {
+        this.remoteModels = models
+        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      }
     } catch {
       // 远端不可用：回退兜底目录（由 staticFallbackModels 提供）。
+    }
+  }
+
+  /**
+   * 模型接受的输入模态。
+   *
+   * 远端 `supportsImage` 是权威来源（实测 26 个模型里 19 个为 true）。
+   * 远端未声明时**保守报 text**：宁可少报能力（用户改用文本描述），
+   * 也不要报一个服务端不认的模态（请求会以 400 失败）。
+   */
+  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
+    return this.remoteMeta.get(model)?.supportsImage === true ? ['text', 'image'] : ['text']
+  }
+
+  /**
+   * 模型的上下文窗口：远端权威值优先，兜底表估值次之。
+   *
+   * 兜底表统一写 131072，而实测远端多数模型返回 1000000 —— 采信估值会让
+   * DSH 在远未用满窗口时就触发上下文压缩。
+   */
+  private contextWindowFor(model: string): number | undefined {
+    return this.remoteMeta.get(model)?.contextWindow ?? this.fallbackIndex.get(model)?.contextWindow
+  }
+
+  /**
+   * 模型可选的思考档位（id 为**发给服务端的 wire 值** `openclawLevel`）。
+   *
+   * 无 `thinkingConfig` 的模型返回空数组 —— 此时不声明 `reasoning`，
+   * UI 显示「当前模型未提供推理等级」，而不是给一个发了也没用的档位。
+   */
+  private reasoningFor(model: string): LlmResolvedModelInfo['reasoning'] {
+    const config = this.remoteMeta.get(model)?.thinkingConfig
+    if (config === undefined) return undefined
+    // defaultEffort 必须落在 efforts 内：DSH 会拿它直接发请求，
+    // 给一个不存在的档位比不给更糟。远端数据不一致时退化为不声明默认值。
+    const defaultWire = config.options.find((option) => option.level === config.defaultLevel)?.openclawLevel
+    return {
+      efforts: config.options.map((option) => ({
+        id: ReasoningEffortId(option.openclawLevel),
+        name: EFFORT_NAMES[option.openclawLevel] ?? option.openclawLevel,
+      })),
+      ...defaultWire !== undefined
+        ? { defaultEffort: ReasoningEffortId(defaultWire) }
+        : {},
     }
   }
 
@@ -394,27 +694,29 @@ export class LobsteraiAdapter extends LlmAdapter {
       provider: this.product.id,
       id: model.id,
       name: model.name,
-      // 图片输入未实测支持，一律只报文本。
-      inputModalities: ['text'] as const,
+      // 远端 supportsImage 权威；未声明时保守报 text（见 inputModalitiesFor）。
+      inputModalities: this.inputModalitiesFor(model.id),
     }))
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     await this.ensureRemoteModels()
-    const remoteName = this.remoteModels?.find((entry) => entry.id === model)?.name
+    const remoteName = this.remoteMeta.get(model)?.name
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
       name: remoteName ?? this.fallbackIndex.get(model)?.name ?? model,
-      inputModalities: ['text'],
+      inputModalities: this.inputModalitiesFor(model),
     }
-    // 上下文窗口：只用产品兜底表的值（远端不返回该字段）。
-    // 注意这是**桥接层的估计值**，见 LobsteraiFallbackModel.contextWindow 的说明。
-    const contextWindow = this.fallbackIndex.get(model)?.contextWindow
+    // 上下文窗口：远端权威值优先，兜底表估值次之（见 contextWindowFor）。
+    const contextWindow = this.contextWindowFor(model)
     if (contextWindow !== undefined) resolved.context = { contextWindow }
-    // 思考等级：**刻意不声明**。LobsterAI 是否支持 reasoning_effort 未实测
-    // （Go 桥接层完全没处理）。不声明时模型选择器会显示「当前模型未提供推理等级」，
-    // 这是诚实的；声明了却无效会让用户以为档位生效了。
+    // 单次输出上限：仅当远端声明时才带（不编造默认值）。
+    const maxTokens = this.remoteMeta.get(model)?.maxTokens
+    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
+    // 思考档位：远端 thinkingConfig 权威（见 reasoningFor 的 wire 值说明）。
+    const reasoning = this.reasoningFor(model)
+    if (reasoning !== undefined) resolved.reasoning = reasoning
     return resolved
   }
 
@@ -447,17 +749,38 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 图片：LobsterAI 未实测支持，明确报错而不是静默丢弃（静默丢弃会让用户
-    // 以为模型看到了图片）。检查在取凭据之前，省掉一次无谓的凭据读取。
+    // 远端模型元数据必须在**图片能力判定之前**就位（见下方 inputModalitiesFor）：
+    // 它决定该模型是否接受图片，而元数据只能从远端目录拿到。
+    await this.ensureRemoteModels()
+
+    // 图片能力按**模型**判定（远端 `supportsImage`），不是按 provider 一刀切：
+    // 实测 26 个模型里 19 个支持图片，7 个纯文本。对不支持的模型明确报错
+    // 而不是静默丢弃（静默丢弃会让用户以为模型看到了图片）。
+    //
+    // 注意这里**不能**放宽成「总是接受」：DSH 在 LlmRuntime 里按适配器播报的
+    // `inputModalities` 决定要不要把图片投影成文本占位符，声明支持就必须真支持。
+    const imageRefs = new Map<string, unknown>()
     for (const message of options.messages) {
-      if (!Array.isArray(message.content)) continue
-      const hasImage = message.content.some((block) =>
-        typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image')
-      if (hasImage) {
+      if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+    }
+    let imageUrls: Map<string, string> | undefined
+    if (imageRefs.size > 0) {
+      if (!this.inputModalitiesFor(options.model).includes('image')) {
         throw new LlmError(
-          'lobsterai: 当前 provider 不支持图片输入',
+          `lobsterai: 模型 "${options.model}" 不支持图片输入`,
           'UNSUPPORTED_CONTENT',
         )
+      }
+      if (this.options.readImage === undefined) {
+        throw new LlmError('lobsterai: 图片输入需要附件服务', 'UNSUPPORTED_CONTENT')
+      }
+      // 保留**空 Map**（而非降级为 undefined）：图片存在但全部读取失败时，
+      // 空 Map 仍会让 userContentParts 产出 [image unavailable] 占位符。
+      imageUrls = new Map()
+      for (const [id, ref] of imageRefs) {
+        const image = await this.options.readImage(ref)
+        if (image === undefined) continue
+        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }
     }
 
@@ -489,10 +812,8 @@ export class LobsteraiAdapter extends LlmAdapter {
       }
     }
 
-    await this.ensureRemoteModels()
-
     // 3. 构造请求体
-    const messages = serializeMessages(options.messages)
+    const messages = serializeMessages(options.messages, imageUrls)
     if (options.system !== undefined && options.system.length > 0) {
       messages.unshift({ role: 'system', content: options.system })
     }
@@ -777,12 +1098,17 @@ export class LobsteraiAdapter extends LlmAdapter {
           // Go 用 `&& !gotAnyContent`（`sse.go:98`，标志位在 `sse.go:72`
           // 每次写入 delta.content 时置 true）表达「只要已经收到过正文，
           // 就再也不采纳 message 形态」。这里照搬该语义。
+          // 注意 `typeof === 'string'` 而非 `!== undefined`：真实线上形态里
+          // 一个模型要么走 content、要么走 reasoning_content，**另一侧恒为
+          // `null`**（实测 335 帧中 content=null 有 227 帧）。只判 undefined
+          // 会让 `.length` 在 null 上崩溃，表现为「每轮对话第一帧就报
+          // Cannot read properties of null」。
           const deltaContent = delta?.content
-          const textDelta = deltaContent !== undefined && deltaContent.length > 0
+          const textDelta = typeof deltaContent === 'string' && deltaContent.length > 0
             ? deltaContent
             : (!gotAnyContent && typeof choice?.message?.content === 'string' ? choice.message.content : undefined)
           if (textDelta !== undefined && textDelta.length > 0) {
-            if (deltaContent !== undefined && deltaContent.length > 0) gotAnyContent = true
+            if (typeof deltaContent === 'string' && deltaContent.length > 0) gotAnyContent = true
             let block = blocks.find(candidate => candidate.kind === 'text')
             if (block === undefined) {
               block = { index: nextIndex++, kind: 'text', text: '' }
@@ -792,7 +1118,9 @@ export class LobsteraiAdapter extends LlmAdapter {
             block.text += textDelta
             yield { type: 'text-delta', index: block.index, text: textDelta }
           }
-          if (delta?.reasoning_content !== undefined && delta.reasoning_content.length > 0) {
+          // 同样必须用 `typeof === 'string'`：`reasoning_content` 也会显式返回
+          // null（实测 335 帧中 107 帧为 null）。
+          if (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
             let block = blocks.find(candidate => candidate.kind === 'reasoning')
             if (block === undefined) {
               block = { index: nextIndex++, kind: 'reasoning', text: '' }

@@ -100,11 +100,21 @@ export const LOBSTERAI_FALLBACK_CLIENT_VERSION = '2026.9.4'
 /**
  * 客户端能力声明（`X-LobsterAI-Client-Capabilities` 头）。
  *
- * 实测值来自 `internal/upstream/client.go:99`（硬编码）。
- * 该头看起来是在声明「本客户端支持 kimi-k3 的 agentic 协议」，
- * 换掉可能影响工具调用行为，故原样保留。
+ * 两个能力**都必须声明**，各自解决一个具体问题（2026-09-17 真实凭据实测）：
+ *
+ * - `kimi-k3-agentic-v1`：**模型列表的准入条件**。不带该能力时
+ *   `/api/models/available` 只返回 25 个模型且**没有 `kimi-k3`**；带上才 26 个。
+ *   该值来自 `internal/upstream/client.go:99` 的硬编码。
+ * - `thinking-level-control-v1`：**思考档位协议的前提**。`reasoning_effort`
+ *   的常规档位（low/high/max/xhigh）不需要它，但 `"off"`（关闭思考）
+ *   在**不带**该能力时服务端直接 HTTP 500（`{"code":500,"message":"服务器内部错误"}`），
+ *   带上则正常返回。也就是说「关掉思考」这条协议要先声明支持它。
+ *
+ * 顺序无关（两种顺序都实测通过），但保持与 IDE 的
+ * `LOBSTERAI_CLIENT_CAPABILITIES`（`modelRuntimeProfiles.js`）一致的排列。
  */
-export const LOBSTERAI_CLIENT_CAPABILITIES = 'kimi-k3-agentic-v1'
+export const LOBSTERAI_CLIENT_CAPABILITIES
+  = 'kimi-k3-agentic-v1,thinking-level-control-v1'
 
 /**
  * User-Agent。

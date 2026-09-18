@@ -138,6 +138,94 @@ describe('LobsterAI 模型列表解析', () => {
   })
 })
 
+/**
+ * 远端下发的模型**参数**解析。
+ *
+ * 远端每个模型除 id/name 外还带 `contextWindow` / `supportsImage` /
+ * `supportsThinking` / `thinkingConfig` / `requestCapabilities` / `maxTokens`
+ * / `description`（2026-09-17 实测）。这些是模型选择器与请求构造的权威依据，
+ * 早先实现把它们全部丢弃，导致上下文窗口用的是兜底表估值、模态恒为 text。
+ */
+describe('LobsterAI 远端模型参数解析', () => {
+  /** 一个贴近真实响应的模型条目。 */
+  const rawModel = {
+    modelId: 'deepseek-flash',
+    modelName: 'DeepSeek-V4.1-Flash',
+    provider: 'LobsterAI',
+    apiFormat: 'openai',
+    runtimeProfile: null,
+    supportsImage: true,
+    supportsThinking: true,
+    thinkingConfig: {
+      options: [
+        { level: 'off', openclawLevel: 'off' },
+        { level: 'high', openclawLevel: 'high' },
+        { level: 'max', openclawLevel: 'xhigh' },
+      ],
+      defaultLevel: 'high',
+    },
+    requestCapabilities: ['lobsterai-options-v1'],
+    contextWindow: 1_000_000,
+    maxTokens: null,
+    description: 'DeepSeek V4.1 Flash 原生多模态。',
+  }
+
+  it('解析 contextWindow / supportsImage / supportsThinking / description', () => {
+    const [model] = parseLobsteraiModels({ code: 0, message: 'success', data: [rawModel] })
+    expect(model).toMatchObject({
+      id: 'deepseek-flash',
+      name: 'DeepSeek-V4.1-Flash',
+      contextWindow: 1_000_000,
+      supportsImage: true,
+      supportsThinking: true,
+      description: 'DeepSeek V4.1 Flash 原生多模态。',
+    })
+  })
+
+  it('解析 thinkingConfig 的 options 与 defaultLevel', () => {
+    const [model] = parseLobsteraiModels({ code: 0, data: [rawModel] })
+    expect(model!.thinkingConfig).toEqual({
+      options: [
+        { level: 'off', openclawLevel: 'off' },
+        { level: 'high', openclawLevel: 'high' },
+        { level: 'max', openclawLevel: 'xhigh' },
+      ],
+      defaultLevel: 'high',
+    })
+  })
+
+  it('解析 requestCapabilities', () => {
+    const [model] = parseLobsteraiModels({ code: 0, data: [rawModel] })
+    expect(model!.requestCapabilities).toEqual(['lobsterai-options-v1'])
+  })
+
+  it('字段缺失时**不**编造值（留 undefined，而非填 0/false）', () => {
+    // 区分「远端说没有」与「远端没说」：填 false 会让支持图片的模型被误判为
+    // 纯文本，填 0 会让上下文窗口变成 0。
+    const [model] = parseLobsteraiModels({
+      code: 0, data: [{ modelId: 'bare', modelName: 'Bare' }],
+    })
+    expect(model).toEqual({ id: 'bare', name: 'Bare' })
+    expect(model).not.toHaveProperty('contextWindow')
+    expect(model).not.toHaveProperty('supportsImage')
+    expect(model).not.toHaveProperty('thinkingConfig')
+  })
+
+  it('畸形 thinkingConfig 被丢弃而非解析出半截数据', () => {
+    for (const bad of [
+      { options: [] },
+      { options: 'nope', defaultLevel: 'high' },
+      { options: [{ level: 'high' }], defaultLevel: 'high' },
+      { options: [{ level: 'high', openclawLevel: 'high' }] }, // 缺 defaultLevel
+    ]) {
+      const [model] = parseLobsteraiModels({
+        code: 0, data: [{ modelId: 'm', modelName: 'M', thinkingConfig: bad }],
+      })
+      expect(model!.thinkingConfig, JSON.stringify(bad)).toBeUndefined()
+    }
+  })
+})
+
 describe('LobsterAI 模型列表 query', () => {
   it('带 keyfrom 身份字段但**不含** refreshToken', () => {
     // client.go:229-241 只用 KeyfromBody 的字段；refreshToken 进 query
@@ -191,6 +279,28 @@ describe('LobsteraiAdapter 模型目录', () => {
     }
   })
 
+  /**
+   * 远端声明 `supportsImage` 时必须以它为准。
+   *
+   * 历史实现硬编码 `['text']`（当时以为远端不下发该字段），实测远端 26 个
+   * 模型里有 19 个 `supportsImage: true` —— 硬编码会让这些模型的图片能力
+   * 在 UI 上被标成不支持，用户无法粘贴图片。
+   */
+  it('远端 supportsImage=true 时报 text+image', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [
+        { id: 'vision', name: 'Vision', supportsImage: true },
+        { id: 'plain', name: 'Plain', supportsImage: false },
+        { id: 'unknown', name: 'Unknown' },
+      ],
+    })
+    const models = await adapter.listModels('lobsterai')
+    expect(models.find((m) => m.id === 'vision')!.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((m) => m.id === 'plain')!.inputModalities).toEqual(['text'])
+    // 远端未声明时保守报 text（不猜测能力）。
+    expect(models.find((m) => m.id === 'unknown')!.inputModalities).toEqual(['text'])
+  })
+
   it('远端可用时以远端为准（不做「以兜底表为准」的裁剪）', async () => {
     // LobsterAI 的远端接口是权威的（兜底表本身就抄自它），
     // 与 buddy 的 reconcileWithFallback 语义相反。
@@ -231,12 +341,94 @@ describe('LobsteraiAdapter resolveModel', () => {
     expect(resolved.context).toEqual({ contextWindow: 131_072 })
   })
 
-  it('**不声明** reasoning（是否支持思考等级未实测）', async () => {
-    // 声明了却无效会让用户以为档位生效；不声明时 UI 显示
-    //「当前模型未提供推理等级」，这是诚实的。
-    const { adapter } = makeAdapter(() => textSse('x'))
+  /**
+   * 远端 `contextWindow` 优先于兜底表估值。
+   *
+   * 实测远端多数模型返回 1000000，而兜底表是 131072 的统一估值 ——
+   * 用估值会让 DSH 过早触发上下文压缩，浪费 1M 窗口。
+   */
+  it('远端 contextWindow 优先于兜底表估值', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [
+        { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000 },
+      ],
+    })
     const resolved = await adapter.resolveModel('lobsterai', 'glm-5.2')
-    expect(resolved.reasoning).toBeUndefined()
+    expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
+  })
+
+  it('远端未给 contextWindow 时回退兜底表', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2' }],
+    })
+    expect((await adapter.resolveModel('lobsterai', 'glm-5.2')).context)
+      .toEqual({ contextWindow: 131_072 })
+  })
+
+  it('远端 maxTokens 映射为 defaultMaxTokens', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [{ id: 'm1', name: 'M1', maxTokens: 8_192 }],
+    })
+    expect((await adapter.resolveModel('lobsterai', 'm1')).defaultMaxTokens).toBe(8_192)
+  })
+
+  /**
+   * 思考档位：远端 `thinkingConfig.options` 是权威来源。
+   *
+   * 关键语义（真实凭据实测 2026-09-17）：发给服务端的 `reasoning_effort`
+   * 用 **`openclawLevel`**，不是 `level`。实测 `reasoning_effort=max` 与不带
+   * 参数无差异（走服务端默认），而 `xhigh` 才真正触发最高档 —— 与远端把
+   * `level: max` 映射到 `openclawLevel: xhigh` 完全自洽。
+   */
+  it('远端 thinkingConfig 映射为 reasoning 档位（id 用 openclawLevel）', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [{
+        id: 'deepseek-flash',
+        name: 'DeepSeek-V4.1-Flash',
+        thinkingConfig: {
+          options: [
+            { level: 'off', openclawLevel: 'off' },
+            { level: 'high', openclawLevel: 'high' },
+            { level: 'max', openclawLevel: 'xhigh' },
+          ],
+          defaultLevel: 'high',
+        },
+      }],
+    })
+    const resolved = await adapter.resolveModel('lobsterai', 'deepseek-flash')
+    expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['off', 'high', 'xhigh'])
+    expect(resolved.reasoning?.efforts.map((e) => e.name)).toEqual(['Off', 'High', 'XHigh'])
+    // defaultEffort 必须是 openclawLevel（'high' 恰好同名），
+    // 且必须落在 efforts 内 —— 否则 DSH 会拿一个不存在的档位去请求。
+    expect(resolved.reasoning?.defaultEffort).toBe('high')
+  })
+
+  it('defaultLevel 为 max 时 defaultEffort 映射成 xhigh', async () => {
+    // glm-5.3-flash 实测 defaultLevel=max，而 max 的 wire 值是 xhigh。
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [{
+        id: 'glm-5.3-flash',
+        name: 'GLM-5.3-Flash',
+        thinkingConfig: {
+          options: [
+            { level: 'off', openclawLevel: 'off' },
+            { level: 'high', openclawLevel: 'high' },
+            { level: 'max', openclawLevel: 'xhigh' },
+          ],
+          defaultLevel: 'max',
+        },
+      }],
+    })
+    const resolved = await adapter.resolveModel('lobsterai', 'glm-5.3-flash')
+    expect(resolved.reasoning?.defaultEffort).toBe('xhigh')
+  })
+
+  it('无 thinkingConfig 的模型不声明 reasoning（如 MiniMax-M3）', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [{ id: 'MiniMax-M3', name: 'MiniMax-M3', supportsThinking: true }],
+    })
+    // supportsThinking=true 但无 thinkingConfig ⇒ 无可选档位，不声明 reasoning。
+    expect((await adapter.resolveModel('lobsterai', 'MiniMax-M3')).reasoning).toBeUndefined()
   })
 
   it('未知模型回退为 id 作展示名且不报错', async () => {
@@ -267,7 +459,7 @@ describe('LobsteraiAdapter 请求构造', () => {
     await collect(generateOptions(), adapter)
     const headers = calls[0]!.init?.headers as Headers
     expect(headers.get('Authorization')).toBe('Bearer AT')
-    expect(headers.get('X-LobsterAI-Client-Capabilities')).toBe('kimi-k3-agentic-v1')
+    expect(headers.get('X-LobsterAI-Client-Capabilities')).toBe(LOBSTERAI.clientCapabilities)
     expect(headers.get('X-LobsterAI-Client-Version')).toBe(CLIENT_VERSION)
     expect(headers.get('User-Agent')).toBe('LobsterAI/0.1.0')
     for (const banned of ['X-Domain', 'X-Product', 'X-Product-Code', 'X-IDE-Name']) {
@@ -391,7 +583,7 @@ describe('LobsteraiAdapter 错误处理', () => {
     expect(error.code).toBe('TRANSPORT')
   })
 
-  it('图片输入报 UNSUPPORTED_CONTENT（而不是静默丢弃）', async () => {
+  it('模型不支持图片时报 UNSUPPORTED_CONTENT（而不是静默丢弃）', async () => {
     const { adapter, calls } = makeAdapter(() => textSse('hi'))
     const options = generateOptions({
       messages: [createUserMessage({
@@ -402,6 +594,120 @@ describe('LobsteraiAdapter 错误处理', () => {
     await expect(collect(options, adapter)).rejects.toThrow(/不支持图片输入/)
     // 应在取凭据/发请求之前就拒绝。
     expect(calls).toHaveLength(0)
+  })
+
+  /**
+   * 远端声明 `supportsImage` 的模型必须**真的**接受图片。
+   *
+   * 只声明 `inputModalities` 而不实现是比不声明更糟的状态：DSH 在
+   * `LlmRuntime`（dsh-llm `lib/index.js`）里按 `inputModalities` 决定要不要把
+   * 图片投影成文本占位符 —— 声明含 image 时图片会原样透传给适配器，
+   * 适配器若拒绝，请求就直接失败（用户看到「粘贴图片后必报错」）。
+   *
+   * 实测（2026-09-17）服务端接受 `image_url` 形态的 data URL 并正确识别内容，
+   * 故这里要求发出该形态。
+   */
+  it('远端 supportsImage 的模型发出 image_url data URL', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('hi'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImage: true }],
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+    })
+    const options = generateOptions({
+      messages: [createUserMessage({
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', attachment: { attachmentId: 'a1' } },
+        ],
+        source: { kind: 'user' },
+      })],
+    } as never)
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<Record<string, unknown>> }
+    const user = body.messages.find((m) => m.role === 'user')!
+    expect(user.content).toEqual([
+      { type: 'text', text: '看图' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    ])
+  })
+
+  it('模型支持图片但附件服务不可用时报错（而非静默丢图）', async () => {
+    const { adapter } = makeAdapter(() => textSse('hi'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImage: true }],
+      // 不提供 readImage
+    })
+    const options = generateOptions({
+      messages: [createUserMessage({
+        content: [{ type: 'image', attachment: { attachmentId: 'a1' } }],
+        source: { kind: 'user' },
+      })],
+    } as never)
+    await expect(collect(options, adapter)).rejects.toThrow(/附件服务/)
+  })
+
+  it('图片字节读取失败时留占位文本（不静默丢图）', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('hi'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImage: true }],
+      readImage: async () => undefined,
+    })
+    const options = generateOptions({
+      messages: [createUserMessage({
+        content: [{ type: 'image', attachment: { attachmentId: 'a1' } }],
+        source: { kind: 'user' },
+      })],
+    } as never)
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<Record<string, unknown>> }
+    const user = body.messages.find((m) => m.role === 'user')!
+    expect(user.content).toEqual([{ type: 'text', text: '[image unavailable]' }])
+  })
+
+  /**
+   * 工具结果内嵌的图片（`read_image` 等）必须被提升到独立的 user 消息。
+   *
+   * OpenAI 兼容协议要求每条 `role:'tool'` 消息紧跟其 assistant tool_call，
+   * 中间插入任何消息都会 400；而 `role:'tool'` 的 content 只能是字符串。
+   * 故图片只能挂到其后的 user 消息 —— 直接丢在 tool 结果里会被
+   * `contentToText` 静默吞掉（连占位符都没有）。
+   */
+  it('工具结果内嵌图片被提升为独立 user 消息', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('hi'), {
+      fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImage: true }],
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+    })
+    const options = generateOptions({
+      messages: [
+        // tool 结果必须与其 assistant tool_call 配对，否则会被孤儿清理剔除
+        // （那是防后端 400 的既有逻辑，与本用例无关）。
+        {
+          role: 'assistant',
+          content: [{
+            type: 'tool-call', id: 't1', name: 'read_image', arguments: '{}',
+          }],
+        },
+        createUserMessage({
+          content: [{
+            type: 'tool-result',
+            toolCallId: 't1',
+            content: [
+              { type: 'text', text: '截图完成' },
+              { type: 'image', attachment: { attachmentId: 'a1' } },
+            ],
+          }],
+          source: { kind: 'user' },
+        }),
+      ],
+    } as never)
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<Record<string, unknown>> }
+    const tool = body.messages.find((m) => m.role === 'tool')!
+    // 文本留在 tool 消息里。
+    expect(tool.content).toBe('截图完成')
+    // 图片被提升到其后的 user 消息，而不是被吞掉。
+    const imageUser = body.messages.filter((m) => m.role === 'user')
+      .find((m) => Array.isArray(m.content))
+    expect(imageUser!.content).toContainEqual({
+      type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' },
+    })
   })
 })
 
@@ -427,6 +733,28 @@ describe('LobsteraiAdapter SSE 消费', () => {
     const { adapter } = makeAdapter(() => new Response(body, { status: 200 }))
     const chunks = await collect(generateOptions(), adapter)
     expect(chunks).toContainEqual({ type: 'text-delta', index: 0, text: 'x' })
+  })
+
+  /**
+   * `delta.content` / `delta.reasoning_content` 显式返回 **`null`** 时必须容忍。
+   *
+   * 真实线上形态（2026-09-17 实测 335 帧）：一个模型要么走 content、要么走
+   * reasoning_content，另一侧恒为 `null`（227 帧 content=null / 107 帧
+   * reasoning_content=null）。早先实现只判 `!== undefined` 就取 `.length`，
+   * 于是**每一轮对话都在第一帧崩溃**，报
+   * `Cannot read properties of null (reading 'length')`。
+   */
+  it('delta.content 为 null 时不崩溃（真实线上形态）', async () => {
+    const { adapter } = makeAdapter(() => sseResponse([
+      JSON.stringify({ choices: [{ delta: { role: 'assistant', content: null, reasoning_content: '想' } }] }),
+      JSON.stringify({ choices: [{ delta: { content: null, reasoning_content: null } }] }),
+      JSON.stringify({ choices: [{ delta: { content: '答' } }] }),
+      JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    ]))
+    const chunks = await collect(generateOptions(), adapter)
+    expect(chunks).toContainEqual({ type: 'reasoning-delta', index: 0, text: '想' })
+    expect(chunks).toContainEqual({ type: 'text-delta', index: 1, text: '答' })
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
   })
 
   it('reasoning_content 单独成块', async () => {
