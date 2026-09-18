@@ -24,13 +24,15 @@
  * | `codearts`  | ✗ 华为云账号体系     | ✗                            |
  * | `buddy`     | ✓                   | ✓                            |
  * | `workbuddy` | ✓                   | ✗ 国际版后端无签到接口        |
+ * | `lobsterai` | ✓                   | ✓ `client-activities` 三步流程 |
  *
- * - `balance`：`POST /v2/billing/meter/get-user-resource`。CodeBuddy 与
- *   WorkBuddy 国际版**通用**（仅 baseURL 随 `product.endpoint` 切换），
- *   见 README「积分余额」。
- * - `dailyCheckin`：`checkin-activity-status` + `daily-checkin`。**仅 CodeBuddy
- *   中国版**有；WorkBuddy 国际版内核里只有 `get-dosage-notify`（用量通知），
- *   没有签到接口，故其面板不渲染「一键领取积分」。
+ * - `balance`：CodeBuddy 系用 `POST /v2/billing/meter/get-user-resource`
+ *   （CodeBuddy 与 WorkBuddy 国际版**通用**，仅 baseURL 随 `product.endpoint`
+ *   切换）；LobsterAI 用 `GET /api/user/profile-summary`。见 README「积分余额」。
+ * - `dailyCheckin`：CodeBuddy 系用 `checkin-activity-status` + `daily-checkin`
+ *   （**仅 CodeBuddy 中国版**有；WorkBuddy 国际版内核里只有
+ *   `get-dosage-notify` 用量通知）；LobsterAI 用 `client-activities` 的
+ *   slot → context → check_in 三步（见 `src/lobsterai-credits.ts`）。
  *
  * 判定一律**默认关闭**：未登记的 provider 视为不支持任何积分能力。这样将来
  * 新增 provider 时，若忘记在此登记，最坏结果是「暂时看不到积分」，而不是
@@ -42,6 +44,7 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   codearts: Object.freeze({ balance: false, dailyCheckin: false }),
   buddy: Object.freeze({ balance: true, dailyCheckin: true }),
   workbuddy: Object.freeze({ balance: true, dailyCheckin: false }),
+  lobsterai: Object.freeze({ balance: true, dailyCheckin: true }),
 });
 
 /**
