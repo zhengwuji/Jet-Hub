@@ -641,6 +641,11 @@ export class BuddyAdapter extends LlmAdapter {
         ...entry.contextWindow !== undefined || remote?.contextWindow !== undefined
           ? { contextWindow: remote?.contextWindow ?? entry.contextWindow }
           : {},
+        // 输出上限同样「远端优先、兜底补位」：远端不下发时兜底表给保守值，
+        // 两边都没有则留 undefined（不编造，见 resolveModel 的说明）。
+        ...entry.maxOutputTokens !== undefined || remote?.maxOutputTokens !== undefined
+          ? { maxOutputTokens: remote?.maxOutputTokens ?? entry.maxOutputTokens }
+          : {},
         ...entry.supportsImages !== undefined || remote?.supportsImages !== undefined
           ? { supportsImages: remote?.supportsImages ?? entry.supportsImages }
           : {},
@@ -765,6 +770,23 @@ export class BuddyAdapter extends LlmAdapter {
       inputModalities: this.inputModalitiesFor(model),
     }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
+    // 单次输出上限：远端 maxOutputTokens（实测 deepseek-v4.1-flash = 128000）
+    // 优先，产品兜底表次之。
+    //
+    // **为什么必须声明**：DSH 在 `resolveCallWithInfo` 里只在调用方未显式给值时
+    // 用 `defaultMaxTokens` 兜底，适配器不声明就等于把这个值永久交给网关默认
+    // （实测网关默认仅 32000 —— 见远端 `auto` 模型的 maxOutputTokens）。结果是
+    // 大文件写入 / 长回答在 32000 处被截断成 finish_reason:'length'，UI 报
+    // 「已达到输出 token 上限」。这与 codearts 适配器显式发 max_tokens 的做法
+    // （llm-adapter.ts）本应一致。
+    //
+    // 远端与兜底表都没有该模型的值时**保持 undefined**，交给网关默认值：
+    // 编造一个偏大的值会让服务端 400 拒绝（参考 codearts 131072 被拒的实测），
+    // 偏小则无谓截断用户输出。
+    const maxOutputTokens = positiveMaxTokens(
+      this.remoteMeta.get(model)?.maxOutputTokens ?? this.productFallbackMeta.get(model)?.maxOutputTokens,
+    )
+    if (maxOutputTokens !== undefined) resolved.defaultMaxTokens = maxOutputTokens
     // 思考等级：这是"思考强度"选择器出现在模型选择里的唯一入口——composer
     // 读取 resolveModel().reasoning。无等级可选的模型不声明该字段，UI 显示
     // "当前模型未提供推理等级"。
@@ -912,6 +934,19 @@ export class BuddyAdapter extends LlmAdapter {
     if (tools !== undefined && tools.length > 0) bodyObj.tools = tools
     if (options.temperature !== undefined) bodyObj.temperature = options.temperature
     if (options.stop !== undefined && options.stop.length > 0) bodyObj.stop = options.stop
+    // 单次请求输出上限。此前**完全没有**下发该字段，导致上限由网关默认值决定
+    // （实测仅 32000），大文件写入会在中途被截断成 `finish_reason:'length'`，
+    // UI 报「已达到输出 token 上限」，且本地无从调整。
+    //
+    // 取值优先级：调用方显式给的 options.maxTokens（DSH 会先注入 resolveModel
+    // 声明的 defaultMaxTokens）→ 远端 maxOutputTokens → 产品兜底表。
+    // 三者皆无则不发该字段，保持网关默认（不编造，理由见 resolveModel）。
+    const maxTokens = positiveMaxTokens(
+      options.maxTokens
+        ?? this.remoteMeta.get(options.model)?.maxOutputTokens
+        ?? this.productFallbackMeta.get(options.model)?.maxOutputTokens,
+    )
+    if (maxTokens !== undefined) bodyObj.max_tokens = maxTokens
     // DeepSeek 思维链开关（逆向官方 codebuddy.js，对齐 workbuddy2api-panel
     // thinking.go）。**实测关键结论（2026-09，直连三站点对照）**：
     //   - 裸请求（无 reasoning_effort、无 thinking）→ reasoning_content 恒为 0；
@@ -1278,6 +1313,19 @@ export class BuddyAdapter extends LlmAdapter {
 function isCredentialExpired(credential: BuddyCredential): boolean {
   const expiresAt = credentialExpiresAtMs(credential)
   return expiresAt === undefined ? false : Date.now() >= expiresAt
+}
+
+/**
+ * 把候选输出上限规整为「可安全下发的正整数」，否则返回 undefined。
+ *
+ * 为什么必须过滤：DSH 的 `LlmRuntime.resolveModelInfoFor` 对适配器声明的
+ * `defaultMaxTokens` 有硬校验 —— 非安全整数或 ≤0 会直接抛
+ * `adapter returned invalid default maxTokens`（INVALID_MODEL_MAX_TOKENS），
+ * 整轮对话起不来。远端是外部输入，`0` / 负数 / `NaN` 都可能出现，
+ * 不能在适配器里假设它合法。
+ */
+function positiveMaxTokens(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
 /**

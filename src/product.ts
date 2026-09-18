@@ -35,6 +35,13 @@ export interface BuddyFallbackModel {
   name: string
   /** 上下文窗口（对应远端 `maxInputTokens`）。 */
   contextWindow?: number
+  /**
+   * 单次请求输出上限（对应远端 `maxOutputTokens`）。
+   *
+   * 远端可达时以远端为准；本字段只在远端不可用或未覆盖该模型时补位。
+   * 取值依据见 `deepseek-v4.1-flash` 条目的注释。
+   */
+  maxOutputTokens?: number
   /** 是否接受图片输入（对应远端 `supportsImages`）。 */
   supportsImages?: boolean
   /** 可选思考等级（对应远端 `reasoning.supportedEfforts`）。 */
@@ -161,23 +168,27 @@ export interface BuddyProduct {
 const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   {
     id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3-x', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
+    // maxOutputTokens 实测（2026-09-19）：scoped 端点 128000、/v3/config 131072。
+    // 取 **128000**（两个端点的较小者）：它是服务端真正接受的额度，131072 是
+    // /v3/config 的声明值。取小者避免因端点差异被上游拒绝；远端可用时仍以
+    // 远端下发值为准，本字段只在远端缺失时补位。
     id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     // 2026-09 补录：远端 /v3/config 与 scoped 端点均返回该模型，且实测能看图
@@ -190,19 +201,19 @@ const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     // medium / high / xhigh / max 一律返回 200（不报非法参数），无法据此判定
     // 哪一组才真实生效，故不擅自改动既有行为，仅记录该分歧待后续验证。
     id: 'deepseek-v4-flash', name: 'Deepseek-V4-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 50_000,
   },
   {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 32_000,
   },
   {
     id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     // supportsImages 为 true 有实测依据：纯红图问答答出「红色」。
@@ -212,18 +223,34 @@ const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     // 只有 scoped 端点先命中时才会被它的 false 覆盖，见 buddy-adapter 的
     // supportsImagesFor 修正）。
     id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 48_000,
   },
-  { id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 64_000,
+  },
+  {
+    id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
   {
     // 2026-09 补录：旧注释曾把它列为「service info not found」而排除，但实测
     // 可正常调用且能看图（纯红图问答答出「红色」），远端两端点也都在下发。
     id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
-  { id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
+  {
+    id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
+  {
+    id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 64_000,
+  },
 ]
 
 export const CODEBUDDY: BuddyProduct = {
@@ -254,72 +281,77 @@ export const CODEBUDDY: BuddyProduct = {
  * 顺序即 IDE 的展示顺序（`cli` agent 白名单顺序），不要随意重排。
  */
 const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
-  { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true },
-  { id: 'fast-model', name: 'Fast', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'balanced-model', name: 'Balanced', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'primary-model', name: 'Primary', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['high'] },
-  { id: 'deep-model', name: 'Deep', contextWindow: 176_000, supportsImages: true },
+  // 注：以下 maxOutputTokens 全部来自 2026-09-19 对国际版 `/v3/config` 的实测
+  // （`node scripts/dump-max-output.mjs`）。该值就是用户在 IDE 里实际拿到的
+  // 单次输出额度，远端不可用时由本表顶替。远端未下发的模型保持 undefined。
+  { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true, maxOutputTokens: 24_000 },
+  { id: 'fast-model', name: 'Fast', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  { id: 'balanced-model', name: 'Balanced', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  { id: 'primary-model', name: 'Primary', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['high'], maxOutputTokens: 72_000 },
+  { id: 'deep-model', name: 'Deep', contextWindow: 176_000, supportsImages: true, maxOutputTokens: 24_000 },
   {
     id: 'hy4-preview-f', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     // 2026-09 补录：/v3/config 的 cli agent 白名单里有它，但兜底表原先漏了，
     // 于是被 reconcileWithFallback 丢弃、模型选择器里看不到。实测能看图。
     id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
-  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high' },
+  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000 },
   {
     // 2026-09 补录：新加坡区的同代模型（-sg 后缀），远端下发且实测能看图。
     id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-terra', name: 'GPT-5.6-Terra', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-luna', name: 'GPT-5.6-Luna', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 272_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 72_000,
   },
+  // gpt-5.3-codex：远端未下发 maxOutputTokens，故不填（保持 undefined，
+  // 交由网关默认），不臆造数值。
   { id: 'gpt-5.3-codex', name: 'GPT-5.3-Codex', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'gemini-3.5-flash', name: 'Gemini-3.5-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'gemini-3.5-flash', name: 'Gemini-3.5-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 65_536 },
   {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 48_000,
   },
   {
     id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 48_000,
   },
-  { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
   {
     // 2026-09 补录：远端 /v3/config 的 cli agent 白名单里有它，兜底表原先漏了。
     id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 32_000,
   },
-  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
 ]
 
 /**

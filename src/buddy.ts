@@ -410,6 +410,21 @@ export interface BuddyRemoteModel {
   name: string
   /** 上下文窗口（data.models[].maxInputTokens，模型自身配置）；远端未下发时缺省。 */
   contextWindow?: number
+  /**
+   * 单次请求输出上限（data.models[].maxOutputTokens）。
+   *
+   * ⚠️ 这是**必须消费**的权威字段，不是仅供参考的元数据：适配器早期把它只当
+   * 「过滤补全模型」的判据（见 isChatModel），却从不下发到请求体，导致所有
+   * buddy / workbuddy 模型都退化成网关默认输出上限（实测 32000），大文件写入
+   * 与长回答会被截断成 `finish_reason: 'length'`。
+   *
+   * 实测（2026-09-19）各端点取值不完全一致：
+   * - 中国版 scoped `/console/enterprises/personal/models` → deepseek-v4.1-flash = 128000
+   * - 中国版 `/v3/config` → deepseek-v4.1-flash = 131072
+   * - 国际版 `/v3/config` → deepseek-v4.1-flash = 128000
+   * 与 `maxInputTokens` 同策略：采信实际命中的那个端点，不做跨端点取大。
+   */
+  maxOutputTokens?: number
   /** 是否接受图片输入（data.models[].supportsImages）。 */
   supportsImages?: boolean
   /** 可选思考等级（data.models[].reasoning.supportedEfforts）；无等级可选的模型缺省。 */
@@ -565,6 +580,12 @@ function parseModelMeta(record: Record<string, unknown> | undefined): Omit<Buddy
   const meta: Omit<BuddyRemoteModel, 'id' | 'name'> = {}
   const limit = record.maxInputTokens
   if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) meta.contextWindow = limit
+  // 单次输出上限：与上下文窗口同样「只保留正数」，缺失即 undefined
+  // （不猜默认值——猜错会要么截断用户输出、要么被服务端 400 拒绝）。
+  const maxOutput = record.maxOutputTokens
+  if (typeof maxOutput === 'number' && Number.isFinite(maxOutput) && maxOutput > 0) {
+    meta.maxOutputTokens = maxOutput
+  }
   if (typeof record.supportsImages === 'boolean') meta.supportsImages = record.supportsImages
   const reasoning = record.reasoning
   if (typeof reasoning === 'object' && reasoning !== null) {

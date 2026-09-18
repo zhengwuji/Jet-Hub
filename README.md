@@ -249,6 +249,53 @@ bundle）。
 > 真实 id（缺失时回退 `call_{index}`），保证同一工具的所有分片 id 一致——否则
 > 跨轮次（每轮都从 `call_0` 重新编号）会把 `tool/result` 配对到错误的历史条目。
 
+### 单次输出上限（`max_tokens`）
+
+**远端下发 `maxOutputTokens`，适配器必须消费它并写进请求体。** 这是「回答被
+截断、UI 报『已达到输出 token 上限』」的唯一根因修复。
+
+- 请求体 `max_tokens` 取值优先级：
+  **`options.maxTokens`（DSH 注入）→ 远端 `data.models[].maxOutputTokens` → 产品兜底表**。
+  三者皆无则**不发该字段**，交回网关默认值（不编造数值）。
+- `resolveModel()` 同时把该值声明为 `defaultMaxTokens`。DSH 只在调用方未显式
+  给值时用声明的默认值兜底；适配器不声明就等于把上限永久交给网关默认。
+- ⚠️ **远端非法值必须过滤**：DSH 对 `defaultMaxTokens` 有硬校验（非安全整数
+  或 ≤0 直接抛 `INVALID_MODEL_MAX_TOKENS`，整轮对话起不来），故远端是外部
+  输入，`0` / 负数 / `NaN` 一律视为未声明（见 `positiveMaxTokens`）。
+
+实测（2026-09-19，`node scripts/dump-max-output.mjs`）：
+
+| 模型 | 中国版 scoped 端点 | 中国版 `/v3/config` | 国际版 `/v3/config` |
+|---|---|---|---|
+| `deepseek-v4.1-flash` | 128000 | 131072 | 128000 |
+| `deepseek-v4-pro` | 128000 | 131072 | — |
+| `deepseek-v4-flash` | 50000 | 50000 | — |
+| `hy4-preview` | 64000 | 64000 | 64000 |
+
+⚠️ **网关默认值恰好是 32000**（远端 `auto` / `glm-4.6` / `kimi-k2.6` 等模型
+声明的就是 32000），这正是未下发 `max_tokens` 时 `deepseek-v4.1-flash` 在
+32000 处被截断的原因 —— 不是「网关固定上限」，而是上游声明的额度被适配器丢了。
+
+网关**确实接受** `max_tokens` 且**精确生效**（`node scripts/verify-max-tokens.mjs`，
+国际版 `deepseek-v4.1-flash`，当时处于官方限免期 `credit: 0`）：
+
+| 请求 | 结果 |
+|---|---|
+| 不带 `max_tokens` | HTTP 200，`finish_reason=stop` |
+| `max_tokens: 128000` | HTTP 200，接受 |
+| `max_tokens: 64` | HTTP 200，**`finish_reason=length`、`completion_tokens=64`** |
+
+第三行是关键证据：输出被精确截断在 64，证明该字段被服务端真实消费，而不是
+被静默忽略。
+
+> **单次请求 ≠ 单轮**：每个 step 都是独立请求、各有各的预算。因此
+> 「拆多步写文件」仍是超出单次额度时最有效的手段；`max_tokens` 只是把单次
+> 额度提升到上游声明的真实值。
+>
+> **思考档位与输出预算共享同一额度**：`reasoning_tokens` 计入
+> `completion_tokens`（实测 `thinking` 内容与正文同池），故思考开到 `max`
+> 时正文更早撞上上限。
+
 ## WorkBuddy provider（国际版）
 
 独立路由 `workbuddy`（腾讯 **WorkBuddy 国际版 / WorkBuddy AI**），与

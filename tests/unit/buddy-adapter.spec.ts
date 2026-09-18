@@ -159,6 +159,108 @@ describe('BuddyAdapter', () => {
     expect((await adapter.resolveModel('buddy', 'kimi-k2.6')).context).toEqual({ contextWindow: 256_000 })
   })
 
+  // ── 单次输出上限（maxOutputTokens）──
+  //
+  // 用户报障：deepseek-v4.1-flash 在 32000 token 处被截断，turn/end 为
+  // `{kind:'max-tokens'}`。根因是适配器**从未下发 max_tokens**，上限完全由
+  // 网关默认值决定（实测网关对 auto 等模型正是 32000）；而远端早已下发权威的
+  // maxOutputTokens（实测 deepseek-v4.1-flash = 128000）。
+  describe('单次输出上限', () => {
+    it('远端 maxOutputTokens 映射为 defaultMaxTokens', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'DS', maxOutputTokens: 128_000 },
+        ],
+      })
+      expect((await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).defaultMaxTokens).toBe(128_000)
+    })
+
+    it('远端与兜底表都没有该值时保持 undefined（不编造）', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [{ id: 'mystery', name: 'M' }],
+      })
+      expect((await adapter.resolveModel('buddy', 'mystery')).defaultMaxTokens).toBeUndefined()
+    })
+
+    it('远端缺失时用产品兜底表的实测值补位', async () => {
+      // deepseek-v4.1-flash 在 CodeBuddy 兜底表中已按实测填 128000。
+      const resolved = await makeAdapter().resolveModel('buddy', 'deepseek-v4.1-flash')
+      expect(resolved.defaultMaxTokens).toBe(128_000)
+    })
+
+    it('stream 把上限写进请求体的 max_tokens', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(128_000)
+    })
+
+    it('调用方显式给出的 maxTokens 优先于远端与兜底表', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 4_096,
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(4_096)
+    })
+
+    it('远端下发的值优先于兜底表', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'DS', maxOutputTokens: 7_000 },
+        ],
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(7_000)
+    })
+
+    it('workbuddy 的 deepseek-v4.1-flash 同样默认 128000', async () => {
+      // 国际版实测 /v3/config 下发 128000，兜底表与之对齐。
+      const adapter = makeAdapter({ product: WORKBUDDY })
+      expect((await adapter.resolveModel('workbuddy', 'deepseek-v4.1-flash')).defaultMaxTokens).toBe(128_000)
+    })
+
+    it('非法/非正的远端值被忽略', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'zero', name: 'Z', maxOutputTokens: 0 },
+          { id: 'neg', name: 'N', maxOutputTokens: -5 },
+        ],
+      })
+      expect((await adapter.resolveModel('buddy', 'zero')).defaultMaxTokens).toBeUndefined()
+      expect((await adapter.resolveModel('buddy', 'neg')).defaultMaxTokens).toBeUndefined()
+    })
+  })
+
   it('resolveModel prefers the remote maxInputTokens over the static table', async () => {
     // /v3/config data.models[].maxInputTokens 是权威来源（对齐 Rust
     // context_limit_for_model 两级查找）：远端下发值覆盖静态 fallback。

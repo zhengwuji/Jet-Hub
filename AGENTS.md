@@ -121,6 +121,39 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - ⚠️ **移除源元素后目标下标会前移**，必须用 `indexOf` 重算而不能复用原下标，
   否则会插到目标之后。`tests/unit/account-order.spec.ts` 覆盖了这一点
 
+## 单次输出上限（`maxOutputTokens`）必须下发，不能只用来过滤
+
+腾讯系两个端点（scoped `/console/enterprises/personal/models` 与 `/v3/config`）
+**都下发 `data.models[].maxOutputTokens`**。它是权威的单次请求输出额度，适配器
+**必须消费并写进请求体的 `max_tokens`**，同时在 `resolveModel` 里声明为
+`defaultMaxTokens`（DSH 只在调用方未显式给值时用声明的默认值兜底）。
+
+**真实缺陷**（用户报障）：`deepseek-v4.1-flash` 的回答在 **32000 token** 处被
+截断，`turn/end` 为 `{kind:'max-tokens'}`，UI 报「已达到输出 token 上限」。
+根因不是「网关固定上限」，而是适配器早期**只把 `maxOutputTokens` 当作
+`isChatModel` 的过滤判据**（≤256 视为补全模型），从不下发 → 上限永久退回网关
+默认值，而网关默认恰好就是 **32000**（远端 `auto` / `glm-4.6` 等声明的即为此值）。
+远端对 `deepseek-v4.1-flash` 实际声明的是 **128000**。
+
+要点：
+
+- 取值优先级：`options.maxTokens`（DSH 注入）→ 远端 → 产品兜底表；
+  **三者皆无则不发该字段**，不编造数值（编大被上游拒、编小无谓截断）
+- ⚠️ **远端是外部输入，非法值必须过滤**：`positiveMaxTokens` 只放行安全正整数。
+  DSH 对 `defaultMaxTokens` 有硬校验，`0` / 负数 / `NaN` 会直接抛
+  `INVALID_MODEL_MAX_TOKENS`，**整轮对话起不来**（不是降级，是崩）
+- 实测（2026-09-19）各端点值不完全一致：`deepseek-v4.1-flash` 在 scoped 端点
+  为 128000、`/v3/config` 为 131072。与 `maxInputTokens` 同策略 —— 采信实际
+  命中的那个端点，**不做跨端点取大**
+- 网关**确实接受且精确生效**：`max_tokens: 64` 会精确截断在 64
+  （`finish_reason=length`、`completion_tokens=64`）。验证脚本
+  `scripts/verify-max-tokens.mjs`（用国际版限免的 v4.1-flash，`credit: 0`）
+- `reasoning_tokens` **计入** `completion_tokens`：思考内容与正文共享同一额度，
+  故思考开到 `max` 时正文更早撞上限。「单次请求」≠「单轮」——每 step 独立预算，
+  超长文件仍需拆多步写
+- 排查脚本（均为**只读 GET**，零模型额度）：`scripts/dump-max-output.mjs`
+  导出全模型 `id → maxOutputTokens`；`scripts/probe-max-output.mjs` 打印原始条目
+
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
 同一 `jet-hub` 命名空间的 `disabledModels` 字段保存「被关闭的模型」，形如 `{ buddy: { 'glm-5.2': true } }`。要点：
