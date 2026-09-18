@@ -71,6 +71,12 @@ function makeAdapter(overrides: {
   postRefreshCredential?: BuddyCredential | undefined
   fetchImpl?: typeof fetch
   fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
+  /**
+   * 刻意比生产类型宽松（允许多返回 `undefined`）：用于模拟「旧版桥接」
+   * 或版本错配时传入的 readImage——适配器的运行时守卫必须能挡住它，
+   * 而不是依赖类型系统保证。生产侧 `BuddyAdapterOptions.readImage`
+   * 已不含 undefined。
+   */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；不传时由 BuddyAdapter 回退到 CodeBuddy。 */
   product?: BuddyProduct
@@ -549,6 +555,53 @@ describe('BuddyAdapter credential handling', () => {
     const body = await captureBody({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })
     const user = (body.messages as Array<Record<string, unknown>>).find((m) => m.role === 'user')!
     expect(user.content).toBe('hello')
+  })
+
+  // 「静默丢图」回归护栏：readImage 表示读不到时，必须抛错。
+  // 旧实现会 `continue` 丢掉整张图，线上请求退化成纯文本，
+  // 模型只能答「我看不到图片」，用户拿不到任何错误原因。
+  it('stream fails loudly when readImage reports it cannot read the bytes', async () => {
+    let body: Record<string, unknown> | undefined
+    const adapter = makeAdapter({
+      readImage: async () => undefined,
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: [DONE]\n\n')
+      },
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is this?' },
+          { type: 'image', attachment: { attachmentId: 'att-missing' } },
+        ],
+      }],
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+    // 关键：请求根本没有发出，图片不可能被静默丢弃。
+    expect(body).toBeUndefined()
+  })
+
+  it('stream preserves the cause when readImage throws', async () => {
+    const cause = new Error('attachment object is gone')
+    const adapter = makeAdapter({
+      readImage: async () => { throw cause },
+      fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }] }],
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+    expect((error as LlmError).message).toContain('attachment object is gone')
   })
 })
 
