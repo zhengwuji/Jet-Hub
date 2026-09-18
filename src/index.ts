@@ -5,15 +5,19 @@ import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
+import { registerQoderLlm } from './qoder-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
+import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
+import { QODER } from './qoder-product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+import type { QoderCredential } from './qoder.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -113,12 +117,13 @@ export function makeReadImage(ctx: Context) {
 /** 注册 codeartsAuth 服务、命令以及 codearts LLM 路由。 */
 export function apply(ctx: Context): void {
   // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
-  // 四个 namespace 分别对应：codearts 路由、CodeBuddy（buddy）路由、
-  // WorkBuddy（workbuddy）路由、LobsterAI（lobsterai）路由 —— 后三者由
-  // registerBuddyLlm / registerLobsteraiLlm 以 `llm-${product.id}` 派生，
-  // 漏注册会让模型设置页在 `refFor → deriveKeyRef(provider)` 处以
+  // 五个 namespace 分别对应：codearts 路由、CodeBuddy（buddy）路由、
+  // WorkBuddy（workbuddy）路由、LobsterAI（lobsterai）路由、Qoder（qoder）路由
+  // —— 后四者由 registerBuddyLlm / registerLobsteraiLlm / registerQoderLlm
+  // 以 `llm-${product.id}` 派生，漏注册会让模型设置页在
+  // `refFor → deriveKeyRef(provider)` 处以
   // `provider.toUpperCase is not a function` 崩溃。
-  registerProviderSettings(ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai')
+  registerProviderSettings(ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai', 'llm-qoder')
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
 
@@ -307,6 +312,48 @@ export function apply(ctx: Context): void {
     product: LOBSTERAI,
   })
 
+  // ===== Qoder (阿里系 AI IDE) 服务 =====
+  // 第五个产品线，协议与四者**都不同源**：PKCE 设备码轮询登录
+  // （不起本地回调服务器，见 src/qoder-oauth.ts）。
+  // 服务名由产品 id 派生，注册为 ctx.qoderAuth。
+  // 与其它 provider 一样不注册斜杠命令：入口在 Jet Hub 的 Qoder 面板。
+  const qoder = new QoderAuth(ctx)
+  registerQoderLlm(ctx, {
+    credentialRef: credentialRef(QODER.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 Qoder 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 QODER.id 而非字面量 'qoder'：写死字面量在
+      // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(QODER.id, '')
+      if (available) return available.credential as QoderCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(QODER.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as QoderCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
+      //
+      // 为什么：resolveCredential（上面）优先从账号池取
+      // `QODER_ACCOUNT_XXX` 的凭据，而 `qoder.refresh()` 读写的是
+      // `QODER_ACCESS_TOKEN`。两者错配的后果是 —— 适配器检测到池凭据
+      // 过期 → 调 refresh → 成功回写到**另一个** ref → 再 resolve 仍取到
+      // 那份未更新的过期凭据 → 带着过期 token 发请求 → 401。
+      // 用户看到的是「刚在 Jet Hub 登录好，却一直认证失败」，
+      // 而日志里续期全是成功的，极难排查。
+      const available = await pool.getAvailableAccount(QODER.id, '')
+      if (available) await qoder.refreshAccountCredential(available.entry.credentialRef)
+      else await qoder.refresh()
+    },
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: QODER,
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -323,6 +370,9 @@ export function apply(ctx: Context): void {
     } catch { /* 静默 */ }
     try {
       await lobsterai.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await qoder.refreshAll(pool)
     } catch { /* 静默 */ }
   }
 
@@ -343,6 +393,7 @@ export function apply(ctx: Context): void {
         buddy.stop()
         workbuddy.stop()
         lobsterai.stop()
+        qoder.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -353,9 +404,10 @@ export function apply(ctx: Context): void {
     buddy.stop()
     workbuddy.stop()
     lobsterai.stop()
+    qoder.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder)
   ctx.provide('accountPool', pool)
 }

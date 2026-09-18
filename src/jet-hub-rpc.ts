@@ -18,9 +18,14 @@ import type { CodeArtsAuth } from './service.js'
 import type { CodeArtsCredential } from './types.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
+import type { QoderAuth } from './qoder-auth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
+import { QODER } from './qoder-product.js'
 import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobsterai.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+import { isQoderRefreshable, qoderCredentialExpiresAtMs } from './qoder.js'
+import type { QoderCredential } from './qoder.js'
+import { fetchQoderCreditBalance } from './qoder-credits.js'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
@@ -117,6 +122,18 @@ function parseCodeArtsCredential(raw: string): CodeArtsCredential | undefined {
 function parseLobsteraiCredential(raw: string): LobsteraiCredential | undefined {
   try {
     const parsed = JSON.parse(raw) as LobsteraiCredential
+    return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 解析 Qoder 凭据 JSON；解析失败返回 undefined。 */
+function parseQoderCredential(raw: string): QoderCredential | undefined {
+  try {
+    const parsed = JSON.parse(raw) as QoderCredential
     return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
       ? parsed
       : undefined
@@ -401,9 +418,10 @@ export function registerJetHubRpc(
   buddy: BuddyAuth,
   workbuddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
+  qoder: QoderAuth,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai)
+    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, qoder)
   })
 }
 
@@ -415,6 +433,7 @@ function registerJetHubEndpoints(
   buddy: BuddyAuth,
   workbuddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
+  qoder: QoderAuth,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -598,6 +617,37 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === QODER.id) {
+          // Qoder 与 codearts / lobsterai 同款两步式，但登录机制不同：
+          // 它是**设备码轮询**（不开本地回调服务器，见 src/qoder-oauth.ts），
+          // 同样必须在用户授权前返回 loginUrl，理由见上面的 codearts 分支。
+          const started = await qoder.startLogin({ refName })
+          // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
+          // 登录成功后再回填昵称/有效期等真实字段。
+          await pool.addAccount({
+            id,
+            provider: QODER.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            const credential = parseQoderCredential(loginResult.access)
+            await pool.updateAccount(id, {
+              nickname: credential?.nickname !== undefined && credential.nickname.length > 0
+                ? credential.nickname
+                : id,
+              expiresAt: credential !== undefined ? qoderCredentialExpiresAtMs(credential) : undefined,
+              refreshable: credential !== undefined && isQoderRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${QODER.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -678,6 +728,9 @@ function registerJetHubEndpoints(
               break
             case LOBSTERAI.id:
               await lobsterai.refreshAccountCredential(entry.credentialRef)
+              break
+            case QODER.id:
+              await qoder.refreshAccountCredential(entry.credentialRef)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -882,6 +935,42 @@ function registerJetHubEndpoints(
             fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === QODER.id) {
+          // 余额来自 `GET /sash/api/v2/me/usage`（实测只需 Bearer +
+          // Cosy-ClientType，**不需要**模型列表那样的 WASM 签名）。
+          // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
+          // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (!resolved) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置',
+              })
+              continue
+            }
+            let credential: QoderCredential
+            try {
+              credential = JSON.parse(resolved.value) as QoderCredential
+            } catch {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据解析失败',
+              })
+              continue
+            }
+            const balance = await fetchQoderCreditBalance(credential, QODER)
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              // 查不到时带上原因，卡片显示原因而非 0（与其它 provider 同约定）。
+              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
+            })
+          }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         const product = productById(req.provider)

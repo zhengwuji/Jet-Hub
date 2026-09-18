@@ -6,19 +6,22 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
-此外插件内置另外两个 provider 路由：
+此外插件内置另外四个 provider 路由：
 
 - **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
   另支持「一键领取积分」（每日签到）。
 - **workbuddy（腾讯 WorkBuddy 国际版）** — 见 [WorkBuddy provider](#workbuddy-provider)。
 - **lobsterai（有道 LobsterAI / 龙虾）** — 见 [LobsterAI provider](#lobsterai-provider)；
   另支持「一键领取积分」（每日签到）。
+- **qoder（阿里系 Qoder）** — 见 [Qoder provider](#qoder-provider)；
+  **支持积分余额**（不支持签到）；走**加密推理端点**，模型池与客户端一致
+  （含 Qwen3.8 系列）。
 
 `codearts` 面板同样支持**积分账户检测、积分余额与「一键领取积分」**
 （华为云「每日签到得积分」活动，走 `SDK-HMAC-SHA256` 签名）——
 见 [CodeArts 积分](#codearts-积分华为云每日签到得积分)。
 
-四个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+五个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
@@ -108,9 +111,11 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册两个独立的腾讯系路由：`buddy`（见
-[buddy provider](#buddy-provider)）与 `workbuddy`（见
-[WorkBuddy provider](#workbuddy-provider)）。三者互不覆盖，可同时使用。
+除 `codearts` 外，插件另注册四个独立的 provider 路由：`buddy`（见
+[buddy provider](#buddy-provider)）、`workbuddy`（见
+[WorkBuddy provider](#workbuddy-provider)）、`lobsterai`（见
+[LobsterAI provider](#lobsterai-provider有道龙虾)）与 `qoder`（见
+[Qoder provider](#qoder-provider)）。五者互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -673,3 +678,167 @@ Bearer `access_token` 鉴权。
 > 是否支持 `reasoning_effort`、各模型真实上下文窗口（内置表统一填 131072，
 > 是桥接层的估计值）、图片输入、`prompt_cache_key`。这些在实现里都取了
 > **保守默认**（不声明 / 不发送），不会因未知而失败。
+
+## Qoder provider
+
+独立路由 `qoder`（阿里系 AI 编程 IDE **Qoder**）。**推理走加密端点**
+（请求体与签名头由客户端自带的 WASM 生成），因此能拿到与客户端
+**完全一致**的模型池（含 Qwen3.8 系列）。详见下方「两条推理路径」。
+
+该 provider 与其余四者**协议都不同源**，实现是独立一套
+（`src/qoder*.ts` + `src/qoder-wasm.ts` + `src/qoder-envelope.ts`
++ 复用的 `src/openai-compat.ts`）：
+
+| 项 | 其余四个 provider | Qoder |
+|---|---|---|
+| 登录方式 | OAuth 回调 / external-link 轮询 / 本地回调 | **PKCE 设备码轮询**（不开监听端口） |
+| 续期请求体 | 只带 `refresh_token`（+ 各自身份字段） | 还要带 **`machine_id`** |
+| 推理鉴权 | 华为 HMAC / 纯 Bearer | **请求体加密 + 签名头**（不能自行构造） |
+| 模型列表 | 远端接口（权威） | **本地静态表**（远端需签名）+ 加密端点使用目录 key |
+| 积分能力 | 余额 ✓（`sash/api/v2/me/usage`）/ 签到 ✗ |
+
+### 登录（设备码轮询）
+
+浏览器打开 `https://qoder.com/device/selectAccounts?...`（PKCE `S256` +
+`client_id`），用户在网页完成授权后，插件轮询
+`https://openapi.qoder.sh/api/v1/deviceToken/poll` 取回
+`{ token, refresh_token }`。
+
+- **`404` 表示「用户尚未完成授权」，不是错误**，必须继续轮询
+  （官方客户端同样如此）。实测依据：该端点返回 404 而任意不存在的路径
+  返回 401，说明它被网关豁免认证、由业务层报「会话未就绪」。
+- **必须走两步式**：`account.create` 在用户授权**之前**返回 `loginUrl`，
+  由前端立即 `window.open`（浏览器 transient activation 约束，
+  见 [+ 新建账号](#-新建账号必须走两步式登录四个-provider-一致)）。
+
+### 两条推理路径（**认两套不同的模型名**）
+
+这是本项目**最容易踩的坑**。Qoder 有两个推理端点：
+
+| 路径 | 端点 | 模型名 | 能力 |
+|---|---|---|---|
+| **加密（本插件使用）** | `api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation` | **目录 key**（`qfmodel` / `dmodel`） | 客户端真实链路；**能拿到 Qwen3.8 系列** |
+| 公开 | `api2-v2.qoder.sh/model/v1/chat/completions` | 通用名（`qwen-flash` / `qwen-plus`） | 标准 OpenAI 格式；**目录 key 一律被拒** |
+
+⚠️ **两个 host 不同**（`api2` vs `api2-v2`），混用会 404。
+
+**真实缺陷**（用户报障）：「向 qwen3.8-flash 发消息后**没收到回复就终止**」。
+根因是早期把**目录 key 发给了公开端点**（得到 `Unsupported model`，
+且该错误帧又被解析器静默吞掉）。
+
+随后又误判为「目录 key 不可用」，把模型表换成了通用名 —— 于是拿到的是
+**Qwen3.5 / Qwen-2.5**，而不是目录里的 Qwen3.8 系列（用户再次报障）。
+
+### 加密推理（`src/qoder-wasm.ts`）
+
+Qoder 的**真实**推理链路要求请求体加密、并带一套服务端认可的身份签名头，
+否则请求被拒。客户端把实现该协议的 WASM 内嵌在自身产物里，本插件按
+wasm-bindgen 约定把它接起来**复用**（`src/qoder-wasm.ts`）。
+
+- **不是「破解密码学」** —— WASM 自己就导出了成对的编解码函数，我们只是
+  调用它，等同「用客户端自己的钥匙开自己的锁」。
+- **响应不需要解密** —— 只在每帧外套一层信封，内层是标准 OpenAI chunk；
+  `src/qoder-envelope.ts` 负责剥信封，剥完交给 `src/openai-compat.ts`。
+- ⚠️ **签名头必须原样透传**，不能用 `Bearer <token>` 覆盖（会被判签名无效）。
+
+> 实现细节（glue 约定、请求体字段、签名载荷、三个已踩过的坑）记录在
+> **不入库**的内部文档 `docs/qoder-encryption-notes.md` 中 ——
+> 该文档含逆向分析，刻意不随仓库分发。
+
+### 模型列表：17 个目录 key（**实测数据**）
+
+`listModels` 是**静态表**（不发网络请求）—— 远端目录需签名，运行时不做。
+
+表里是客户端目录下发的 **17 个 key**，全部实测可用：
+
+| 分组 | 模型 |
+|---|---|
+| Qoder 档位 | `auto` / `ultimate` / `performance` / `efficient` |
+| 内部代号 | `smodel`(Sonus) / `cmodel`(Cantus) |
+| **Qwen** | `qmodel_38max`(3.8-Max) / **`qfmodel`(3.8-Flash)** / `qmodel_latest`(3.7-Max) / `qmodel`(3.7-Plus) |
+| Kimi | `kmodel_latest`(K3) / `kmodel`(K2.8-Preview) |
+| GLM | `gmodel`(5.3) / `gfmodel`(5.3-Flash) |
+| DeepSeek | `dmodel`(V4-Pro) / `dfmodel`(Flash) |
+| MiniMax | `mmodel`(M3) |
+
+⚠️ **请求体必须带 `business` 字段** —— 缺了服务端会把请求路由到故障节点，
+而**其余模型恰好不受影响**，所以现象像「只有 `qfmodel` 一个模型坏掉」，
+极易误判成「服务端故障」。**判据是「Qoder IDE 能否用同一模型」**：
+IDE 能用即说明是我们的请求缺东西。
+
+**免费额度模型**（`is_free=true`）：`qmodel_38max` 与 `qfmodel`。
+e2e 探针默认用 `qmodel_38max` 以免消耗积分。
+
+- 该表**会逐渐过时**（新模型上线后不会自动出现）；
+- 按 DSH 约定「`listModels` 结果仅供参考」，**表外的 key 仍可手动指定**；
+- 需要刷新时按下方「升级 WASM」流程重新采集，并**逐个验证可推理**再入库。
+
+### 升级 WASM（Qoder 版本更新时）
+
+Qoder 升级后签名协议可能变化，表现为**难以解释的 `Signature invalid`**
+或 `[FAIL]node:...`。此时刷新：
+
+```bash
+pnpm qoder:wasm            # 自动取本机 Qoder 最新版本的内嵌 WASM
+pnpm qoder:wasm 0.3.5      # 或指定版本
+pnpm build:assets          # 同步到 lib/
+```
+
+脚本取 `.qoder-versions/<v>` 而非 `resources/` —— 后者可能是与 IDE
+**实际运行**不同的版本。刷新后**务必实测一次对话**（`qfmodel` 或
+`qmodel_38max`）确认签名仍被接受。
+
+### 积分余额（Credits Balance）
+
+`qoder` 面板**支持积分余额**（但不支持签到）：
+
+```
+GET https://openapi.qoder.sh/sash/api/v2/me/usage
+Authorization: Bearer <token>
+Cosy-ClientType: 5
+```
+
+⚠️ 两个易错点：
+
+1. **路径前缀是 `/sash/`**，不是 `/api/`。早期因为只按 `/api/` 前缀搜索
+   而误判「Qoder 无积分端点」。
+2. **余额不只在 `userQuota` 里**。实测某账号 `userQuota.remaining = 0`
+   而 `addOnQuota.remaining = 100`（资源包）；只读 `userQuota` 会显示 0。
+
+该端点**只需 Bearer**，不需要模型列表那样的 WASM 签名。企业版账号
+（`displayMode: "enterprise"`）不下发额度数字、只给外部链接，此时返回
+「查询失败」而非 0。
+
+### 无签到能力
+
+`dailyCheckin` 为 **false**：`/sash/api/v1/me/campaigns` 实测返回
+`{"showCampaign":false,"claimable":false,"campaigns":[]}`，且协议逆向中
+**未发现**签到动作端点（只有活动查询）。故面板不渲染「一键领取积分」按钮。
+
+> 积分能力矩阵（`plugin-src/client/credits-capabilities.js`）中 qoder 登记为
+> `{ balance: true, dailyCheckin: false }`。**两项能力彼此独立** ——
+> 不能因为「没有签到」就推断「也查不到余额」（这正是早期误判的形态）。
+> 该表键集合必须与客户端 `PROVIDERS` 相等，有单测锁死。
+
+### 凭据与续期
+
+- **登录入口：Jet Hub 设置页的 Qoder 面板**（支持多账号与账号池自动切换）。
+  不注册斜杠命令。
+- 凭据 ref：单账号 `QODER_ACCESS_TOKEN`；多账号
+  `QODER_ACCOUNT_<UUID_SHORT>`（由 Jet Hub「+ 新建账号」生成）。
+- 凭据结构：`security_oauth_token` 与 `access_token` **双写同值**
+  （服务端取用顺序是前者优先），外加 `refresh_token` / `expire_time` /
+  `refresh_token_expire_time` / **`machine_id`**。
+- ⚠️ **`machine_id` 必须持久化**：续期请求体需要它。本插件生成**随机 UUID**
+  并随凭据保存（不复制官方客户端的硬件指纹逻辑 —— 那依赖 `@napi-rs` 原生
+  模块取 SMBIOS UUID，属设备指纹且不可移植）。**这是本实现最大的未验证
+  假设**：若服务端校验设备一致性，续期会被拒。`pnpm test:e2e:qoder-chat`
+  的续期用例专门验证这一点。
+- 续期：与其他 provider 同一调度器（启动后每 30 分钟对**可续期**账号静默
+  刷新）。终态判定：HTTP 401/403 或响应缺 token → `RefreshTokenExpiredError`
+  （停止重试）；网络抖动与 5xx 走可重试路径。
+
+### 适用范围
+
+**仅支持国际版**（`qoder.com` / `qoder.sh`）。中国版（`qoder.com.cn`）的
+端点与 client id 不同，本实现未覆盖。
