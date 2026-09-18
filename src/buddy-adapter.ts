@@ -213,11 +213,27 @@ function contentToText(content: unknown): string {
  *   ——与 codearts 的 deepseek-v4 校验一致；
  * - 正文为空且带 tool_calls 时 `content` 必须为 `null`（对齐 openai_chat.rs）。
  */
+/** 工具结果内嵌图片的载体文本（与官方 deepseek 适配器同名同义）。 */
+const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
+
 function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
   imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
+
+  // 工具结果内嵌图片（read_image 等）不能并入 `role:'tool'` 消息：OpenAI 兼容
+  // 协议要求每条 tool 消息紧跟其 assistant tool_call，中间插入任何消息都会 400。
+  // 故与官方 deepseek 适配器一致：挂起到其后的独立 user 消息统一发出。
+  let pendingToolImages: Array<Record<string, unknown>> = []
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
+    })
+    pendingToolImages = []
+  }
 
   // ── 孤儿工具调用清理（会话续命的关键）──
   // OpenAI 兼容协议要求：带 `tool_calls` 的 assistant 消息，其**每一个**
@@ -252,6 +268,9 @@ function serializeMessages(
         .map((block) => String(block.text))
         .join('')
       const text = contentToText(content)
+      // 挂起的工具结果图片必须在 assistant 之前发出（对齐官方适配器）：
+      // 否则它们会漂到这条 assistant 之后，与产生它们的工具调用脱节。
+      flushToolImages()
       wire.push({
         role: 'assistant',
         // 正文为空且有工具调用时 content 必须为 null（对齐 openai_chat.rs）。
@@ -262,6 +281,7 @@ function serializeMessages(
       continue
     }
     if (message.role === 'system') {
+      flushToolImages()
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
@@ -270,23 +290,58 @@ function serializeMessages(
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
     const text = contentToText(message.content)
+    // 工具结果之外的常规内容（含顶层图片）。
+    const regular = content.filter((block) =>
+      !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
     // 含图片时 content 升级为 OpenAI 多模态 parts（CodeBuddy 唯一接受的图片
     // 形态；{type:'image'} 会以 `unsupported content type ... image` 400）。
-    const parts = imageUrls === undefined || imageUrls.size === 0
+    //
+    // 注意：这里**不能**把「空 Map」也降级为 undefined。`imageUrls` 为 undefined
+    // 只发生在整个请求都没有图片时；若图片存在但全部读取失败，map 是**空的**
+    // 而非 undefined。降级成 undefined 会让 `[image unavailable]` 占位符也被跳过，
+    // 图片静默消失；只有部分失败时（map 非空）才会出现占位符 —— 同一故障两种
+    // 表现。保留空 Map 可让 `userContentParts` 统一产出占位符。
+    const regularImageUrls = imageUrls
+    const parts = regularImageUrls === undefined
       ? undefined
-      : userContentParts(content, imageUrls)
-    if (parts !== undefined) wire.push({ role: 'user', content: parts })
-    else if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+      : userContentParts(regular, regularImageUrls)
+    if (parts !== undefined) {
+      flushToolImages()
+      wire.push({ role: 'user', content: parts })
+    } else if (text.length > 0 || toolResults.length === 0) {
+      flushToolImages()
+      wire.push({ role: 'user', content: text })
+    }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 其结果同样会让后端 400。
       if (!keepResultIds.has(String(result.toolCallId))) continue
+      // 工具结果内嵌的图片（read_image 等）单独收集：文本继续走 `role:'tool'`，
+      // 图片挂起到其后的 user 消息 —— 与原实现相比，这里补上了递归分支，
+      // 否则图片会被 contentToText 静默丢弃（只留元数据文本）。
+      let resultText = '(no output)'
+      if (regularImageUrls !== undefined && Array.isArray(result.content)) {
+        const resultParts = userContentParts(result.content, regularImageUrls)
+        if (resultParts !== undefined) {
+          pendingToolImages.push(...resultParts.filter((part) => part.type !== 'text'))
+          const joined = resultParts
+            .filter((part) => part.type === 'text')
+            .map((part) => String(part.text))
+            .join('')
+          if (joined.length > 0) resultText = joined
+        } else {
+          resultText = contentToText(result.content) || '(no output)'
+        }
+      } else {
+        resultText = contentToText(result.content) || '(no output)'
+      }
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
+        content: resultText,
       })
     }
   }
+  flushToolImages()
   return wire
 }
 
@@ -395,6 +450,12 @@ function isTransportError(error: unknown): boolean {
 /**
  * 把 user 消息内容块转为 OpenAI 多模态 parts；无图片时返回 undefined，
  * 让调用方保持原有的纯字符串路径（无图请求的线上格式不变，避免破坏前缀缓存）。
+ *
+ * `tool-result` 分支为**递归**，与 `collectImages()` 的递归深度保持一致：
+ * 二者若不对称，出现在深层工具结果里的图片会被 collectImages 收进 refs、
+ * 却因这里只走一层而在序列化阶段被静默丢弃（连 `[image unavailable]`
+ * 占位符都没有）。实测 harness 目前只产生一层嵌套，但既然收集侧已经是
+ * 任意深度，序列化侧就必须同样递归，否则是一处埋着的静默丢图。
  */
 function userContentParts(
   content: readonly unknown[],
@@ -404,7 +465,12 @@ function userContentParts(
   let hasImage = false
   for (const raw of content) {
     if (typeof raw !== 'object' || raw === null) continue
-    const block = raw as { type?: unknown; text?: unknown; attachment?: { attachmentId?: unknown } }
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
     if (block.type === 'text') {
       const text = String(block.text ?? '')
       if (text.length > 0) parts.push({ type: 'text', text })
@@ -419,6 +485,20 @@ function userContentParts(
       parts.push(url === undefined
         ? { type: 'text', text: '[image unavailable]' }
         : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      // 递归取内层 parts：内层只要出现图片，hasImage 即为真，
+      // 从而让整条消息升级为多模态形态。
+      const inner = userContentParts(block.content, imageUrls)
+      if (inner !== undefined) {
+        hasImage = true
+        parts.push(...inner)
+      } else {
+        // 内层无图：保留其文本，避免内容丢失。
+        const text = contentToText(block.content)
+        if (text.length > 0) parts.push({ type: 'text', text })
+      }
     }
   }
   return hasImage && parts.length > 0 ? parts : undefined
