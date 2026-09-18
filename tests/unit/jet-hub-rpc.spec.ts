@@ -1118,3 +1118,117 @@ describe('积分端点的 provider 能力边界', () => {
     })
   })
 })
+
+/**
+ * `account.reorder` 端点（Jet Hub 拖拽排序）。
+ *
+ * 用**真实 AccountPool** + 内存 settings 替身，而不是给 pool 打桩：
+ * 这个端点的价值全在「参数校验 + 转交 pool.reorderAccounts」，
+ * 用桩替换 pool 就只剩「调用了某方法」这种无信息量的断言，
+ * 无法发现「集合校验被绕过」「顺序没持久化」这类真实问题。
+ */
+describe('account.reorder 端点', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  /** 建一个真实 pool（内存 settings）+ 端点调用器。 */
+  function setup(initial: Array<{ id: string; provider: string }>) {
+    let stored: { accounts: unknown[]; disabledModels: Record<string, unknown> } = {
+      accounts: initial.map(a => ({
+        ...a,
+        nickname: a.id,
+        enabled: true,
+        credentialRef: `${a.provider.toUpperCase()}_ACCOUNT_${a.id.toUpperCase()}`,
+        createdAt: 1,
+        refreshable: true,
+      })),
+      disabledModels: {},
+    }
+    let handler: Handler | undefined
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: typeof stored) => { stored = value },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: { resolve: async () => undefined },
+    }
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never)
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
+      return body.result
+    }
+    return { call, orderInStore: () => (stored.accounts as Array<{ id: string }>).map(a => a.id) }
+  }
+
+  it('重排成功并把新顺序写入存储', async () => {
+    const { call, orderInStore } = setup([
+      { id: 'a', provider: 'buddy' },
+      { id: 'b', provider: 'buddy' },
+      { id: 'c', provider: 'buddy' },
+    ])
+    const result = await call('account.reorder', { provider: 'buddy', orderedIds: ['c', 'a', 'b'] })
+    expect(result.ok).toBe(true)
+    expect(orderInStore()).toEqual(['c', 'a', 'b'])
+  })
+
+  it('集合不一致（列表过期）回可读错误，而不是 handler-failed', async () => {
+    // 这类并发是可预期的：用户拖拽期间在别处新增/删除了账号。
+    // 回 bad-request + 可读文案，前端能提示"刷新后重试"；
+    // 若抛异常会退化成 jet-hub/handler-failed，用户只看到"未知故障"。
+    const { call, orderInStore } = setup([
+      { id: 'a', provider: 'buddy' },
+      { id: 'b', provider: 'buddy' },
+    ])
+    const result = await call('account.reorder', { provider: 'buddy', orderedIds: ['a'] })
+    expect(result.ok).toBe(false)
+    expect(result.error?.message).toContain('账号列表已变化')
+    // 数据未被破坏
+    expect(orderInStore()).toEqual(['a', 'b'])
+  })
+
+  it('缺 provider 或 orderedIds 非字符串数组 → bad-request', async () => {
+    const { call } = setup([{ id: 'a', provider: 'buddy' }])
+    expect((await call('account.reorder', { orderedIds: ['a'] })).ok).toBe(false)
+    expect((await call('account.reorder', { provider: 'buddy' })).ok).toBe(false)
+    expect((await call('account.reorder', { provider: 'buddy', orderedIds: [1, 2] })).ok).toBe(false)
+  })
+
+  it('重排不影响其他 provider 账号的位置', async () => {
+    const { call, orderInStore } = setup([
+      { id: 'b1', provider: 'buddy' },
+      { id: 'c1', provider: 'codearts' },
+      { id: 'b2', provider: 'buddy' },
+    ])
+    const result = await call('account.reorder', { provider: 'buddy', orderedIds: ['b2', 'b1'] })
+    expect(result.ok).toBe(true)
+    // buddy 的两个账号在各自原下标上互换，codearts 仍在中间
+    expect(orderInStore()).toEqual(['b2', 'c1', 'b1'])
+  })
+})

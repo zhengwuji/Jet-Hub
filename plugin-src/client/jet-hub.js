@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
+import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -170,7 +171,7 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
-function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, credits, creditsLoading, showCredits }) {
+function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, busy, credits, creditsLoading, showCredits, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -178,12 +179,38 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, cre
   // 只要存在**任何**标记（即使已过期）就允许重测/重置——过期记录正是
   // 用户最想清理的对象，而 UI 的 rateLimits 只显示未到期的。
   const hasAnyLimit = Boolean(account.modelRateLimits && Object.keys(account.modelRateLimits).length > 0);
+  // 拖拽相关的状态与回调由 ProviderPanel 统一管理（它掌握整个列表顺序）。
+  const dragProps = drag || {};
 
   return React.createElement('div', {
     className: 'dim-jh-accountCard',
     'data-enabled': account.enabled,
+    'data-dragging': dragProps.isDragging ? 'true' : undefined,
+    // 插入位置指示：before 画在卡片上方，after 画在下方 —— 必须与
+    // 实际落点一致，否则用户按指示拖放却得到不同结果。
+    'data-dropBefore': dragProps.isDropTarget && dragProps.dropPosition !== 'after' ? 'true' : undefined,
+    'data-dropAfter': dragProps.isDropTarget && dragProps.dropPosition === 'after' ? 'true' : undefined,
+    // 整卡可拖：抓取柄之外也能拖，手感更好；但文本选择区（凭据/时间）
+    // 仍可正常选中——HTML5 拖拽不会阻止选择。
+    draggable: dragProps.enabled ? 'true' : undefined,
+    onDragStart: dragProps.onDragStart,
+    onDragEnd: dragProps.onDragEnd,
+    onDragOver: dragProps.onDragOver,
+    onDrop: dragProps.onDrop,
   },
     React.createElement('div', { className: 'dim-jh-accountTop' },
+      // 抓取柄 + 序号：序号即自动选号的优先级，让"拖到第一位"的含义明确。
+      dragProps.enabled
+        ? React.createElement('span', {
+            className: 'dim-jh-dragHandle',
+            title: '拖动以调整顺序（顺序即自动选号优先级）',
+            'aria-hidden': 'true',
+          }, '⠿')
+        : null,
+      dragProps.enabled
+        ? React.createElement('span', { className: 'dim-jh-accountOrder', title: '自动选号优先级' },
+            String((order ?? index ?? 0) + 1))
+        : null,
       React.createElement('span', {
         className: 'dim-jh-accountStatus',
         'data-on': account.enabled ? 'true' : 'false',
@@ -443,6 +470,21 @@ function ProviderPanel({ provider, rpcCall }) {
    * 没必要让整个登录流程作废。
    */
   const [loginUrlForManual, setLoginUrlForManual] = React.useState(null);
+
+  /**
+   * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
+   *
+   * 两者都只用于**视觉反馈**（源卡片淡出、目标卡片显示插入线），
+   * 真正的顺序变更在 drop 时才提交给服务端。
+   */
+  const [draggingId, setDraggingId] = React.useState(null);
+  const [dropTargetId, setDropTargetId] = React.useState(null);
+  // 落点方向：'before' | 'after'。由指针落在目标卡片的上半/下半决定，
+  // 让"往下拖一格"与"往上拖一格"都能生效（详见 account-order.js）。
+  const [dropPosition, setDropPosition] = React.useState('before');
+  const [reordering, setReordering] = React.useState(false);
+  // 拖拽提交失败时的提示（如「列表已变化，请刷新」）。
+  const [reorderError, setReorderError] = React.useState(null);
   const mounted = React.useRef(true);
   /**
    * 最新账号列表的 ref 镜像。
@@ -682,6 +724,92 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
+   * 把账号列表重排为 `orderedIds` 并持久化。
+   *
+   * **乐观更新**：先本地改顺序（拖拽手感即时），再提交服务端；失败则回滚并
+   * 提示。拖拽若等一个网络往返才动，会明显发滞。
+   *
+   * 顺序不是纯 UI 状态：它就是服务端 `getAvailableAccount` 的候选优先级，
+   * 即自动选号与限流换号的实际取号顺序（见 `AccountPool.reorderAccounts`）。
+   */
+  const commitOrder = async (orderedIds) => {
+    const snapshot = accountsRef.current;
+    const byId = new Map(snapshot.map(a => [a.id, a]));
+    const next = orderedIds.map(id => byId.get(id)).filter(Boolean);
+    if (next.length !== snapshot.length) return;   // 理论不可达：id 集合来自本列表
+    accountsRef.current = next;
+    setAccounts(next);
+    setReordering(true);
+    setReorderError(null);
+    try {
+      await rpcCall('account.reorder', { provider, orderedIds });
+    } catch (caught) {
+      console.error('[jet-hub] reorder failed:', caught);
+      if (!mounted.current) return;
+      // 回滚：服务端未接受这个顺序，界面不能停在"看起来已生效"的状态。
+      accountsRef.current = snapshot;
+      setAccounts(snapshot);
+      setReorderError(caught?.message || '顺序保存失败');
+    } finally {
+      if (mounted.current) setReordering(false);
+    }
+  };
+
+  /**
+   * 计算把 `sourceId` 放到 `targetId` 前/后的新顺序。
+   *
+   * 实际逻辑在 `./account-order.js`（纯函数，可单测）：这里只负责取当前
+   * 列表的 id 序列并转交。`position` 由指针落在目标卡片的上半/下半决定 ——
+   * 只支持「插入到之前」会让"往下拖一格"变成空操作（见该模块注释）。
+   */
+  const computeDropOrder = (sourceId, targetId, position) =>
+    orderAfterDrop(accountsRef.current.map(a => a.id), sourceId, targetId, position);
+
+  /** 构造某张卡片的拖拽属性（关闭拖拽时返回 enabled:false）。 */
+  const dragPropsFor = (account, index) => {
+    // 只有一个账号时排序无意义，直接不启用（避免出现无法落点的拖拽）。
+    if (accounts.length < 2) return { enabled: false };
+    return {
+      enabled: true,
+      order: index,
+      isDragging: draggingId === account.id,
+      isDropTarget: dropTargetId === account.id && draggingId !== null && draggingId !== account.id,
+      dropPosition,
+      onDragStart: (event) => {
+        setDraggingId(account.id);
+        setReorderError(null);
+        // 必须设置 dataTransfer，否则 Firefox 不触发拖拽。
+        try { event.dataTransfer.setData('text/plain', account.id); } catch { /* 忽略 */ }
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+      },
+      onDragEnd: () => {
+        setDraggingId(null);
+        setDropTargetId(null);
+      },
+      onDragOver: (event) => {
+        if (draggingId === null || draggingId === account.id) return;
+        // 必须 preventDefault 才允许 drop。
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        if (dropTargetId !== account.id) setDropTargetId(account.id);
+        // 按指针在卡片内的纵向位置决定插到前面还是后面。
+        const rect = event.currentTarget?.getBoundingClientRect?.();
+        const next = dropPositionFromPointer(event.clientY, rect);
+        if (next !== dropPosition) setDropPosition(next);
+      },
+      onDrop: (event) => {
+        event.preventDefault();
+        const sourceId = draggingId;
+        setDraggingId(null);
+        setDropTargetId(null);
+        if (sourceId === null || sourceId === account.id) return;
+        const next = computeDropOrder(sourceId, account.id, dropPosition);
+        if (next !== null) void commitOrder(next);
+      },
+    };
+  };
+
+  /**
    * 重测 / 重置的统一入口。
    *
    * kind 决定调用哪个 RPC：
@@ -821,9 +949,23 @@ function ProviderPanel({ provider, rpcCall }) {
               React.createElement('p', null, '尚未配置账号'),
               React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。'))
           : React.createElement('div', null,
-              accounts.map(account => React.createElement(AccountCard, {
+              // 排序提示：顺序会真实影响自动选号，必须让用户知道，否则
+              // 「拖了有什么用」无从得知。仅两个以上账号时才显示。
+              accounts.length > 1
+                ? React.createElement('p', { className: 'dim-jh-orderHint' },
+                    '拖动卡片可调整顺序（也可直接拖整张卡片）。顺序即自动选号与限流换号的优先级，排在前面的账号优先使用。')
+                : null,
+              reorderError
+                ? React.createElement('div', {
+                    className: 'dim-jh-probeNotice',
+                    'data-tone': 'warn',
+                    role: 'alert',
+                  }, React.createElement('div', null, `顺序保存失败：${reorderError}`))
+                : null,
+              accounts.map((account, index) => React.createElement(AccountCard, {
                 key: account.id,
                 account,
+                index,
                 busy: probeBusy !== null,
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
@@ -832,6 +974,8 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // 提交顺序期间禁用拖拽，避免并发提交互相覆盖。
+                drag: reordering ? { enabled: false } : dragPropsFor(account, index),
               }))),
     // 模型列表以 modal 渲染：它是覆盖层，放在账号区之后只是组件树的书写顺序，
     // 实际靠 fixed 定位浮在整个面板之上，不再挤占账号池的版面。

@@ -78,6 +78,29 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - 适配器必须以 `this.product.id` 作为 provider 实参查询账号池（写死 `'buddy'` 会让 WorkBuddy 永远匹配不到账号）
 - 限流后按池中「已启用且不在重置时间内」的下一个账号自动重试；全部耗尽才抛 `QUOTA_EXCEEDED`
 
+### 账号顺序 = 选号优先级（Jet Hub 拖拽排序）
+
+**数组顺序本身就是 `getAvailableAccount` 的候选优先级**，即自动选号与限流换号的实际取号顺序。
+
+- ⚠️ **不要重新引入「按限流重置时间重排候选」的 sort**。早期实现有
+  `candidates.sort((a,b) => resetAtA - resetAtB)`，它会让手动顺序形同虚设 ——
+  用户把某账号拖到首位，只要另一个账号的重置时间更早，实际选中的仍是后者。
+  现语义是「**手动顺序优先，限流豁免**」：顺序完全由用户决定，而正处于限流期的
+  账号已被 `filter` 排除，不会选到
+- `reorderAccounts(provider, orderedIds)`：**只动本 provider 占用的下标**，
+  其他 provider 账号位置不变（账号存在一个全局数组里，设置页按 provider 分组渲染）
+- `orderedIds` 必须是该 provider 全部账号 id 的一个**排列**，否则抛错。
+  少了 id 若静默忽略，该账号会莫名掉到末尾（用户看到「顺序自己变了」）；
+  多了未知 id 说明前后端状态不一致
+- RPC：`account.reorder`；前端 `plugin-src/client/jet-hub.js` + 纯逻辑
+  `plugin-src/client/account-order.js`
+- ⚠️ **落点必须区分 before / after**（`dropPositionFromPointer` 按指针落在目标卡片
+  上半/下半判定）。只支持「插入到目标之前」时，把卡片**往下拖一格是空操作**，
+  用户会以为拖拽坏了。插入线指示（`data-dropBefore` / `data-dropAfter`）必须与
+  实际落点一致
+- ⚠️ **移除源元素后目标下标会前移**，必须用 `indexOf` 重算而不能复用原下标，
+  否则会插到目标之后。`tests/unit/account-order.spec.ts` 覆盖了这一点
+
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
 同一 `jet-hub` 命名空间的 `disabledModels` 字段保存「被关闭的模型」，形如 `{ buddy: { 'glm-5.2': true } }`。要点：

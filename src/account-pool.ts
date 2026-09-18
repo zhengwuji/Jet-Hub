@@ -341,6 +341,71 @@ export class AccountPool {
   }
 
   /**
+   * 重排某 provider 下账号的顺序（Jet Hub 拖拽排序）。
+   *
+   * ## 为什么顺序有实际意义
+   *
+   * 账号列表的数组顺序就是 {@link getAvailableAccount} 的**候选优先级**：
+   * 自动选号、限流后的换号重试都按这个顺序取「第一个可用账号」。
+   * 因此拖拽不是 UI 装饰，它直接决定实际用哪个账号发请求。
+   *
+   * ## 只动本 provider 的槽位
+   *
+   * 账号存在**一个全局数组**里（各 provider 混排，靠 `provider` 字段区分），
+   * 而设置页是按 provider 分组渲染的。因此这里取「该 provider 账号原本占用的
+   * 那些下标」，把新顺序填回这些下标 —— 其他 provider 的账号**位置不变**。
+   *
+   * 不这么做（例如把该 provider 的账号整体挪到数组头部）会让拖拽 CodeArts
+   * 的顺序顺带改变 Buddy 账号的相对位置，属于跨面板的意外副作用。
+   *
+   * ## 校验：必须是同一集合的一个排列
+   *
+   * `orderedIds` 必须恰好包含该 provider 的**全部**账号 id（顺序可变、集合不可变）。
+   * 不满足就抛错而不是「尽力而为」：
+   * - 少了某个 id（前端列表过期，期间账号被别处新增）→ 若静默忽略，那个账号
+   *   会莫名其妙掉到末尾，用户看到的是"顺序自己变了"；
+   * - 多了未知 id → 说明前端状态与服务端不一致。
+   * 两种情况都让用户刷新重试，比悄悄改数据安全。
+   *
+   * @param provider - provider id
+   * @param orderedIds - 该 provider 全部账号 id 的目标顺序
+   */
+  async reorderAccounts(provider: string, orderedIds: readonly string[]): Promise<void> {
+    const accounts = this.readAccounts()
+    const indices: number[] = []
+    const currentIds: string[] = []
+    accounts.forEach((entry, index) => {
+      if (entry.provider === provider) {
+        indices.push(index)
+        currentIds.push(entry.id)
+      }
+    })
+
+    // 集合一致性校验（顺序无关）。
+    const expected = new Set(currentIds)
+    const got = new Set(orderedIds)
+    const sameSet = orderedIds.length === currentIds.length
+      && got.size === orderedIds.length
+      && orderedIds.every(id => expected.has(id))
+    if (!sameSet) {
+      throw new Error(
+        `账号列表已变化，请刷新后重试（期望 ${currentIds.length} 个账号，收到 ${orderedIds.length} 个）`,
+      )
+    }
+
+    const next = [...accounts]
+    // 按新顺序回填到该 provider 原本占用的下标上。
+    indices.forEach((accountIndex, position) => {
+      const id = orderedIds[position]
+      const source = accounts.find(a => a.id === id)
+      // 上面的集合校验已保证 source 必定存在；这里的判断只为类型收窄。
+      if (source !== undefined) next[accountIndex] = source
+    })
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[jet-hub] 已重排 ${provider} 账号顺序: ${orderedIds.join(', ')}`)
+  }
+
+  /**
    * 按凭据内容反查账号 id（供适配器记录"当前用的是哪个账号"）。
    *
    * 适配器不持有 ctx，也不该直接访问本类的私有凭据存储，
@@ -480,12 +545,17 @@ export class AccountPool {
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
       })
     if (candidates.length === 0) return null
-    // 优先选择无限制或限制最早到期的
-    candidates.sort((a, b) => {
-      const ra = a.modelRateLimits?.[modelId] ?? 0
-      const rb = b.modelRateLimits?.[modelId] ?? 0
-      return ra - rb
-    })
+    // 候选顺序即**用户在 Jet Hub 拖拽设定的手动顺序**（`reorderAccounts` 写入）。
+    //
+    // 为什么不再按「限流重置时间最早到期」重排（早期实现如此）：
+    // 那个排序会让手动顺序形同虚设 —— 用户把某账号拖到首位，只要另一个
+    // 账号的限流重置时间更早，实际选中的仍是后者，拖拽变成纯 UI 装饰。
+    // 现在的语义是「手动顺序优先，限流豁免」：顺序完全由用户决定，
+    // 而当前正处于限流期的账号已被上面的 filter 排除，不会选到。
+    //
+    // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
+    // 顺序，故这里天然就是手动顺序，无需任何排序。
+    //
     // 逐个尝试解析凭据，跳过占位/损坏条目（并记录原因，避免静默失败）
     const failures: string[] = []
     for (const entry of candidates) {

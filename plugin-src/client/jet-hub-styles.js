@@ -39,9 +39,23 @@ const STYLES = `
 .dim-jh-empty p { margin: 8px 0; font-size: 14px; }
 
 /* 账号卡片 */
-.dim-jh-accountCard { border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; padding: 14px 16px; margin-bottom: 10px; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); transition: border-color .16s ease, box-shadow .16s ease; }
+.dim-jh-accountCard { position: relative; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; padding: 14px 16px; margin-bottom: 10px; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); transition: border-color .16s ease, box-shadow .16s ease, opacity .16s ease; }
 .dim-jh-accountCard:hover { border-color: color-mix(in srgb, #1677ff 22%, var(--dsw-alias-border-l2, #eef0f3)); box-shadow: 0 5px 16px rgb(31 35 41 / 5%); }
 .dim-jh-accountCard[data-enabled="false"] { opacity: 0.62; }
+
+/* 拖拽排序 */
+/* 抓取柄：独立的小区域，避免与卡片内的按钮/文本选择冲突 */
+.dim-jh-dragHandle { flex: none; width: 16px; height: 20px; display: flex; align-items: center; justify-content: center; cursor: grab; color: var(--dsw-alias-label-tertiary, #9aa0a6); font-size: 12px; line-height: 1; letter-spacing: -1px; user-select: none; border-radius: 4px; }
+.dim-jh-dragHandle:hover { color: var(--dsw-alias-label-secondary, #5f6672); background: rgb(31 35 41 / 5%); }
+.dim-jh-dragHandle:active { cursor: grabbing; }
+/* 正在被拖动的卡片：淡出以表明它已"拿起" */
+.dim-jh-accountCard[data-dragging="true"] { opacity: 0.4; border-style: dashed; }
+/* 拖拽悬停的目标位置：插入线。上方=插到该卡片之前，下方=之后。 */
+.dim-jh-accountCard[data-dropBefore="true"]::before { content: ''; position: absolute; left: 0; right: 0; top: -6px; height: 3px; border-radius: 2px; background: #1677ff; }
+.dim-jh-accountCard[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -6px; height: 3px; border-radius: 2px; background: #1677ff; }
+/* 序号徽标：让当前优先级一目了然（顺序即自动选号优先级） */
+.dim-jh-accountOrder { flex: none; min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: 11px; line-height: 17px; font-weight: 600; text-align: center; color: var(--dsw-alias-label-secondary, #5f6672); background: rgb(31 35 41 / 6%); }
+.dim-jh-orderHint { margin: 0 0 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 顶部一行：状态点 + 名称 + 状态标签 */
 .dim-jh-accountTop { display: flex; align-items: center; gap: 8px; }

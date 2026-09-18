@@ -5,7 +5,7 @@
  * 与 dsh-im 的 registerManagementRpc 一致。
  * 通道名 jet-hub → 路径 /api/jet-hub
  * 端点方法：account.list / account.create / account.update / account.delete /
- *           account.refresh / account.retest / account.retestAll /
+ *           account.reorder / account.refresh / account.retest / account.retestAll /
  *           account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           model.list / model.setDisabled
@@ -57,6 +57,7 @@ import type {
   RpcPollLoginResponse,
   RpcUpdateAccountRequest,
   RpcDeleteAccountRequest,
+  RpcReorderAccountsRequest,
   RpcRefreshAccountRequest,
   RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
@@ -611,6 +612,32 @@ function registerJetHubEndpoints(
       case 'account.delete': {
         const req = payload as RpcDeleteAccountRequest
         await pool.removeAccount(req.accountId)
+        return { ok: true, value: undefined }
+      }
+
+      // 拖拽排序：重写该 provider 账号在池中的顺序。
+      // 该顺序是自动选号与限流换号的候选优先级，因此不是纯 UI 操作。
+      case 'account.reorder': {
+        const req = payload as RpcReorderAccountsRequest
+        if (typeof req.provider !== 'string' || req.provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }
+        }
+        if (!Array.isArray(req.orderedIds) || req.orderedIds.some(id => typeof id !== 'string')) {
+          return { ok: false, error: { code: 'bad-request', message: 'orderedIds 必须是字符串数组' } }
+        }
+        try {
+          await pool.reorderAccounts(req.provider, req.orderedIds)
+        } catch (error) {
+          // 集合不一致（前端列表过期）是可预期的并发情况，回可读错误让用户
+          // 刷新重试，而不是抛成 jet-hub/handler-failed 那种「未知故障」。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }
+        }
         return { ok: true, value: undefined }
       }
 
