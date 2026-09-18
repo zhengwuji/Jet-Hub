@@ -1,6 +1,6 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { runLoginFlow, runOAuthFlow } from './login.js'
+import { runLoginFlow, runOAuthFlow, startOAuthFlow, type StartedOAuthFlow } from './login.js'
 import {
   RefreshTokenExpiredError,
   credentialFromTokenResponse,
@@ -97,10 +97,51 @@ export class CodeArtsAuth extends Service {
   /** 运行登录流程（默认新式 OAuth；flow: 'ticket' 走旧流程回退）并持久化凭据。 */
   async login(options: { flow?: 'oauth' | 'ticket'; refName?: string; accountId?: string; pool?: AccountPool } & LoginFlowOptions = {}): Promise<LoginResult> {
     this.active = true
-    const ref = options.refName ? credentialRef(options.refName) : credentialRef(CODEARTS_CREDENTIAL_REF)
     const flow: LoginFlowResult = options.flow === 'ticket'
       ? await runLoginFlow(options)
       : await runOAuthFlow(options)
+    return this.persistLogin(flow, options)
+  }
+
+  /**
+   * **两步式登录**：起回调服务器并立即返回登录 URL，由调用方先打开窗口。
+   *
+   * 为什么需要它（真实缺陷）：Jet Hub 的「+ 新建账号」原先调用阻塞式
+   * {@link login}，而浏览器只在用户点击后的短暂窗口（transient activation，
+   * 约 5 秒）内允许 `window.open`。等阻塞调用返回时手势早已过期，
+   * `window.open` 被弹窗拦截器拒绝并返回 `null`，前端兜底逻辑便执行
+   * `window.location.href = loginUrl`，把**整个设置页**跳转到登录页
+   * ——用户看到的正是「主页面直接跳转过去了」。
+   *
+   * 与 CodeBuddy 系的做法对齐（那边是后端不 await、立即返回 loginUrl），
+   * 因此三者现在都是「点击 → 弹出小窗 → 轮询等待」的同一交互。
+   *
+   * 调用方拿到 `loginUrl` 后应当**立即** `window.open`，再 await `result`。
+   */
+  async startLogin(
+    options: { refName?: string; accountId?: string; pool?: AccountPool } & LoginFlowOptions = {},
+  ): Promise<{ loginUrl: string; result: Promise<LoginResult>; close: () => Promise<void> }> {
+    this.active = true
+    const started: StartedOAuthFlow = await startOAuthFlow(options)
+    const result = started.result.then((flow) => this.persistLogin(flow, options))
+    // 与 startOAuthFlow 同理：结果可能早于调用方 await 而落定，
+    // 先挂空处理器避免「未处理的拒绝」告警（错误仍会传给真正的消费者）。
+    result.catch(() => {})
+    return { loginUrl: started.loginUrl, result, close: started.close }
+  }
+
+  /**
+   * 持久化一次登录结果：写凭据、重置失效状态、武装续期、按需登记账号池。
+   *
+   * 抽成独立方法供 {@link login} 与 {@link startLogin} 共用 ——
+   * 两条路径的差别只在「何时返回 loginUrl」，落库逻辑必须完全一致，
+   * 否则两步式路径会静默缺少续期武装或账号登记。
+   */
+  private async persistLogin(
+    flow: LoginFlowResult,
+    options: { refName?: string; accountId?: string; pool?: AccountPool } = {},
+  ): Promise<LoginResult> {
+    const ref = options.refName ? credentialRef(options.refName) : credentialRef(CODEARTS_CREDENTIAL_REF)
     await this.ctx.credentials.set(ref, flow.access)
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined

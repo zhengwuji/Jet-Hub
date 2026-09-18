@@ -3,14 +3,14 @@
  *
  * 为什么必须单独成表、且必须在**发起请求之前**判断：
  *
- * Host 侧两个积分端点（`credits.balances` / `credits.claimAll`）都以
- * `productById(provider)` 解析产品配置（见 `src/jet-hub-rpc.ts`），而
- * **CodeArts 不属于 CodeBuddy 系产品**，解析结果为 `undefined`，端点必定回
- * `bad-request: unsupported provider: codearts`。客户端早期在面板挂载时对所有
- * provider 无条件调用 `credits.balances`，于是每打开一次 CodeArts 面板都会：
+ * Host 侧积分端点对**三套互不相同的协议**分派（见 `src/jet-hub-rpc.ts`）：
+ * CodeBuddy 系经 `productById(provider)` 取产品配置，LobsterAI 与 CodeArts
+ * 各自提前分支。未登记的 provider 仍会落到 `bad-request`，因此客户端必须
+ * 在发请求之前按本表门控 —— 历史缺陷正是「对不支持的 provider 无条件发请求」：
+ * 早期 CodeArts 两项能力皆无，客户端却在面板挂载时对所有 provider 调用
+ * `credits.balances`，于是每打开一次 CodeArts 面板都会：
  *   1. 在控制台留下一条必然失败的报错（`[jet-hub] load credits failed`）；
  *   2. 把该页面每个账号卡片的「积分」渲染成「查询失败」。
- * 这不是偶发故障，而是「请求了后端明确不支持的能力」这一设计缺陷的必然结果。
  * 修法不是在 UI 上吞掉错误，而是**不发起这个请求**。
  *
  * 之所以用一张表而不是散落的 `provider === 'buddy' || provider === 'workbuddy'`
@@ -21,18 +21,22 @@
  *
  * | provider    | balance（积分余额） | dailyCheckin（每日签到领取） |
  * |-------------|---------------------|------------------------------|
- * | `codearts`  | ✗ 华为云账号体系     | ✗                            |
+ * | `codearts`  | ✓ 华为签名          | ✓ 华为签名                   |
  * | `buddy`     | ✓                   | ✓                            |
  * | `workbuddy` | ✓                   | ✗ 国际版后端无签到接口        |
  * | `lobsterai` | ✓                   | ✓ `client-activities` 三步流程 |
  *
  * - `balance`：CodeBuddy 系用 `POST /v2/billing/meter/get-user-resource`
  *   （CodeBuddy 与 WorkBuddy 国际版**通用**，仅 baseURL 随 `product.endpoint`
- *   切换）；LobsterAI 用 `GET /api/user/profile-summary`。见 README「积分余额」。
+ *   切换）；LobsterAI 用 `GET /api/user/profile-summary`；CodeArts 用
+ *   `GET /snap-manager/v1/statistics/plugin`（与账户类型检测同一响应）。
+ *   见 README「积分余额」。
  * - `dailyCheckin`：CodeBuddy 系用 `checkin-activity-status` + `daily-checkin`
  *   （**仅 CodeBuddy 中国版**有；WorkBuddy 国际版内核里只有
  *   `get-dosage-notify` 用量通知）；LobsterAI 用 `client-activities` 的
- *   slot → context → check_in 三步（见 `src/lobsterai-credits.ts`）。
+ *   slot → context → check_in 三步（见 `src/lobsterai-credits.ts`）；
+ *   CodeArts 用 `/v1/ops/delivery` + `/v1/ops/claim`(+`confirm`)
+ *   （见 `src/codearts-credits.ts`）。
  *
  * 判定一律**默认关闭**：未登记的 provider 视为不支持任何积分能力。这样将来
  * 新增 provider 时，若忘记在此登记，最坏结果是「暂时看不到积分」，而不是
@@ -41,7 +45,7 @@
 
 /** 单个 provider 的积分能力。 */
 export const CREDITS_CAPABILITIES = Object.freeze({
-  codearts: Object.freeze({ balance: false, dailyCheckin: false }),
+  codearts: Object.freeze({ balance: true, dailyCheckin: true }),
   buddy: Object.freeze({ balance: true, dailyCheckin: true }),
   workbuddy: Object.freeze({ balance: true, dailyCheckin: false }),
   lobsterai: Object.freeze({ balance: true, dailyCheckin: true }),
@@ -60,7 +64,7 @@ export function supportsCreditBalance(provider) {
 /**
  * 该 provider 是否能执行每日签到领取（一键领取积分）。
  *
- * 为 false 时面板不渲染该按钮（CodeArts 无此能力；WorkBuddy 国际版后端无接口）。
+ * 为 false 时面板不渲染该按钮（WorkBuddy 国际版后端无接口）。
  */
 export function supportsDailyCheckin(provider) {
   return CREDITS_CAPABILITIES[provider]?.dailyCheckin === true;

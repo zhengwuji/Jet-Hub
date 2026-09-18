@@ -14,7 +14,7 @@
 
 `lobsterai` 与上述两者**完全不同源**：登录方式、请求头、续期载荷、签到流程、版本号来源都不一样，因此实现是独立一套 `src/lobsterai*.ts`。它只**共用架构模式**（产品配置驱动、账号池、限流切换、模型黑名单），**不共用 `BuddyProduct` 类型** —— 那里面 `apiDomain` / `productCode` / `attributionName` / `userAgentByModelFamily` / `appendSessionParams` 等字段对 LobsterAI 全部无意义。详见 README 的「LobsterAI provider」章节与 `docs/lobsterai-integration-plan.md`。
 
-Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy 与 LobsterAI 两个面板提供** —— 国际版 WorkBuddy 后端没有签到接口，CodeArts 是华为云账号体系不参与。
+Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI 与 CodeArts 三个面板提供** —— 国际版 WorkBuddy 后端没有签到接口，故不提供。三者是**三套互不相同的协议**（见下「积分领取」）。
 
 - **包名**：`dsh-codearts-auth`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
@@ -161,9 +161,38 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - 工具结果内嵌图片（`read_image`）不能留在 `role:'tool'` 消息里（该角色 content 只能是字符串），须提升为**其后的独立 user 消息**；`userContentParts` 与 `collectImages` 必须**对称递归**，否则深层图片会被静默吞掉
 - 只声明 `inputModalities` 而不实现比不声明**更糟**：DSH 在 `LlmRuntime` 里按它决定是否把图片投影成文本占位符，声明支持就必须真支持
 
+## 「+ 新建账号」必须两步式返回 loginUrl（四个 provider 一致）
+
+`account.create` 对**全部四个 provider** 都必须在**用户完成授权之前**返回
+`loginUrl`，由前端立即 `window.open`，后台再异步等回调。
+
+这不是风格偏好，而是浏览器硬约束：`window.open` 只在用户点击后的
+**transient activation** 窗口（约 5 秒）内被允许。若 `account.create` 阻塞到
+用户授权完成（数十秒），返回时手势已过期 → 弹窗被拦截返回 `null` → 前端若
+兜底 `window.location.href = loginUrl` 就会把**整个设置页**导航走。
+**真实缺陷**（用户报障）：「codearts 新建账号应该弹出新的页面，现在主页面直接
+跳转过去了」正是此因。
+
+- `buddy` / `workbuddy`：`runBuddyLoginFlow` 不 await，立即返回 URL
+- `codearts`：`CodeArtsAuth.startLogin()`（`src/service.ts`），底层 `startOAuthFlow`（`src/login.ts`）
+- `lobsterai`：`LobsteraiAuth.startLogin()`（`src/lobsterai-auth.ts`），底层 `startLobsteraiLoginFlow`（`src/lobsterai-oauth.ts`）
+
+要点：
+
+- 阻塞式 `runOAuthFlow` / `runLobsteraiLoginFlow` **保留**（CLI、e2e 仍用），
+  但它们现在由 `start*` 实现，两条路径的落库逻辑共用 `persistLogin()` ——
+  否则两步式会静默缺少续期武装或账号登记
+- 两步式路径**没有外层 `try/finally`**，故超时与「结果落定即关闭回调服务器」
+  都收在 `start*` 内部，避免泄漏监听端口
+- 两步式下 `account.create` 返回时凭据还不存在，**必须**先登记占位账号条目，
+  否则前端 `login.poll` 查不到该账号、永远 `done:false`
+- 前端**不得**再出现 `window.location.href = loginUrl`：弹窗被拦截时改为展示
+  可点击链接（`loginUrlForManual`）。`tests/unit/jet-hub-rpc.spec.ts` 有源码级
+  断言锁死这条（剔除注释行后匹配，因注释里保留了该缺陷的叙述）
+
 ## 积分领取（每日签到）
 
-两套**协议完全不同**的实现，各自独立：
+**三套协议完全不同**的实现，各自独立：
 
 **CodeBuddy** —— `src/credits.ts`（国际版 WorkBuddy 后端无签到接口）：
 
@@ -179,20 +208,37 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - `clientVersion` 是**必填** query 参数，动态拉取（缓存 12h），失败回退 `product.fallbackClientVersion`
 - `platform=win32` 等参数是**客户端形态伪装**，非 Windows 上也照发
 
-两套都遵守的共同约定：
+**CodeArts** —— `src/codearts-credits.ts`（四步，华为云「每日签到得积分」）：
+
+- 账户类型 `GET /snap-manager/v1/statistics/plugin` → 活动列表 `GET /v1/ops/delivery?channel=IDE` → 领取 `POST /v1/ops/claim` `{campaignId, channel:'IDE'}` →（响应 `id !== null` 时）确认 `POST /v1/ops/confirm` `{campaignId}`
+- **认证是 `SDK-HMAC-SHA256` 签名**（复用 `src/sign.ts`），base = `https://snap-access.cn-north-4.myhuaweicloud.com`（与 `src/models.ts` 的 `SNAP_MODEL_BUILTIN_URL` **同域**）
+- ⚠️ **`Agent-Type` / `X-Language` 必须在签名之后追加，绝不能参与签名**。实测把它们作为 `signRequestHuawei` 的 `extraHeaders` 传入（进入 canonical request 与 SignedHeaders）会得到 `401 APIG.0301 verify ak sk signature fail`；签名后追加则 200 并返回真实数据。正确做法与 `src/models.ts` 的 `fetchSignedGet` 一致（其参数注释写明「签名后追加的头（不参与签名计算）」）。**真实缺陷**：本模块早期误当作签名头，界面显示「积分：账户信息查询失败」。⚠️ 注意 `src/llm-adapter.ts` 的 `maas_type: benefit` 是**反例**——那个头确实需要参与签名，不要据此推断
+- ⚠️ **非 2xx 必须带出服务端 `error_code` / `error_msg`**（`describeHttpFailure`）：只报 `HTTP 401` 会让「签名头位置错」「AK 限流（`AK access failed to reach the limit`）」「凭据过期」这些处置方式完全不同的问题看起来一模一样
+- ⚠️ **官方文档给的 portal 路径不可用**：`codearts.huaweicloud.com/portal/...` 是 BFF 接口、依赖浏览器 Cookie，实测带 AK/SK 签名也只会返回 IAM 登录跳转 HTML。协议逆向自本机码道 IDE（`out/main.js` 的 `PackageInfoService`、workbench 的 `ActivityWelfarePane`）
+- **账户类型检测**：`package.is_credit_package === true` 即积分账户（文档要求「已升级到积分计费模式」）。领取第一步就判它，非积分账户回 `inactive` 而非 `failed`
+- **幂等**：本协议无幂等键、无「今天已签到」业务码，唯一保护是活动列表的 `claimable` / `status` 预检（`status` ∈ {CLAIMED, CONFIRMED, CONSUMED} → `already-claimed`）
+- ⚠️ **`refresh_token` 一次性轮换**：用一次即作废（`STS5.1806 the refresh token has been used`）。任何刷新都必须**立刻回写**新凭据；E2E 凭据读取（`tests/e2e/codearts-credential.ts`）**只读不刷新**
+- `statistics/plugin` 是**裸对象**响应（无 `{code,data}` 包装），而 `ops/*` 有 —— 解析必须兼容两种信封
+- ⚠️ **`/v1/ops/delivery` 的字段类型/名字与直觉不符**（实测 2026-09-18，两个坑叠加导致「1 个失败」）：
+  - **`campaignId` 是数字**（`1`），不是字符串 → 必须用 `readIdentifier`（兼容数字/字符串），用只收字符串的 `readString` 会得到空串并判 `failed`「活动缺少 campaignId」
+  - **可领积分字段是 `benefitAmount`**（`1000`），不是 `amount` → 读错会恒为 0
+  - 不可领取的活动 `status` 是 **`null`**（不是字符串），`readString` 要能容忍
+  - 完整真实 item 字段：`campaignId` / `title` / `type` / `benefitAmount` / `benefitUnit` / `displayConfig` / `pageUrl` / `claimable` / `hooks` / `extra` / `description` / `status` / `pendingCount` / `pendingTotalAmount`
+- ⚠️ **单测必须用真实响应形状**：早期用例喂的是**编造的** `campaignId: 'c-1'` 与 `amount: 1000`，因此完全没抓到上面那个 bug。新用例直接用实测字段集合
+
+三套都遵守的共同约定：
 
 - `credits.claimAll` / `credits.status` **处理该 provider 下的全部账号，含已停用**：停用只影响账号池的自动选择与限流切换，与「该账号今天领了没」无关
 - 逐账号**顺序执行**（并发易触发风控），单个账号失败不中断整批
 - 返回同一个 `ClaimOutcome` 判别联合，使 `computeClaimSummary` 与前端摘要 UI 两套协议共用
 
-**积分余额（Credits Balance）** 也是两套端点，但语义一致（「查不到」与「余额为 0」严格区分）：
+**积分余额（Credits Balance）** 也是**三套端点**，但语义一致（「查不到」与「余额为 0」严格区分）：
 
 **CodeBuddy 系（buddy / workbuddy）** —— `POST /v2/billing/meter/get-user-resource`：
 
 - body `{}`；响应**双层嵌套**：`data.Response.Data.Accounts[]`（签到是单层 `data`，此处最易解析错）
 - 总额用各包 `CapacityRemainPrecise` 相加（实测 247.87+100=347.87），**不用**截断过的 `TotalDosage`（347）
 - 包名回退链：`PackageName` → `SubProductName` → `PackageCode`
-- **CodeArts 不支持**（华为云账号体系，无腾讯计费接口）：`productById('codearts')` 为 `undefined`，三个积分端点都会回 `bad-request: unsupported provider: codearts`
 - 该接口**不在 CLI 内核**里（内核只有 `get-dosage-notify`），静态搜索找不到，靠真实凭据实测发现
 
 **LobsterAI** —— `GET /api/user/profile-summary`：
@@ -200,7 +246,12 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - 取 `data.totalCreditsRemaining`
 - **不要**用 `/api/user/quota`：它只有 `freeCreditsTotal=300`，不含活动积分
 
-两者共同的约定：
+**CodeArts** —— `GET /snap-manager/v1/statistics/plugin`（与账户类型检测**同一响应**）：
+
+- 取 `metrics[]` 中 `usageTotalPackageCredit` 的 `package_credit_remain`；**不累加**基础/按需/赠送分类明细（它们是总额的构成项，相加会重复计算）
+- 非积分账户的文案是「Token 计费账户，无积分余额」而非「查询失败」——账户类型差异不是故障。实现走 `CreditsEndpointDeps.fetchBalanceDetailed` 钩子带回精确原因
+
+三者共同的约定：
 
 - 累加后 `roundCredits` 规整两位小数（多包浮点噪声会放大成 655.67000031）
 - 失败时 `balance` 为 `null` + `error`，卡片显示原因而非 0
@@ -212,7 +263,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 | provider | `balance` | `dailyCheckin` |
 |---|---|---|
-| `codearts` | ✗ | ✗ |
+| `codearts` | ✓ | ✓（华为云签名四步流程） |
 | `buddy` | ✓ | ✓ |
 | `workbuddy` | ✓ | ✗（国际版后端无签到接口） |
 | `lobsterai` | ✓ | ✓（`client-activities` 三步流程） |
@@ -221,7 +272,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 - **默认关闭**：未登记的 provider 视为两项全无。新增 provider 忘登记时，最坏结果是暂时看不到积分，而不是每次打开面板都发一个必然失败的请求
 - **门控在发请求之前**，不是在 UI 上吞错误：`loadCredits` / `claimCredits` 函数内部各有一道守卫（按钮不渲染只是 UI 便利，不是安全边界），`AccountCard` 的积分行与「刷新积分」按钮也按能力渲染
-- **历史缺陷**（用户报障）：客户端在面板挂载时对所有 provider 无条件调用 `credits.balances`，CodeArts 面板每次打开都在控制台报 `unsupported provider: codearts`，并把账号卡片的「积分」渲染成「查询失败」。后端 `productById()` 的拒绝是正确契约，不该被当成运行时故障
+- **历史缺陷**（用户报障）：客户端在面板挂载时对所有 provider 无条件调用 `credits.balances`，当时 CodeArts 无积分能力，面板每次打开都在控制台报 `unsupported provider: codearts`，并把账号卡片的「积分」渲染成「查询失败」。后端 `productById()` 的拒绝是正确契约，不该被当成运行时故障。**门控机制保留至今**，用于挡住真正未登记的 provider
 - 改动能力矩阵后必须同步 `PROVIDERS` 列表：`tests/unit/credits-capabilities.spec.ts` 有一条断言锁死两者条目集合相等
 
 ## X-Domain 必须跟随产品，而非凭据

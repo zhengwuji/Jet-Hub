@@ -206,9 +206,9 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, cre
           account.expiresAt
             ? `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
             : '未知')),
-      // 不支持积分余额的 provider（CodeArts）不渲染该行：留着它只能显示
-      // 「查询失败」，而失败原因是「这个 provider 根本没有此接口」——
-      // 与其展示一条无法修复的错误，不如不展示。
+      // 不支持积分余额的 provider 不渲染该行：留着它只能显示「查询失败」，
+      // 而失败原因是「这个 provider 根本没有此接口」——与其展示一条无法修复
+      // 的错误，不如不展示。
       showCredits
         ? React.createElement(CreditBalanceRow, {
             balance: credits?.balance ?? null,
@@ -436,6 +436,13 @@ function ProviderPanel({ provider, rpcCall }) {
   // 账号发网络请求，不能拖慢账号列表本身的渲染。
   const [credits, setCredits] = React.useState({});
   const [creditsLoading, setCreditsLoading] = React.useState(false);
+  /**
+   * 弹窗被拦截时展示给用户手动打开的登录链接。
+   *
+   * 保留它而不是直接失败：弹窗拦截取决于浏览器设置，用户手动点一下就能继续，
+   * 没必要让整个登录流程作废。
+   */
+  const [loginUrlForManual, setLoginUrlForManual] = React.useState(null);
   const mounted = React.useRef(true);
   /**
    * 最新账号列表的 ref 镜像。
@@ -465,16 +472,15 @@ function ProviderPanel({ provider, rpcCall }) {
   /**
    * 本 provider 是否支持积分余额查询。
    *
-   * CodeArts 是华为云账号体系，后端**没有**这两条腾讯计费接口
-   * （`credits.balances` 会回 `unsupported provider: codearts`）。
-   * 因此这里必须在**发起请求之前**判掉：既不调用 RPC，也不渲染「积分」行与
-   * 「刷新积分」按钮——否则卡片会永远停在「查询失败」，控制台每次都留报错。
-   *
    * 判定依据是 `./credits-capabilities.js` 的能力矩阵（唯一真相源），
    * 而不是散落在 UI 里的 provider 字面量比较。
+   *
+   * 必须在**发起请求之前**判掉：既不调用 RPC，也不渲染「积分」行与
+   * 「刷新积分」按钮。历史缺陷是对不支持的 provider 无条件请求，导致卡片
+   * 永远停在「查询失败」、控制台每次都留报错。
    */
   const canLoadCredits = supportsCreditBalance(provider);
-  // 支持每日签到积分的 provider（CodeBuddy / LobsterAI）才渲染领取按钮。
+  // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
 
   /**
@@ -484,7 +490,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 慢或失败；它绝不能影响账号列表的可用性——查不到余额时卡片显示原因，
    * 而不是让整个面板变成错误页。
    *
-   * **不支持的 provider 直接返回**：不支持的 provider（CodeArts）连请求都不发。
+   * **不支持的 provider 直接返回**：不支持的 provider 连请求都不发。
    * 这是刻意放在函数内部而不是只靠调用点判断——`claimCredits` / 「刷新积分」
    * 按钮等多个入口都调它，门控收在这里才不会被将来新增的调用点绕过。
    */
@@ -524,8 +530,8 @@ function ProviderPanel({ provider, rpcCall }) {
   React.useEffect(() => {
     mounted.current = true;
     void loadAccounts();
-    // 只有支持余额查询的 provider 才在挂载时拉积分；CodeArts 不会走到这里
-    // （loadCredits 内部也有一道门控，这里提前判掉是为了连 loading 状态都不翻）。
+    // 只有支持余额查询的 provider 才在挂载时拉积分（loadCredits 内部也有一道
+    // 门控，这里提前判掉是为了连 loading 状态都不翻）。
     if (canLoadCredits) void loadCredits();
     return () => { mounted.current = false; };
     // loadCredits 依赖 accounts，但这里只想在挂载/provider 变化时各跑一次；
@@ -556,16 +562,36 @@ function ProviderPanel({ provider, rpcCall }) {
     setClaimNotice(null);
     try {
       const res = await rpcCall('credits.claimAll', { provider });
-      const { summary } = res;
+      const { summary, results } = res;
       const parts = [];
       if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功（+${summary.totalCredit} 积分）`);
       if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今日已领取`);
       if (summary.inactive > 0) parts.push(`${summary.inactive} 个活动未开启`);
       if (summary.failed > 0) parts.push(`${summary.failed} 个失败`);
       if (!mounted.current) return;
+      // 逐账号列出**具体原因**（昵称 + outcome.message）。
+      //
+      // 后端一直有这些信息（`results[].outcome.message`），但早期 UI 只显示
+      // 计数（如「1 个失败」），用户与排查者都拿不到任何线索 —— 一个
+      // 「campaignId 解析为空」的 bug 因此只能靠翻代码+抓包才能定位。
+      // 失败/未开启的条目尤其需要原因：它们的处置方式完全不同。
+      const details = [];
+      for (const item of results || []) {
+        const outcome = item.outcome || {};
+        if (outcome.kind === 'claimed') {
+          details.push(`${item.nickname || item.accountId}：领取成功 +${outcome.credit} 积分`);
+        } else if (outcome.kind === 'already-claimed') {
+          details.push(`${item.nickname || item.accountId}：${outcome.message || '今天已领取'}`);
+        } else if (outcome.kind === 'inactive') {
+          details.push(`${item.nickname || item.accountId}：${outcome.message || '不在活动范围'}`);
+        } else if (outcome.kind === 'failed') {
+          details.push(`${item.nickname || item.accountId}：失败 — ${outcome.message || '未知原因'}`);
+        }
+      }
       setClaimNotice({
         tone: summary.failed > 0 ? 'warn' : 'ok',
         text: parts.length > 0 ? parts.join('，') : '没有可领取的账号',
+        details,
       });
       await loadAccounts();
       // 领取会改变余额，顺带刷新一次，免得卡片还显示领取前的数字
@@ -590,11 +616,25 @@ function ProviderPanel({ provider, rpcCall }) {
       accountId = res.accountId;
       loginUrl = res.loginUrl;
       if (loginUrl) {
-        // 尝试弹窗；如果被拦截则跳转到当前标签页
+        // 登录页在**新窗口**中打开。这里必须能成功弹出：
+        // 后端对全部 provider 都是「先返回 loginUrl、后台再等回调」的两步式，
+        // 因此本行紧跟用户点击、仍处于浏览器的 transient activation 窗口内。
+        //
+        // ⚠️ 绝不能在弹窗失败时回退到 `window.location.href = loginUrl`：
+        // 那会把整个设置页（甚至用户正在编辑的会话）导航到外部登录页，
+        // 登录完成后也回不来。这正是用户报障「主页面直接跳转过去了」的现象。
+        // 早期 CodeArts/LobsterAI 走的是**阻塞式**登录（后端 await 到用户
+        // 授权完成才返回），拿到 URL 时手势早已过期、window.open 必被拦截，
+        // 于是每次都命中那个跳转兜底。根因已在后端修掉（改为两步式），
+        // 这里也不再保留那条破坏性兜底。
         const loginWindow = window.open(loginUrl, '_blank', 'width=800,height=600');
-        console.log('[jet-hub] window.open result =', loginWindow);
         if (!loginWindow || loginWindow.closed) {
-          window.location.href = loginUrl;
+          // 弹窗被拦截：展示可点击链接让用户自行打开，而不是劫持当前页面。
+          // 轮询照常进行，用户手动打开也能完成登录。
+          //
+          // 这里**不**调 setError：本函数运行时 phase 是 'ready'，错误文案只在
+          // 'error' 阶段渲染，设了也看不见；提示由下面的 loginUrlForManual 区块负责。
+          setLoginUrlForManual(loginUrl);
         }
         // 轮询等待登录完成
         const pollTimer = setInterval(async () => {
@@ -603,6 +643,7 @@ function ProviderPanel({ provider, rpcCall }) {
             if (pollRes.done) {
               clearInterval(pollTimer);
               if (loginWindow && !loginWindow.closed) loginWindow.close();
+              setLoginUrlForManual(null);
               await loadAccounts();
             }
           } catch { /* 继续轮询 */ }
@@ -745,7 +786,29 @@ function ProviderPanel({ provider, rpcCall }) {
           className: 'dim-jh-probeNotice',
           'data-tone': claimNotice.tone,
           role: claimNotice.tone === 'error' ? 'alert' : 'status',
-        }, React.createElement('div', null, claimNotice.text))
+        },
+        React.createElement('div', null, claimNotice.text),
+        // 逐账号原因列表。没有它时用户只看到「1 个失败」，无从判断是
+        // 凭据问题、活动未开、还是解析 bug。
+        (claimNotice.details || []).length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              claimNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
+          : null)
+      : null,
+    // 弹窗被拦截：给出可点击的登录链接。不劫持当前页面（见 createAccount 的说明）。
+    loginUrlForManual
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'warn',
+          role: 'alert',
+        },
+        React.createElement('div', null, '登录窗口被浏览器拦截，请手动打开下方链接完成登录：'),
+        React.createElement('a', {
+          className: 'dim-jh-loginLink',
+          href: loginUrlForManual,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+        }, loginUrlForManual))
       : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')

@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, resolve } from 'node:path'
 import {
   collectClaimResults,
   collectCreditBalances,
@@ -506,6 +509,212 @@ describe('credits.balances 逐账号余额收集', () => {
  * `options.models.map(...)`（从不过滤），恰好绕过这个矛盾，导致该 bug 在
  * 「注释声称已验证第 3 条」的情况下依然漏到了线上。
  */
+describe('account.create 必须立即返回 loginUrl（两步式登录回归）', () => {
+  /**
+   * 真实缺陷（用户报障）：「codearts 新建账号应该弹出新的页面，现在主页面直接
+   * 跳转过去了」。
+   *
+   * 根因是**时序**，不是弹窗 API 用法：
+   * - 浏览器只在用户点击后的短暂窗口（transient activation，约 5 秒）内允许
+   *   `window.open`；
+   * - 早期 `account.create` 对 codearts / lobsterai 走**阻塞式** `login()`
+   *   （`await` 到用户在浏览器里完成授权，数十秒），返回时手势早已过期；
+   * - 前端 `window.open` 被弹窗拦截器拒绝并返回 `null`，于是命中兜底
+   *   `window.location.href = loginUrl`，把整个设置页导航到外部登录页。
+   *
+   * 修法：这两个 provider 也改为「先返回 loginUrl、后台再等回调」的两步式
+   * （与 CodeBuddy 系一致）。因此本用例守的是**契约**：`account.create`
+   * 必须在用户完成授权**之前**就 resolve —— 若哪天有人改回阻塞式，
+   * 这里会以超时失败，而不是等到用户再次报障。
+   *
+   * 用假计时器不适用（涉及真实 Promise 链），故用「授权永不完成」来模拟
+   * 用户尚未操作：旧实现会一直挂着，新实现立即返回。
+   */
+  type Handler = (request: Request) => Promise<Response>
+
+  /** 构造端点，注入一个「授权永不完成」的登录服务替身。 */
+  function registerCreateEndpoints(overrides: {
+    /** startLogin 是否可用；false 模拟旧实现的阻塞式 login。 */
+    twoPhase: boolean
+  }) {
+    let handler: Handler | undefined
+    /** 记录 startLogin / login 的调用，用于断言走了哪条路径。 */
+    const calls: string[] = []
+    let resolveLogin!: () => void
+    const neverFinishes = new Promise<void>((resolve) => { resolveLogin = resolve })
+
+    // 登录服务替身：startLogin 立即返回 URL，result 永不落定（模拟用户未操作）。
+    const makeAuth = (id: string) => ({
+      async startLogin() {
+        calls.push(`${id}:startLogin`)
+        return {
+          loginUrl: `https://example.test/${id}/login`,
+          result: neverFinishes.then(() => ({
+            access: '{}', expires: 0, ref: id, loginUrl: '', refreshable: false,
+          })),
+          close: async () => {},
+        }
+      },
+      async login() {
+        calls.push(`${id}:login`)
+        // 阻塞式：永不 resolve，复刻旧实现的等待语义。
+        return await neverFinishes
+      },
+    })
+
+    const pool = {
+      addAccount: async () => {},
+      updateAccount: async () => {},
+      removeAccount: async () => {},
+      listAccounts: async () => [],
+    }
+
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: { resolve: async () => undefined, set: async () => {}, unset: async () => {} },
+    }
+
+    registerJetHubRpc(
+      ctx as never, pool as never,
+      makeAuth('codearts') as never,
+      {} as never, {} as never,
+      makeAuth('lobsterai') as never,
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const call = async (method: string, payload: unknown) => {
+      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown } }
+      return body.result
+    }
+    return { call, calls, resolveLogin }
+  }
+
+  /**
+   * 给 `account.create` 一个**远早于**用户授权完成的超时预算。
+   *
+   * 旧实现下它必然超时（因为 await 的是永不落定的登录）；新实现下它应当
+   * 在毫秒级返回。这个差异正是本用例的判定依据。
+   */
+  const FAST_BUDGET_MS = 2000
+
+  it.each(['codearts', 'lobsterai'])(
+    '%s 在用户完成授权之前就返回 loginUrl（不阻塞）',
+    async (provider) => {
+      const { call, calls } = registerCreateEndpoints({ twoPhase: true })
+
+      const result = await Promise.race([
+        call('account.create', { provider }),
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), FAST_BUDGET_MS)),
+      ])
+
+      expect(
+        result,
+        `${provider} 的 account.create 阻塞了：说明它退回了「等用户授权完成才返回」`
+        + '的旧实现，前端 window.open 会因手势过期被拦截，进而跳转主页面。',
+      ).not.toBe('timeout')
+      expect((result as { ok: boolean }).ok).toBe(true)
+      const value = (result as { value: { loginUrl: string; accountId: string } }).value
+      expect(value.loginUrl).toContain(provider)
+      expect(value.accountId).toContain(provider)
+      // 必须走两步式的 startLogin，而不是阻塞式 login。
+      expect(calls).toContain(`${provider}:startLogin`)
+      expect(calls).not.toContain(`${provider}:login`)
+    },
+  )
+
+  it('未登录成功的账号先以占位条目登记，使前端 login.poll 能立即看到', async () => {
+    // 两步式下 account.create 返回时凭据还不存在；若不登记占位条目，
+    // 前端的 login.poll 会查不到该账号而永远返回 done:false。
+    let added: Record<string, unknown> | undefined
+    const pool = {
+      addAccount: async (entry: Record<string, unknown>) => { added = entry },
+      updateAccount: async () => {},
+      removeAccount: async () => {},
+      listAccounts: async () => [],
+    }
+    let handler: Handler | undefined
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: { resolve: async () => undefined, set: async () => {}, unset: async () => {} },
+    }
+    const auth = {
+      async startLogin() {
+        return {
+          loginUrl: 'https://example.test/codearts/login',
+          result: new Promise(() => {}),
+          close: async () => {},
+        }
+      },
+    }
+    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never)
+    const response = await handler!(new Request('http://localhost/api/jet-hub', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+        payload: { method: 'account.create', payload: { provider: 'codearts' } },
+      }),
+    }))
+    await response.json()
+    expect(added, 'account.create 未登记占位账号条目').toBeDefined()
+    expect(added?.provider).toBe('codearts')
+    expect(added?.enabled).toBe(true)
+    expect(added?.refreshable).toBe(false)
+  })
+
+  /**
+   * 前端源码级守卫：`createAccount` 不得再劫持当前页面。
+   *
+   * 组件无法在单测里渲染（react 不在本仓库依赖内），故与
+   * `credits-capabilities.spec.ts` 同款——用源码断言锁死那条破坏性兜底
+   * 不再出现。`window.location.href = loginUrl` 会把用户正在使用的设置页
+   * 整个导航到外部登录页，且登录完成后回不来；正确做法是保留可点击链接。
+   */
+  it('createAccount 不再用 window.location.href 跳转主页面', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const source = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+    const start = source.indexOf('const createAccount = async () => {')
+    expect(start).toBeGreaterThan(-1)
+    // 取到下一个顶层函数定义为止，避免把文件其余部分一起扫进来。
+    const rest = source.slice(start)
+    const end = rest.indexOf('\n  const toggleAccount')
+    const body = end > -1 ? rest.slice(0, end) : rest.slice(0, 3000)
+
+    // 归一化 CRLF：本仓库源码在 Windows 上是 CRLF。
+    // 再剔除注释行：本文件里保留了叙述该缺陷的注释（含 `window.location.href = …`
+    // 字样），直接扫全文会把注释本身当成违规。与 credits-capabilities.spec.ts 同款。
+    const normalized = body.replace(/\r\n/g, '\n')
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(
+      normalized,
+      'createAccount 里又出现了 window.location.href 跳转：弹窗被拦截时'
+      + '必须展示可点击链接，而不是把整个设置页导航走。',
+    ).not.toMatch(/window\.location\.(href|assign|replace)\s*=/)
+    // 必须仍然尝试弹出新窗口（两步式的前提）。
+    expect(normalized).toContain('window.open(loginUrl')
+    // 弹窗失败时要有手动链接兜底。
+    expect(normalized).toContain('setLoginUrlForManual(loginUrl)')
+  })
+})
+
 describe('model.list / model.setDisabled 端点', () => {
   /** 从 connection.fetch.register 捕获到的处理器。 */
   type Handler = (request: Request) => Promise<Response>
@@ -773,21 +982,29 @@ describe('model.list / model.setDisabled 端点', () => {
 })
 
 /**
- * 三个积分端点的 provider 能力边界（后端侧契约）。
+ * 三个积分端点的 provider 分派与能力边界（后端侧契约）。
  *
- * CodeArts 是华为云账号体系，**不是** BuddyProduct —— `productById('codearts')`
- * 返回 undefined，因此 `credits.status` / `credits.claimAll` / `credits.balances`
- * 必然回 `bad-request: unsupported provider: codearts`。
+ * 四个 provider 分属**三套互不相同的协议**：
+ * - CodeBuddy 系（buddy / workbuddy）经 `productById()` 取 BuddyProduct；
+ * - `lobsterai`（三步 client-activities）；
+ * - `codearts`（华为云 SDK-HMAC-SHA256 签名，见 `src/codearts-credits.ts`）。
  *
- * 这不是缺陷，而是正确的能力边界声明。真实缺陷在客户端：它在面板挂载时对
+ * 历史背景（本用例的由来）：CodeArts 曾**不是** BuddyProduct，
+ * `productById('codearts')` 返回 undefined，于是三个端点必然回
+ * `bad-request: unsupported provider: codearts`。当时客户端在面板挂载时对
  * **所有** provider 无条件调用 `credits.balances`，把这条必然的拒绝当成运行时
  * 故障打进了控制台，并把账号卡片的「积分」渲染成「查询失败」（修法见
- * `plugin-src/client/credits-capabilities.js` 与 `tests/unit/credits-capabilities.spec.ts`）。
+ * `plugin-src/client/credits-capabilities.js` 与
+ * `tests/unit/credits-capabilities.spec.ts`）。
  *
- * 此用例锁住后端这一侧，防止两种「好心改坏」：
- * - 把拒绝改成「返回空结果」→ 前端会以为 CodeArts 真没有积分可查，永远查不出问题；
- * - 让它抛异常 → 退化成 `jet-hub/handler-failed`，丢失「provider 不支持」这一原因。
- * 同时也验证拒绝是**按 provider 精确生效**的，没有连 CodeBuddy 系一起误拒。
+ * 现在 CodeArts 已接入真实实现，因此本用例锁三件事：
+ * 1. **未登记**的 provider 仍回可读的 bad-request（兜底契约不能退化）；
+ * 2. CodeArts 被**接受**并返回结构化结果（新能力的回归保护）；
+ * 3. 拒绝/接受都**按 provider 精确生效**，没有连 CodeBuddy 系一起误拒。
+ *
+ * 防止的「好心改坏」：把拒绝改成「返回空结果」→ 前端会以为该 provider 真没有
+ * 积分可查，永远查不出问题；让它抛异常 → 退化成 `jet-hub/handler-failed`，
+ * 丢失「provider 不支持」这一原因。
  */
 describe('积分端点的 provider 能力边界', () => {
   /** 从 connection.fetch.register 捕获到的处理器。 */
@@ -804,13 +1021,16 @@ describe('积分端点的 provider 能力边界', () => {
       // 替身必须提供 inject，否则会以 `ctx.inject is not a function` 抛错。
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
+      // 积分端点会 resolve 凭据；返回 undefined 让逐账号流程走「凭据未配置」
+      // 分支，从而无需真实网络即可跑完（accounts 替身返回空数组，实际不触发）。
+      credentials: { resolve: async () => undefined },
     }
     // pool 替身：一旦 provider 校验被绕过，listAccounts 会返回空数组，
     // 端点便以 `ok: true` + 空列表「假成功」——下面的断言会立刻揭穿它，
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
@@ -831,12 +1051,24 @@ describe('积分端点的 provider 能力边界', () => {
 
   const CREDITS_METHODS = ['credits.status', 'credits.claimAll', 'credits.balances']
 
-  it.each(CREDITS_METHODS)('%s 对 codearts 返回 unsupported provider（可读的 bad-request）', async (method) => {
+  /**
+   * 未知 provider 仍必须被拒。
+   *
+   * ⚠️ 历史上这条用例断言的是 **codearts** 被拒 —— 当时 CodeArts 确实没有
+   * 积分能力（华为云账号体系无腾讯计费接口）。现在它已接入自己的签名协议
+   * （`src/codearts-credits.ts`），故改用真正未登记的 provider 名来守住
+   * 同一件事：**拒绝是兜底契约，不是常规路径**。
+   *
+   * 保留本用例的价值：防止「好心改坏」——把拒绝改成「返回空结果」会让前端
+   * 以为该 provider 真没有积分可查；让它抛异常则退化成
+   * `jet-hub/handler-failed`，丢失「provider 不支持」这一原因。
+   */
+  it.each(CREDITS_METHODS)('%s 对未知 provider 返回 unsupported provider（可读的 bad-request）', async (method) => {
     const call = registerCreditsEndpoints()
-    const result = await call(method, { provider: 'codearts' })
+    const result = await call(method, { provider: 'unknownprovider' })
 
     expect(result.ok).toBe(false)
-    expect(result.error?.message).toBe('unsupported provider: codearts')
+    expect(result.error?.message).toBe('unsupported provider: unknownprovider')
   })
 
   it.each(CREDITS_METHODS)('%s 不会把 CodeBuddy 系一并误拒', async (method) => {
@@ -846,5 +1078,43 @@ describe('积分端点的 provider 能力边界', () => {
       const result = await call(method, { provider })
       expect(result.ok, `${method}/${provider}`).toBe(true)
     }
+  })
+
+  /**
+   * CodeArts 现在**必须**被接受（不再回 bad-request）。
+   *
+   * 这是本次接入的核心契约：三个积分端点都要为 `codearts` 分支。
+   * 用空账号池调用，只验证「provider 被接受且返回结构化结果」，
+   * 不触发任何网络请求。
+   */
+  it.each(CREDITS_METHODS)('%s 接受 codearts（已接入华为云签名协议）', async (method) => {
+    const call = registerCreditsEndpoints()
+    const result = await call(method, { provider: 'codearts' })
+    expect(result.ok).toBe(true)
+  })
+
+  it('credits.balances 对 codearts 返回 accounts 数组', async () => {
+    const call = registerCreditsEndpoints()
+    const result = await call('credits.balances', { provider: 'codearts' })
+    expect(result.ok).toBe(true)
+    expect((result.value as { accounts: unknown[] }).accounts).toEqual([])
+  })
+
+  it('credits.status 对 codearts 返回 accounts 数组（状态如实为 null）', async () => {
+    // 华为侧没有独立的「签到状态」端点，故与 LobsterAI 同样返回 null，
+    // 而不是臆造一份 CheckinStatus 形状的对象。
+    const call = registerCreditsEndpoints()
+    const result = await call('credits.status', { provider: 'codearts' })
+    expect(result.ok).toBe(true)
+    expect((result.value as { accounts: unknown[] }).accounts).toEqual([])
+  })
+
+  it('credits.claimAll 对 codearts 返回 summary 结构', async () => {
+    const call = registerCreditsEndpoints()
+    const result = await call('credits.claimAll', { provider: 'codearts' })
+    expect(result.ok).toBe(true)
+    expect((result.value as { summary: unknown }).summary).toEqual({
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+    })
   })
 })

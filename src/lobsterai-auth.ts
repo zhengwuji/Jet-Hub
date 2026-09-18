@@ -39,7 +39,9 @@ import { classifyLobsteraiError, isLobsteraiTerminalError } from './lobsterai-er
 import {
   exchangeLobsteraiAuthCode,
   runLobsteraiLoginFlow,
+  startLobsteraiLoginFlow,
   type LobsteraiLoginFlowOptions,
+  type LobsteraiLoginFlowResult,
 } from './lobsterai-oauth.js'
 import { RefreshScheduler } from './refresh.js'
 import { AccountPool } from './account-pool.js'
@@ -203,7 +205,6 @@ export class LobsteraiAuth extends Service {
     flowOptions: { refName?: string; accountId?: string; pool?: AccountPool } & Partial<LobsteraiLoginFlowOptions> = {},
   ): Promise<LobsteraiLoginResult> {
     this.active = true
-    const ref = flowOptions.refName ? credentialRef(flowOptions.refName) : credentialRef(this.credentialRefName)
     // 版本号是 exchange 的必需字段，登录前先解析（带缓存，通常无网络开销）。
     const clientVersion = await this.resolveClientVersion()
     const flow = await runLobsteraiLoginFlow({
@@ -212,6 +213,50 @@ export class LobsteraiAuth extends Service {
       ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
       ...flowOptions,
     })
+    return this.persistLogin(flow, flowOptions)
+  }
+
+  /**
+   * **两步式登录**：起回调服务器并立即返回登录 URL，由调用方先打开窗口。
+   *
+   * 与 CodeArts 的 `CodeArtsAuth.startLogin` 同因（真实缺陷）：Jet Hub 的
+   * 「+ 新建账号」原先调用阻塞式 {@link login}，而浏览器只在用户点击后的
+   * 短暂窗口（transient activation，约 5 秒）内允许 `window.open`。
+   * 等阻塞调用返回时手势早已过期，`window.open` 被弹窗拦截器拒绝并返回
+   * `null`，前端兜底逻辑便执行 `window.location.href = loginUrl`，
+   * 把**整个设置页**跳转到登录页。
+   *
+   * 调用方拿到 `loginUrl` 后应当**立即** `window.open`，再 await `result`。
+   */
+  async startLogin(
+    flowOptions: { refName?: string; accountId?: string; pool?: AccountPool } & Partial<LobsteraiLoginFlowOptions> = {},
+  ): Promise<{ loginUrl: string; result: Promise<LobsteraiLoginResult>; close: () => Promise<void> }> {
+    this.active = true
+    const clientVersion = await this.resolveClientVersion()
+    const started = await startLobsteraiLoginFlow({
+      product: this.product,
+      clientVersion,
+      ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+      ...flowOptions,
+    })
+    const result = started.result.then((flow) => this.persistLogin(flow, flowOptions))
+    // 与 startLobsteraiLoginFlow 同理：结果可能早于调用方 await 而落定，
+    // 先挂空处理器避免「未处理的拒绝」告警（错误仍会传给真正的消费者）。
+    result.catch(() => {})
+    return { loginUrl: started.loginUrl, result, close: started.close }
+  }
+
+  /**
+   * 持久化一次登录结果：写凭据、重置失效状态、武装续期、按需登记账号池。
+   *
+   * 抽成独立方法供 {@link login} 与 {@link startLogin} 共用 ——
+   * 两条路径的差别只在「何时返回 loginUrl」，落库逻辑必须完全一致。
+   */
+  private async persistLogin(
+    flow: LobsteraiLoginFlowResult,
+    flowOptions: { refName?: string; accountId?: string; pool?: AccountPool } = {},
+  ): Promise<LobsteraiLoginResult> {
+    const ref = flowOptions.refName ? credentialRef(flowOptions.refName) : credentialRef(this.credentialRefName)
     await this.ctx.credentials.set(ref, flow.access)
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined

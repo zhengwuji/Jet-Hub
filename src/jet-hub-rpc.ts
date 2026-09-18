@@ -15,9 +15,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from './account-pool.js'
 import type { CodeArtsAuth } from './service.js'
+import type { CodeArtsCredential } from './types.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
+import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobsterai.js'
+import type { LobsteraiCredential } from './lobsterai.js'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
@@ -34,6 +37,10 @@ import {
   claimLobsteraiDailyCheckin,
   fetchLobsteraiCreditBalance,
 } from './lobsterai-credits.js'
+import {
+  claimCodeArtsDailyCheckin,
+  fetchCodeArtsAccountInfoDetailed,
+} from './codearts-credits.js'
 import {
   resetAccount,
   resetAllAccounts,
@@ -85,6 +92,30 @@ function shortId(): string {
 function parseBuddyCredential(raw: string): BuddyCredential | undefined {
   try {
     const parsed = JSON.parse(raw) as BuddyCredential
+    return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 解析 CodeArts 凭据 JSON；解析失败返回 undefined。 */
+function parseCodeArtsCredential(raw: string): CodeArtsCredential | undefined {
+  try {
+    const parsed = JSON.parse(raw) as CodeArtsCredential
+    return typeof parsed === 'object' && parsed !== null && typeof parsed.access_key_id === 'string'
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 解析 LobsterAI 凭据 JSON；解析失败返回 undefined。 */
+function parseLobsteraiCredential(raw: string): LobsteraiCredential | undefined {
+  try {
+    const parsed = JSON.parse(raw) as LobsteraiCredential
     return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
       ? parsed
       : undefined
@@ -160,6 +191,19 @@ export interface CreditsEndpointDeps<
   claim?: (credential: TCredential, product: TProduct) => Promise<ClaimOutcome>
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
+  /**
+   * 余额查询的**带原因**版本（优先于 {@link fetchBalance}）。
+   *
+   * 为什么需要它：`fetchBalance` 只用 `null` 表达「查不到」，调用方统一回
+   * 「余额查询失败」。但 CodeArts 还有第三种情形 —— **非积分计费账户**
+   * （Token 计费）：它不是故障，如实显示「余额查询失败」会把用户引向错误的
+   * 排查方向。该钩子让实现能带回精确文案，同时仍复用本函数的逐账号编排
+   * （顺序执行、单账号失败不中断、凭据解析在 try 之内）。
+   */
+  fetchBalanceDetailed?: (
+    credential: TCredential,
+    product: TProduct,
+  ) => Promise<{ balance: CreditBalance | null; error?: string }>
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
   /**
@@ -291,6 +335,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsBalancesResponse['accounts']> {
   const fetchBalance = deps.fetchBalance ?? (fetchCreditBalance as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchBalance']>)
+  const fetchDetailed = deps.fetchBalanceDetailed
   const results: RpcCreditsBalancesResponse['accounts'] = []
   // 顺序查询，避免并发触发风控
   for (const entry of accounts) {
@@ -302,9 +347,17 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
         error = '凭据未配置'
       } else {
         const credential = JSON.parse(resolved.value) as TCredential
-        balance = await fetchBalance(credential, product)
-        // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
-        if (balance === null) error = '余额查询失败'
+        if (fetchDetailed !== undefined) {
+          // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
+          const detailed = await fetchDetailed(credential, product)
+          balance = detailed.balance
+          error = detailed.error
+          if (balance === null && error === undefined) error = '余额查询失败'
+        } else {
+          balance = await fetchBalance(credential, product)
+          // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
+          if (balance === null) error = '余额查询失败'
+        }
       }
     } catch (caught) {
       deps.warn?.(`[jet-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
@@ -480,19 +533,70 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: { accountId: id, loginUrl: authUrl } }
         } else if (provider === 'codearts') {
-          // codearts login 是 OAuth 回调方式，不支持纯获取 URL
-          // 直接同步执行（需等待回调完成）
-          const loginResult = await codearts.login({ refName, accountId: id, pool })
-          return { ok: true, value: { accountId: id, loginUrl: loginResult.loginUrl } }
-        } else if (provider === LOBSTERAI.id) {
-          // LobsterAI 也是**回调式**登录（本地回调服务器收 authCode），
-          // 与 codearts 同款：同步执行、等待用户在浏览器完成登录后返回。
+          // CodeArts 也是**回调式**登录（本地回调服务器收授权码），但同样必须
+          // 走两步式：先返回 loginUrl 让前端立刻 window.open，后台再等回调。
           //
-          // 与 CodeBuddy 系的两步式（先返回 URL、后台异步跑）不同 —— 那种模式
-          // 是为「轮询式登录」设计的（前端拿 accountId 反复 login.poll）。
-          // LobsterAI 没有可轮询的 state，照 codearts 做才自然。
-          const loginResult = await lobsterai.login({ refName, accountId: id, pool })
-          return { ok: true, value: { accountId: id, loginUrl: loginResult.loginUrl } }
+          // 为什么不能像早期那样 await 整个流程（真实缺陷）：浏览器只在用户
+          // 点击后的短暂窗口（transient activation，约 5 秒）内允许 window.open。
+          // 阻塞数十秒后才返回 URL，弹窗必被拦截并返回 null，前端兜底逻辑
+          // 便执行 `window.location.href = loginUrl`，把整个设置页跳走
+          // ——用户报的「主页面直接跳转过去了」正是此因。
+          const started = await codearts.startLogin({ refName })
+          // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
+          // 登录成功后再回填昵称/有效期等真实字段。
+          await pool.addAccount({
+            id,
+            provider: 'codearts',
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            const credential = parseCodeArtsCredential(loginResult.access)
+            await pool.updateAccount(id, {
+              nickname: credential?.user_name !== undefined && credential.user_name.length > 0
+                ? credential.user_name
+                : id,
+              expiresAt: credential?.expires_at !== undefined
+                ? (Number.isNaN(Date.parse(credential.expires_at)) ? undefined : Date.parse(credential.expires_at))
+                : undefined,
+              refreshable: Boolean(credential?.refresh_token),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background codearts login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === LOBSTERAI.id) {
+          // LobsterAI 与 codearts 同款：回调式登录 + 两步式返回，
+          // 理由见上面的 codearts 分支（弹窗拦截导致主页面被跳转）。
+          const started = await lobsterai.startLogin({ refName })
+          await pool.addAccount({
+            id,
+            provider: LOBSTERAI.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            const credential = parseLobsteraiCredential(loginResult.access)
+            await pool.updateAccount(id, {
+              nickname: credential?.nickname !== undefined && credential.nickname.length > 0
+                ? credential.nickname
+                : id,
+              expiresAt: credential !== undefined ? lobsteraiCredentialExpiresAtMs(credential) : undefined,
+              refreshable: credential !== undefined && isLobsteraiRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${LOBSTERAI.id} login failed for ${id}: ${String(error)}`)
+            void pool.removeAccount(id).catch(() => {})
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -611,16 +715,34 @@ function registerJetHubEndpoints(
       // ── 每日签到（积分领取）──
       // 查询某 provider 下全部启用账号的签到状态。
       //
-      // ⚠️ 三个积分端点（status / claimAll / balances）都以 `productById()`
-      // 判能力，而 **CodeArts 不是 BuddyProduct**（华为云账号体系没有腾讯计费
-      // 接口），因此 `codearts` 必定落到下面的 bad-request。这是正确且必要的
-      // 拒绝，但客户端**不应**把这条错误当作运行时故障去展示：它应当在发请求
-      // 之前就按 `plugin-src/client/credits-capabilities.js` 的能力矩阵判掉
-      // （历史缺陷：CodeArts 面板挂载时无条件调用 credits.balances，导致每次
-      // 打开设置页都在控制台报 unsupported provider 并把账号卡片标成查询失败）。
-      // 此处的拒绝是兜底与契约声明，不是常规路径。
+      // 四个 provider 分属**三套互不相同的协议**，各自在自己的分支里处理：
+      //   - CodeBuddy 系（buddy / workbuddy）：`productById()` 取 BuddyProduct，
+      //     走 `collectCreditsStatus` 的默认实现；
+      //   - `lobsterai`：slot → context 三步，无独立状态端点；
+      //   - `codearts`：华为云 SDK-HMAC-SHA256 签名，无独立状态端点。
+      //
+      // ⚠️ 只有 CodeBuddy 系能经 `productById()` 解析出产品配置；后两者
+      // **必须各自提前分支**，否则会落到下面的 bad-request。历史上 CodeArts
+      // 就是因此恒回 `unsupported provider: codearts`（客户端在面板挂载时
+      // 无条件调用 credits.balances，于是每打开一次设置页都在控制台报错并把
+      // 账号卡片标成查询失败）。现在 CodeArts 已有真实实现，该 bad-request
+      // 只对**未知** provider 生效。
       case 'credits.status': {
         const req = payload as RpcCreditsStatusRequest
+        if (req.provider === 'codearts') {
+          // CodeArts 没有独立的「签到状态」端点：可领状态要经
+          // `statistics/plugin`（账户类型）+ `/v1/ops/delivery`（活动列表）
+          // 两步才能得到，且语义与 CodeBuddy 的 CheckinStatus 不同构
+          //（无 streak_days / daily_credit 等概念）。
+          // 故与 LobsterAI 同样如实返回 null，而不是臆造一份状态对象。
+          const accounts = await pool.listAccounts(req.provider)
+          return {
+            ok: true,
+            value: {
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
+            } satisfies RpcCreditsStatusResponse,
+          }
+        }
         if (req.provider === LOBSTERAI.id) {
           // LobsterAI 没有独立的「签到状态」端点：活动状态要经
           // slot → context 两步才能得到，且语义与 CodeBuddy 的
@@ -650,6 +772,19 @@ function registerJetHubEndpoints(
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         const accounts = await pool.listAccounts(req.provider)
+        if (req.provider === 'codearts') {
+          // CodeArts（华为云）走**签名**协议，与两个腾讯系 provider 都不同源：
+          // 领取流程自带「账户类型 + 活动列表」预检（见 claimCodeArtsDailyCheckin），
+          // 故 precheckStatus: false 跳过外部那次 CodeBuddy 式的状态查询 ——
+          // 用 fetchCheckinStatus 打华为端点既发错请求又必然失败。
+          const value = await collectClaimResults<CodeArtsCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            claim: (credential) => claimCodeArtsDailyCheckin(credential),
+            precheckStatus: false,
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
         if (req.provider === LOBSTERAI.id) {
           // LobsterAI 的 clientVersion 是签到必填参数，需动态解析
           //（带缓存，通常无额外网络开销）。
@@ -683,6 +818,37 @@ function registerJetHubEndpoints(
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
         const accounts = await pool.listAccounts(req.provider)
+        if (req.provider === 'codearts') {
+          // 余额来自 `statistics/plugin`（与账户类型检测同一个响应），
+          // 故用带原因的钩子：非积分账户要显示「Token 计费账户」而不是
+          // 误导性的「余额查询失败」。
+          const values = await collectCreditBalances<CodeArtsCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalanceDetailed: async (credential) => {
+              // 用带原因的版本：`fetchCodeArtsAccountInfo` 只回 null，会把
+              // 「AK 限流」「签名失败」「凭据过期」压成同一句笼统文案，
+              // 用户与排查者都拿不到线索（本端点就因此把一次 401 显示成了
+              // 无信息量的「账户信息查询失败」）。
+              const result = await fetchCodeArtsAccountInfoDetailed(credential)
+              if (!result.ok) return { balance: null, error: `账户信息查询失败：${result.message}` }
+              const info = result.info
+              if (!info.isCreditPackage) {
+                return {
+                  balance: null,
+                  error: info.isTokenPackage
+                    ? 'Token 计费账户，无积分余额'
+                    : '非积分计费账户，无积分余额',
+                }
+              }
+              // 积分账户但没有 credit metric：如实报「无积分数据」，
+              // 不显示成 0 —— 0 会让用户以为自己把积分用光了。
+              if (info.credit === undefined) return { balance: null, error: '未返回积分数据' }
+              return { balance: info.credit }
+            },
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
         if (req.provider === LOBSTERAI.id) {
           const values = await collectCreditBalances(accounts, LOBSTERAI, {
             resolve: (ref) => ctx.credentials.resolve(ref),

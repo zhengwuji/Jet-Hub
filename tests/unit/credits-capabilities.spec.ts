@@ -16,19 +16,25 @@ import {
  * [jet-hub] load credits failed: Error: unsupported provider: codearts
  * ```
  * 根因是客户端 `loadCredits()` 在面板挂载时**对所有 provider 无条件**调用
- * `credits.balances`，而该端点以 `productById()` 判能力，CodeArts 根本不是
- * BuddyProduct，必定返回 bad-request。
+ * `credits.balances`，而当时该端点以 `productById()` 判能力，CodeArts 根本
+ * 不是 BuddyProduct，必定返回 bad-request。
  *
  * 修法是「请求前按能力门控」。因此这里守两件事：
- * 1. 能力矩阵本身正确（尤其 CodeArts 两项全假、WorkBuddy 余额真/签到假）；
+ * 1. 能力矩阵本身正确（尤其 WorkBuddy 余额真/签到假、未登记项默认关闭）；
  * 2. 客户端源码里**不存在绕过门控的调用点** —— UI 组件无法在单测里渲染
  *    （react 不在本仓库依赖内），故用源码级断言锁死守卫存在。
+ *
+ * 注：CodeArts 后来已接入真实实现（`src/codearts-credits.ts`，华为云签名），
+ * 故其能力由全假变为全真；**门控机制本身不变**，仍是防止「对不支持的
+ * provider 发必然失败的请求」的那道闸。
  */
 describe('积分能力矩阵', () => {
-  it('CodeArts 两项能力全为 false（华为云账号体系无腾讯计费接口）', () => {
-    expect(CREDITS_CAPABILITIES.codearts).toEqual({ balance: false, dailyCheckin: false })
-    expect(supportsCreditBalance('codearts')).toBe(false)
-    expect(supportsDailyCheckin('codearts')).toBe(false)
+  it('CodeArts 余额与签到都支持（华为云 SDK-HMAC-SHA256 签名协议）', () => {
+    // 华为云走 `snap-access` 的签名端点，与腾讯系协议完全不同源，
+    // 但**能力上两项都具备**（见 src/codearts-credits.ts）。
+    expect(CREDITS_CAPABILITIES.codearts).toEqual({ balance: true, dailyCheckin: true })
+    expect(supportsCreditBalance('codearts')).toBe(true)
+    expect(supportsDailyCheckin('codearts')).toBe(true)
   })
 
   it('CodeBuddy 余额与签到都支持', () => {
@@ -129,5 +135,32 @@ describe('客户端积分请求门控（源码级回归）', () => {
     const cardBody = normalized.slice(cardStart, cardStart + 4000)
     expect(cardBody).toContain('showCredits')
     expect(cardBody).toMatch(/showCredits\s*\n?\s*\?[\s\S]*CreditBalanceRow/)
+  })
+
+  /**
+   * 领取结果必须逐账号显示**原因**，不能只给计数。
+   *
+   * 真实教训：CodeArts 的领取曾因「数字 campaignId 被当成字符串解析」而
+   * 全部失败，但 UI 只显示「1 个失败」，用户与排查者都无从判断是凭据问题、
+   * 活动未开、还是解析 bug —— 只能靠翻代码 + 抓包定位。
+   * 后端一直返回 `results[].outcome.message`，前端不该把它丢掉。
+   */
+  it('claimCredits 汇总逐账号原因并在面板渲染', () => {
+    const normalized = source.replace(/\r\n/g, '\n')
+    const start = normalized.indexOf('const claimCredits = async () => {')
+    expect(start).toBeGreaterThan(-1)
+    const body = normalized.slice(start, start + 3000)
+    // 必须读取 results（而不只是 summary）
+    expect(body, 'claimCredits 未消费 results').toContain('results')
+    // 必须为失败条目带上 outcome.message
+    expect(body).toContain('outcome.message')
+    // 必须把 details 交给 notice
+    expect(body).toContain('details')
+    // 渲染层必须真的消费 claimNotice.details
+    const renderStart = normalized.indexOf('claimNotice\n')
+    expect(renderStart).toBeGreaterThan(-1)
+    const renderBody = normalized.slice(renderStart, renderStart + 900)
+    expect(renderBody, 'claimNotice 的 details 未被渲染').toContain('claimNotice.details')
+    expect(renderBody).toContain('dim-jh-probeDetails')
   })
 })

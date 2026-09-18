@@ -27,6 +27,8 @@
 | `workbuddy-claim-probe.e2e.spec.ts` | `DSH_WORKBUDDY_CLAIM_E2E=1` + `DSH_WORKBUDDY_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（不改模型额度，但会改动账号当日签到状态） |
 | `lobsterai-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` | **只读**：凭据结构、客户端版本号动态解析、签到槽位/上下文、积分余额。**不签到、不发模型请求** |
 | `lobsterai-claim-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` + `DSH_LOBSTERAI_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
+| `codearts-credits-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | **只读**：凭据结构、**账户类型检测**（`is_credit_package`）、积分余额、活动列表。**绝不领取** |
+| `codearts-claim-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` + `DSH_CODEARTS_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（会改动当日领取状态；**不消耗模型积分**，重复运行幂等） |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -60,7 +62,18 @@ pnpm test:e2e:lobsterai
 
 # ⚠️ 会真实签到（改动当日签到状态；不消耗模型积分，重复运行幂等）
 pnpm test:e2e:lobsterai-claim
+
+# 安全：CodeArts 只读探针（凭据/账户类型/积分余额/活动列表，绝不领取）
+pnpm test:e2e:codearts-credits
+
+# ⚠️ 会真实领取积分（改动当日领取状态；不消耗模型积分，重复运行幂等）
+pnpm test:e2e:codearts-claim
 ```
+
+> **CodeArts 凭据必须新鲜**：其 `refresh_token` 是**一次性轮换**的（用一次即
+> 作废，服务端回 `STS5.1806 the refresh token has been used`）。两个 CodeArts
+> 积分探针都**只读凭据、不刷新**，因此凭据过期时会如实报签名请求失败 ——
+> 此时请在 Jet Hub 重新登录，或等续期调度跑过一轮，**不要**为此给探针加刷新逻辑。
 
 ## 限流真实性判定
 

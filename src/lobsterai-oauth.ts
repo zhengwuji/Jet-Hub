@@ -206,18 +206,33 @@ async function defaultOpenBrowser(url: string): Promise<void> {
 }
 
 /**
- * 运行完整登录流程：起本地回调服务器 → 打开 portal → 等 `code` → exchange。
+ * 已启动但尚未完成的登录流程（两步式登录用）。
  *
- * 单进程内闭环，不落状态文件（见模块头注释）。
- *
- * `timeoutMs` 覆盖「浏览器打开 + 用户操作」整个窗口，超时抛错；
- * 无论成功失败都关闭本地服务器（`finally`）。
+ * 拆出这一层与 CodeArts 的 `startOAuthFlow` 同因：浏览器只在用户点击后的
+ * 短暂窗口（transient activation，约 5 秒）内允许 `window.open`。
+ * 若把「起服务器 → 打开浏览器 → 等用户授权」做成一次阻塞调用，
+ * 调用方拿到 URL 时手势早已过期，`window.open` 会被拦截。
  */
-export async function runLobsteraiLoginFlow(
+export interface StartedLobsteraiLoginFlow {
+  /** 展示给用户的登录 URL。 */
+  loginUrl: string
+  /** 用户完成授权（或超时/失败）后落定的结果。 */
+  result: Promise<LobsteraiLoginFlowResult>
+  /** 关闭回调服务器；**幂等**，可重复调用。 */
+  close: () => Promise<void>
+}
+
+/**
+ * 启动登录流程并**立即返回**登录 URL（不打开浏览器、不等用户）。
+ *
+ * `result` 已内置超时：两步式路径没有外层 try/finally 兜底，
+ * 若超时不在此处生效，回调服务器会一直挂着。
+ * 结果一旦落定就自动关闭服务器，避免两步式路径泄漏监听端口。
+ */
+export async function startLobsteraiLoginFlow(
   options: LobsteraiLoginFlowOptions & { product: LobsteraiProduct; clientVersion: string },
-): Promise<LobsteraiLoginFlowResult> {
+): Promise<StartedLobsteraiLoginFlow> {
   const fetcher = options.fetcher ?? fetch
-  const open: OpenBrowser = options.openBrowser ?? defaultOpenBrowser
   const { product, clientVersion } = options
   const session = createLobsteraiLoginSession()
   const state = randomUUID()
@@ -274,20 +289,50 @@ export async function runLobsteraiLoginFlow(
   const port = await listenOnRandomPort(server)
   const loginUrl = buildLobsteraiLoginUrl(port, state, product)
 
-  try {
-    await open(loginUrl)
-    return await Promise.race([
-      result,
-      new Promise<never>((_, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error(`LobsterAI 登录超时（${Math.round((options.timeoutMs ?? LOBSTERAI_LOGIN_TIMEOUT_MS) / 1000)} 秒内未完成）`)),
-          options.timeoutMs ?? LOBSTERAI_LOGIN_TIMEOUT_MS,
-        )
-        timer.unref?.()
-      }),
-    ])
-  } finally {
+  let closed = false
+  const close = async (): Promise<void> => {
+    if (closed) return
+    closed = true
     await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  const resultWithTimeout = Promise.race([
+    result,
+    new Promise<never>((_, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`LobsterAI 登录超时（${Math.round((options.timeoutMs ?? LOBSTERAI_LOGIN_TIMEOUT_MS) / 1000)} 秒内未完成）`)),
+        options.timeoutMs ?? LOBSTERAI_LOGIN_TIMEOUT_MS,
+      )
+      timer.unref?.()
+    }),
+  ])
+  // 结果落定即关闭服务器（含超时与失败路径）——两步式没有外层 finally。
+  resultWithTimeout.catch(() => {}).finally(() => { void close() })
+
+  return { loginUrl, result: resultWithTimeout, close }
+}
+
+/**
+ * 运行完整登录流程：起本地回调服务器 → 打开 portal → 等 `code` → exchange。
+ *
+ * 单进程内闭环，不落状态文件（见模块头注释）。
+ *
+ * `timeoutMs` 覆盖「浏览器打开 + 用户操作」整个窗口，超时抛错；
+ * 无论成功失败都关闭本地服务器（`finally`）。
+ *
+ * 阻塞语义：打开浏览器并等用户完成授权后才返回。需要「立即拿到 URL」的
+ * 场景（Jet Hub 两步式登录）请用 {@link startLobsteraiLoginFlow}。
+ */
+export async function runLobsteraiLoginFlow(
+  options: LobsteraiLoginFlowOptions & { product: LobsteraiProduct; clientVersion: string },
+): Promise<LobsteraiLoginFlowResult> {
+  const open: OpenBrowser = options.openBrowser ?? defaultOpenBrowser
+  const started = await startLobsteraiLoginFlow(options)
+  try {
+    await open(started.loginUrl)
+    return await started.result
+  } finally {
+    await started.close()
   }
 }
 
