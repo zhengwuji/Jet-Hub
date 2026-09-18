@@ -137,6 +137,38 @@ Tokens 福利）。
 - 续期定时器是 unref 的，在 `logout()` 和插件卸载时停止。
 - 运行时依赖新增 `jose`（用于 DPoP JWS 签发，与 CodeArts Agent 插件实现一致）。
 
+### ⚠️ 停用的账号同样会被续期
+
+`refreshAll()` 与续期调度器**只按 `refreshable` 过滤，不看 `enabled`**。
+
+停用只应影响「账号池的自动选号」，与「凭据是否需要保持新鲜」无关 ——
+停用账号仍然出现在 Jet Hub 里，也仍然参与积分领取。
+
+> **真实缺陷**：两个**曾停用**的 CodeBuddy 账号显示「凭证过期」，点「一键领取
+> 积分」报 `Unexpected token '<', "<html> <h"... is not valid JSON`。
+> 根因是两处都按 `enabled` 过滤：
+>
+> - `refreshAll()` 里的 `if (!entry.enabled || !entry.refreshable) continue`
+>   → 停用期间 `refresh_token` 一路放到失效；
+> - `src/index.ts` 的 `accounts.some(a => a.refreshable && a.enabled)`
+>   → **所有账号都停用时，续期定时器根本不启动**。
+>
+> 用户重新启用后拿到的是死凭据，只能重新登录。四个 provider 的 `refreshAll`
+> 与调度器都必须保持只看 `refreshable`。
+
+### 凭据失效时不再抛 `Unexpected token '<'`
+
+积分请求原本直接 `await response.json()`。凭据失效时腾讯网关返回的是
+**HTML 错误页**，于是抛出 `Unexpected token '<', "<html> <h"... is not valid
+JSON` —— 用户既不知道发生了什么，也看不出该重新登录。
+
+现在先取文本再解析，非 JSON 时给出可读原因：
+
+- HTTP 401/403 → 「凭据已失效（HTTP 401），请重新登录该账号」
+- 其他状态 → 「服务端返回了非 JSON 响应（HTTP 502）：&lt;片段&gt;」
+
+`src/credits.ts`（CodeBuddy 系）与 `src/lobsterai-credits.ts` 都已按此处理。
+
 ## 开发
 
 - `pnpm test` — 单元测试（快速，无网络）。

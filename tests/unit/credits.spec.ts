@@ -109,6 +109,55 @@ describe('积分签到模块', () => {
     expect(outcome).toMatchObject({ message: expect.stringContaining('socket hang up') })
   })
 
+  /**
+   * 真实缺陷（用户报障）：停用的两个 CodeBuddy 账号领取积分时报
+   * ```
+   * Jet：失败 — Unexpected token '<', "<html> <h"... is not valid JSON
+   * ```
+   *
+   * 根因：凭据过期后腾讯网关返回 **HTML 错误页**，而实现直接
+   * `await response.json()`，于是抛出上面那句对用户毫无意义的解析错误 ——
+   * 既看不出「凭据失效」，也想不到要重新登录。
+   *
+   * 修法：先取文本再解析，非 JSON 时给出带状态码的可读原因。
+   */
+  it('HTML 错误页（凭据失效）不抛 Unexpected token，而是可读的凭据提示', async () => {
+    const fetcher = stubFetch(() => new Response(
+      '<html><head><title>401 Unauthorized</title></head><body>...</body></html>',
+      { status: 401 },
+    ))
+    const outcome = await claimDailyCheckin(makeCredential(), CODEBUDDY, fetcher)
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') {
+      expect(outcome.message).not.toContain('Unexpected token')
+      expect(outcome.message).toContain('凭据已失效')
+      expect(outcome.message).toContain('401')
+      expect(outcome.message).toContain('重新登录')
+    }
+  })
+
+  it('非 JSON 且非鉴权类状态码 → 带状态码与响应片段', async () => {
+    const fetcher = stubFetch(() => new Response('<html>Bad Gateway</html>', { status: 502 }))
+    const outcome = await claimDailyCheckin(makeCredential(), CODEBUDDY, fetcher)
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') {
+      expect(outcome.message).toContain('502')
+      expect(outcome.message).toContain('非 JSON')
+    }
+  })
+
+  it('状态查询遇 HTML 错误页返回 null（不抛异常）', async () => {
+    // fetchCheckinStatus 的契约是「查不到返回 null」，不能因为服务端返回
+    // HTML 就抛异常冒泡到批量领取循环里。
+    const fetcher = stubFetch(() => new Response('<html>403</html>', { status: 403 }))
+    await expect(fetchCheckinStatus(makeCredential(), CODEBUDDY, fetcher)).resolves.toBeNull()
+  })
+
+  it('余额查询遇 HTML 错误页返回 null', async () => {
+    const fetcher = stubFetch(() => new Response('<html>500</html>', { status: 500 }))
+    await expect(fetchCreditBalance(makeCredential(), CODEBUDDY, fetcher)).resolves.toBeNull()
+  })
+
   it('请求携带产品码与 bearer 凭据，且不携带 X-Device-Token', async () => {
     let seen: Headers | undefined
     const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {

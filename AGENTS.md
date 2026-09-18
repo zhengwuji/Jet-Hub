@@ -66,6 +66,26 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 另有按凭据 ref 续期**指定账号**的 `refreshAccountCredential(refName)` —— 供 Jet Hub 账号卡片的「刷新」按钮使用。**不要**用 `refresh()` 去刷账号池里的账号：它读写的是该 provider 的**默认单凭据 ref**（如 `BUDDY_ACCESS_TOKEN`），而账号卡片对应的是 `BUDDY_ACCOUNT_XXX`，会刷到另一个凭据上。
 
+### ⚠️ 续期不得按 `enabled` 过滤
+
+`refreshAll()` 与 `src/index.ts` 的续期调度器**只按 `refreshable` 过滤，不看 `enabled`**。
+
+停用只应影响「账号池的自动选号」，与「凭据是否需要保持新鲜」无关 ——
+停用账号同样会出现在 Jet Hub 里并参与积分领取。
+
+**真实缺陷**（用户报障）：两个**曾停用**的 CodeBuddy 账号显示「凭证过期」，
+点「一键领取积分」报 `Unexpected token '<', "<html> <h"... is not valid JSON`。
+根因是两处都按 `enabled` 过滤：
+
+- `refreshAll()` 里的 `if (!entry.enabled || !entry.refreshable) continue`
+  → 停用期间 refresh_token 一路放到失效；
+- `src/index.ts` 的 `accounts.some(a => a.refreshable && a.enabled)`
+  → **所有账号都停用时续期定时器根本不启动**。
+
+用户重新启用后拿到的是死凭据，只能重新登录。四个 provider 的
+`refreshAll`（`buddy-auth.ts` / `service.ts` / `lobsterai-auth.ts`）与调度器
+**都必须保持只看 `refreshable`**。
+
 服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，互不覆盖。
 
 各 provider 的登录/续期机制不同（详见 README.md），但均通过 `ctx.credentials` 统一管理凭据生命周期。
