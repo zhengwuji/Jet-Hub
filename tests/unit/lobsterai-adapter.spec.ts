@@ -83,8 +83,31 @@ async function collect(options: GenerateOptions, adapter: LobsteraiAdapter) {
 }
 
 describe('LobsterAI 模型列表解析', () => {
-  it('解析 data.data 数组（外层信封 + 内层 data 数组）', () => {
-    // 注意双层：外层是统一信封 {code,msg,data}，内层 data 才是模型数组。
+  /**
+   * **真实线上形态**（2026-09-17 实测，`{code:0, message:'success', data:[...]}`）。
+   *
+   * 这是本模块历史上最严重的一处缺陷：早先的实现复用 `parseLobsteraiEnvelope`，
+   * 而该信封要求 `data` 必须是**对象**（用于判定「凭据失效返回 data:null」），
+   * 于是本端点恒被判成失败、模型列表恒为空数组、适配器静默回退静态兜底表。
+   * 症状是「远端已上线的新模型（deepseek-flash / glm-5.3-flash 等）在面板里
+   * 看不到」，且不报任何错。这条断言锁死单层形状必须被解析。
+   */
+  it('解析**单层** data 数组（真实线上形态）', () => {
+    expect(parseLobsteraiModels({
+      code: 0, message: 'success',
+      data: [
+        { modelId: 'deepseek-flash', modelName: 'DeepSeek-V4.1-Flash', provider: 'LobsterAI', apiFormat: 'openai' },
+        { modelId: 'glm-5.3-flash', modelName: 'GLM-5.3-Flash', provider: 'LobsterAI', apiFormat: 'openai' },
+      ],
+    })).toEqual([
+      { id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash' },
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash' },
+    ])
+  })
+
+  it('解析 data.data 数组（双层形态，兼容 Go 桥接层记录）', () => {
+    // 双层：外层是统一信封 {code,msg,data}，内层 data 才是模型数组。
+    // 两种形状都要认 —— 不能为修单层而砍掉双层。
     expect(parseLobsteraiModels({
       code: 0, msg: 'OK',
       data: { data: [{ modelId: 'glm-5.2', modelName: 'GLM-5.2', provider: 'p', apiFormat: 'openai' }] },
@@ -92,17 +115,17 @@ describe('LobsterAI 模型列表解析', () => {
   })
 
   it('缺 modelName 时以 id 兜底', () => {
-    expect(parseLobsteraiModels({ code: 0, data: { data: [{ modelId: 'm1' }] } }))
+    expect(parseLobsteraiModels({ code: 0, data: [{ modelId: 'm1' }] }))
       .toEqual([{ id: 'm1', name: 'm1' }])
   })
 
   it('跳过缺 modelId 的条目', () => {
     expect(parseLobsteraiModels({
-      code: 0, data: { data: [{ modelName: 'x' }, { modelId: 'm1' }] },
+      code: 0, data: [{ modelName: 'x' }, { modelId: 'm1' }],
     })).toEqual([{ id: 'm1', name: 'm1' }])
   })
 
-  it('信封失败、结构不符、非数组时返回空数组（调用方回退兜底目录）', () => {
+  it('业务码非 0、data 为 null、结构不符时返回空数组（调用方回退兜底目录）', () => {
     for (const bad of [
       { code: 500, msg: 'boom' },
       { code: 0, data: null },

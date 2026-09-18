@@ -25,8 +25,8 @@ import {
   isLobsteraiExpired,
   isLobsteraiRefreshable,
   lobsteraiAnonymousHeaders,
-  lobsteraiAuthHeaders,
   lobsteraiCredentialExpiresAtMs,
+  lobsteraiModelsHeaders,
   lobsteraiRefreshBody,
   parseLobsteraiEnvelope,
   parseLobsteraiTokenPayload,
@@ -541,7 +541,9 @@ export class LobsteraiAuth extends Service {
     try {
       const response = await this.fetchImpl(url, {
         method: 'GET',
-        headers: lobsteraiAuthHeaders(credential, this.product),
+        // 必须带 `X-LobsterAI-Client-Capabilities`：服务端按该头声明的能力
+        // 过滤模型集合，不带时 `kimi-k3` 不会返回（实测 25 vs 26 个）。
+        headers: lobsteraiModelsHeaders(credential, this.product, clientVersion),
         signal: AbortSignal.timeout(LOBSTERAI_REQUEST_TIMEOUT_MS),
       })
       if (!response.ok) return []

@@ -31,10 +31,11 @@
 /**
  * 兜底模型目录中的一个条目。
  *
- * 与 `BuddyFallbackModel` 分开定义：LobsterAI 的远端模型接口
- * （`GET /api/models/available`）只返回 `modelId`/`modelName`/`provider`/
- * `apiFormat`，**不含**上下文窗口与推理等级，因此那两个字段在这里是**纯本地
- * 估计值**，语义与 Buddy 侧（远端可下发、本地仅兜底）不同。
+ * 与 `BuddyFallbackModel` 分开定义。注意**不要把这里的 `contextWindow` 当成
+ * 远端权威值**：远端 `GET /api/models/available` 其实**会**返回
+ * `contextWindow`（2026-09-17 实测多数为 `1000000`），只是本适配器当前尚未
+ * 解析消费它（见 `LobsteraiRemoteModel` 的说明）。因此这里的值是**纯本地
+ * 估计值**，且只在本表被用到时（远端整体失败）才生效。
  */
 export interface LobsteraiFallbackModel {
   /** 模型 ID（传给 `POST /api/proxy/v1/chat/completions` 的 `model`）。 */
@@ -46,7 +47,7 @@ export interface LobsteraiFallbackModel {
    *
    * `handler.go:94-114` 里 19 个模型全部标 `131072`，那是对齐
    * `deepseek-v4` 系的取值后**统一填的**，并非逐个实测。
-   * 落地后如实测到真实值应当逐个修正，并在修正处注明实测日期。
+   * 实测远端多数模型返回 `1000000`，故该估计值偏保守。
    */
   contextWindow: number
 }

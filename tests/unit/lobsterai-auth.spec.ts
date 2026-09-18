@@ -137,6 +137,58 @@ describe('LobsteraiAuth 客户端版本号', () => {
   })
 })
 
+/**
+ * `fetchModels` 的端到端回归。
+ *
+ * 这里锁死的是两个**叠加**的历史缺陷 —— 任一个单独存在都会让远端新模型
+ * （`deepseek-flash` / `glm-5.3-flash` / `kimi-k3`）在面板里看不到：
+ *
+ * 1. **解析**：真实响应是 `{code:0, message:'success', data:[...]}`（`data` 直接
+ *    是数组），早先复用要求 `data` 为对象的 `parseLobsteraiEnvelope`，恒判失败
+ *    → 空数组 → 静默回退静态兜底表；
+ * 2. **请求头**：不带 `X-LobsterAI-Client-Capabilities` 时服务端只返回 25 个
+ *    模型（无 `kimi-k3`）。
+ */
+describe('LobsteraiAuth 远端模型列表', () => {
+  it('解析单层 data 数组并带上 Capabilities 头（真实线上形态）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set(LOBSTERAI_CREDENTIAL_REF, JSON.stringify(makeCredential()))
+
+    let headers: Record<string, string> = {}
+    const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (String(url).includes('api-overmind')) return versionResponse()
+      headers = (init?.headers ?? {}) as Record<string, string>
+      return new Response(JSON.stringify({
+        code: 0,
+        message: 'success',
+        data: [
+          { modelId: 'deepseek-flash', modelName: 'DeepSeek-V4.1-Flash', provider: 'LobsterAI', apiFormat: 'openai' },
+          { modelId: 'glm-5.3-flash', modelName: 'GLM-5.3-Flash', provider: 'LobsterAI', apiFormat: 'openai' },
+          { modelId: 'kimi-k3', modelName: 'Kimi-K3', provider: 'LobsterAI', apiFormat: 'openai' },
+        ],
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const service = newService(ctx, { fetcher })
+    const models = await service.fetchModels()
+
+    expect(models.map((m) => m.id)).toEqual(['deepseek-flash', 'glm-5.3-flash', 'kimi-k3'])
+    expect(models[0]!.name).toBe('DeepSeek-V4.1-Flash')
+    // 头必须带能力声明，否则服务端不返回 kimi-k3。
+    expect(headers['X-LobsterAI-Client-Capabilities']).toBe(LOBSTERAI.clientCapabilities)
+    expect(headers['X-LobsterAI-Client-Version']).toBe('2026.9.4')
+  })
+
+  it('远端失败时返回空数组（调用方回退兜底目录，不抛错）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set(LOBSTERAI_CREDENTIAL_REF, JSON.stringify(makeCredential()))
+    const service = newService(ctx, {
+      fetcher: stubFetcher(() => new Response('boom', { status: 500 })),
+    })
+    expect(await service.fetchModels()).toEqual([])
+  })
+})
+
 describe('LobsteraiAuth 续期', () => {
   it('成功时写回新令牌，且 latest_keyfrom 保持不变（对齐 Go）', async () => {
     const { ctx, credentials } = makeContext()

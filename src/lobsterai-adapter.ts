@@ -38,7 +38,7 @@ import {
   isLobsteraiExpired,
   lobsteraiChatHeaders,
   lobsteraiKeyfromBody,
-  parseLobsteraiEnvelope,
+  readNumberField,
   readStringField,
   type LobsteraiCredential,
 } from './lobsterai.js'
@@ -71,9 +71,17 @@ const LOBSTERAI_MAX_ROTATE = 3
 /**
  * LobsterAI 远端模型条目。
  *
- * 远端 `GET /api/models/available` 只返回 `modelId`/`modelName`/`provider`/
- * `apiFormat` —— **不含上下文窗口与推理等级**。因此这个结构刻意比
- * `BuddyRemoteModel` 更小：多出来的字段没有数据来源，声明了只会误导。
+ * 本结构刻意只保留 `id`/`name`：模型选择器与 `listModels` 只需要这两项。
+ *
+ * **注意远端实际返回的字段远多于这两个**（2026-09-17 实测）：
+ * `contextWindow`（多数为 1000000）、`supportsImage`、`supportsThinking`、
+ * `thinkingConfig`、`runtimeProfile`、`maxTokens`、`supportsToolCalling`、
+ * `agenticReady` 等。本适配器**目前不消费**它们 —— 因此
+ * `resolveModel` 里的上下文窗口仍取产品兜底表的估计值（131072）、
+ * `inputModalities` 仍硬编码为 `['text']`，与远端真值不一致。
+ *
+ * 这是**已知的待办**，不是「远端没有这些数据」：需要更精确的上下文窗口或
+ * 图片能力时，应从这里的响应中解析并透传，而不是去改兜底表。
  */
 export interface LobsteraiRemoteModel {
   id: string
@@ -81,19 +89,46 @@ export interface LobsteraiRemoteModel {
 }
 
 /**
- * 解析 `GET /api/models/available` 的响应。
+ * 从响应中提取模型数组，兼容上游**两种**形状。
  *
- * 响应形状（`internal/upstream/client.go:254-278`）：
- * `{code:0, data:[{modelId, modelName, provider, apiFormat}]}`
+ * 这两种形状在真实服务端上都出现过，必须都认：
+ *
+ * - **单层**（2026-09-17 实测的真实形态）：
+ *   `{code:0, message:'success', data:[{modelId,...}]}` —— `data` 直接是数组；
+ * - **双层**（`internal/upstream/client.go:254-278` 记录的形态）：
+ *   `{code:0, msg:'OK', data:{data:[{modelId,...}]}}` —— 数组嵌在 `data.data`。
+ *
+ * **刻意不复用 {@link parseLobsteraiEnvelope}**：那个信封要求 `data` 必须是
+ * 对象（用于把「凭据失效返回 `data:null`」判成失败，见其注释），而本端点的
+ * 真实 `data` 恰恰是**数组**。复用它会让信封恒定返回 `ok:false`，进而使整个
+ * 模型列表恒为空数组，适配器再静默回退到静态兜底表 ——
+ * 症状就是「远端已上线的新模型在面板里看不到」，且不报任何错。
+ *
+ * `code !== 0` 或结构不符时返回空数组，由调用方回退兜底目录。
+ */
+export function readLobsteraiModelArray(body: unknown): readonly unknown[] {
+  if (typeof body !== 'object' || body === null) return []
+  const record = body as Record<string, unknown>
+  if ((readNumberField(record, 'code') ?? -1) !== 0) return []
+  const data = record.data
+  if (Array.isArray(data)) return data
+  if (typeof data === 'object' && data !== null) {
+    const nested = (data as Record<string, unknown>).data
+    if (Array.isArray(nested)) return nested
+  }
+  return []
+}
+
+/**
+ * 解析 `GET /api/models/available` 的响应。
  *
  * 只取 `modelId` 与 `modelName`：`provider`/`apiFormat` 是上游内部字段，
  * 对模型选择器没有意义。
+ *
+ * 形状兼容性见 {@link readLobsteraiModelArray}。
  */
 export function parseLobsteraiModels(body: unknown): LobsteraiRemoteModel[] {
-  const envelope = parseLobsteraiEnvelope(body)
-  if (!envelope.ok) return []
-  const raw = (envelope.data as { data?: unknown }).data
-  if (!Array.isArray(raw)) return []
+  const raw = readLobsteraiModelArray(body)
   const models: LobsteraiRemoteModel[] = []
   for (const item of raw) {
     if (typeof item !== 'object' || item === null) continue
