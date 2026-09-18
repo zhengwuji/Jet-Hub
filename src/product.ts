@@ -180,6 +180,19 @@ const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high',
   },
   {
+    // 2026-09 补录：远端 /v3/config 与 scoped 端点均返回该模型，且实测能看图
+    // （纯红图问答答出「红色」）。它不在 craft/cli agent 白名单里，但可正常调用，
+    // 也是适配器 DEFAULT_MODEL 的取值。
+    //
+    // 档位沿用适配器静态表 REASONING_EFFORTS 的既有取值 [low,high,max]（该表有
+    // 实测依据：三档会显著改变返回的 reasoning_content 长度）。注意上游
+    // /v3/config 声明的是 [low,high,xhigh]，与本表不一致；实测服务端对 low /
+    // medium / high / xhigh / max 一律返回 200（不报非法参数），无法据此判定
+    // 哪一组才真实生效，故不擅自改动既有行为，仅记录该分歧待后续验证。
+    id: 'deepseek-v4-flash', name: 'Deepseek-V4-Flash', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+  },
+  {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
     reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
   },
@@ -191,9 +204,23 @@ const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
     reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
   },
-  { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    // supportsImages 为 true 有实测依据：纯红图问答答出「红色」。
+    // 注意 scoped 端点（/console/enterprises/personal/models）对它返回
+    // supportsImages=false，与 /v3/config、IDE 缓存、wb2api 清单三处矛盾；
+    // 实测以「能看到图」为准，故保留 true（远端若下发 true 则两者一致，
+    // 只有 scoped 端点先命中时才会被它的 false 覆盖，见 buddy-adapter 的
+    // supportsImagesFor 修正）。
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
+  },
   { id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
   { id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    // 2026-09 补录：旧注释曾把它列为「service info not found」而排除，但实测
+    // 可正常调用且能看图（纯红图问答答出「红色」），远端两端点也都在下发。
+    id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+  },
   { id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
   { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
   { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'] },
@@ -237,10 +264,21 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
   },
   {
+    // 2026-09 补录：/v3/config 的 cli agent 白名单里有它，但兜底表原先漏了，
+    // 于是被 reconcileWithFallback 丢弃、模型选择器里看不到。实测能看图。
+    id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+  },
+  {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
     reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
   },
   { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high' },
+  {
+    // 2026-09 补录：新加坡区的同代模型（-sg 后缀），远端下发且实测能看图。
+    id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+  },
   {
     id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 1_000_000, supportsImages: true,
     reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
@@ -276,6 +314,11 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
   },
   { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    // 2026-09 补录：远端 /v3/config 的 cli agent 白名单里有它，兜底表原先漏了。
+    id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+  },
   { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
 ]
 
