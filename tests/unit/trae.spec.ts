@@ -1,0 +1,1011 @@
+/**
+ * TRAE 协议层单元测试（纯函数）。
+ *
+ * 覆盖 `src/trae.ts` 的核心逻辑：
+ * - 端点常量（移植正确性的第一道防线，改错一个字符就会打到不存在的端点）；
+ * - 凭据结构、过期解析、可刷新判定；
+ * - 三类请求头构造（SOLO / Ug / OAuth）；
+ * - ExchangeToken / GetUserInfo 响应解析与凭据组装；
+ * - 模型列表解析；
+ * - machine_id / device_id 生成；
+ * - **OpenAI 到 SOLO 载荷转换**（本 provider 最核心的差异点）；
+ * - SOLO 到 OpenAI 的 SSE 事件解析与聚合。
+ *
+ * 全部为纯函数测试，不发任何网络请求。
+ */
+
+import { describe, expect, it } from 'vitest'
+import * as traeModule from '../../src/trae.js'
+import {
+  OPENAI_DONE,
+  TRAE_CHAT_PATH,
+  TRAE_CHECKIN_CLAIM_PATH,
+  TRAE_CHECKIN_STATUS_PATH,
+  TRAE_DEFAULT_MODEL,
+  TRAE_ENT_USAGE_PATH,
+  TRAE_EXCHANGE_PATH,
+  TRAE_FUNCTION,
+  TRAE_MODELS_PATH,
+  TRAE_USER_INFO_PATH,
+  aggregateTraeSSE,
+  applyTraeRefresh,
+  buildOpenAIChunk,
+  buildTraeCredential,
+  clampTraeMaxTokens,
+  deriveCheckinDeviceId,
+  deriveRotatingMachineId,
+  generateDeviceId,
+  generateMachineId,
+  isTraeExpired,
+  isTraeModelCallable,
+  isTraeModelUsable,
+  isTraeRefreshable,
+  parseTraeBatchModelList,
+  parseTraeExchangeResponse,
+  parseTraeModelList,
+  parseTraeSSELine,
+  parseTraeUserInfoResponse,
+  readBooleanField,
+  readNumberField,
+  readStringField,
+  traeCredentialExpiresAtMs,
+  traeMaxModeFields,
+  traeOAuthHeaders,
+  traeSOLOHeaders,
+  traeUgHeaders,
+  transformToSOLOBody,
+} from '../../src/trae.js'
+import { TRAE } from '../../src/trae-product.js'
+import type { TraeCredential, TraeRemoteModel } from '../../src/trae.js'
+
+function makeCredential(overrides: Partial<TraeCredential> = {}): TraeCredential {
+  return {
+    access_token: 'AT',
+    refresh_token: 'RT',
+    expires_at: String(Date.now() + 3_600_000),
+    uid: 'uid-1',
+    nickname: '测试账号',
+    machine_id: 'a'.repeat(32),
+    device_id: 'c'.repeat(32),
+    ...overrides,
+  }
+}
+
+describe('TRAE 端点常量', () => {
+  it('路径与 trae2api 逆向结果一致', () => {
+    // 对齐 trae2api/internal/upstream/constants.go。
+    expect(TRAE_CHAT_PATH).toBe('/api/agent/v3/llm_utils_chat')
+    expect(TRAE_MODELS_PATH).toBe('/api/ide/v1/get_detail_param')
+    expect(TRAE_EXCHANGE_PATH).toBe('/cloudide/api/v3/trae/oauth/ExchangeToken')
+    expect(TRAE_USER_INFO_PATH).toBe('/cloudide/api/v3/trae/GetUserInfo')
+    expect(TRAE_CHECKIN_STATUS_PATH).toBe('/trae/api/v2/ug/checkin_credits/status')
+    expect(TRAE_CHECKIN_CLAIM_PATH).toBe('/trae/api/v2/ug/checkin_credits/claim')
+    expect(TRAE_ENT_USAGE_PATH).toBe('/trae/api/v2/pay/ide_user_ent_usage')
+  })
+
+  it('对话 function 恒为 solo_work_lite（其他值实测无效）', () => {
+    // 实测：work / solo / work_lite 三种取值均无效。
+    expect(TRAE_FUNCTION).toBe('solo_work_lite')
+    expect(TRAE.function).toBe(TRAE_FUNCTION)
+  })
+
+  it('默认模型为 glm-5.2（对齐 Go 端 DefaultConfigName）', () => {
+    expect(TRAE_DEFAULT_MODEL).toBe('glm-5.2')
+  })
+})
+
+describe('安全字段读取', () => {
+  it('readStringField 兼容字符串、数字，其余返回空串', () => {
+    expect(readStringField({ a: 'x' }, 'a')).toBe('x')
+    expect(readStringField({ a: 42 }, 'a')).toBe('42')
+    expect(readStringField({ a: null }, 'a')).toBe('')
+    expect(readStringField({}, 'a')).toBe('')
+  })
+
+  it('readNumberField 兼容数字型字符串，非数字返回 undefined', () => {
+    expect(readNumberField({ a: 42 }, 'a')).toBe(42)
+    expect(readNumberField({ a: '42' }, 'a')).toBe(42)
+    expect(readNumberField({ a: '4.5' }, 'a')).toBe(4.5)
+    expect(readNumberField({ a: 'abc' }, 'a')).toBeUndefined()
+    expect(readNumberField({}, 'a')).toBeUndefined()
+  })
+})
+
+describe('凭据过期解析与可刷新判定', () => {
+  it('毫秒时间戳字符串按毫秒解析', () => {
+    const ms = Date.now() + 3_600_000
+    expect(traeCredentialExpiresAtMs(makeCredential({ expires_at: String(ms) }))).toBe(ms)
+  })
+
+  it('秒级时间戳自动换算为毫秒', () => {
+    const sec = Math.floor((Date.now() + 3_600_000) / 1000)
+    const parsed = traeCredentialExpiresAtMs(makeCredential({ expires_at: String(sec) }))
+    expect(parsed).toBe(sec * 1000)
+  })
+
+  it('ISO 8601 字符串可解析', () => {
+    const iso = new Date(Date.now() + 3_600_000).toISOString()
+    const parsed = traeCredentialExpiresAtMs(makeCredential({ expires_at: iso }))
+    expect(parsed).toBe(Date.parse(iso))
+  })
+
+  it('expires_at 缺失时回退解析 JWT 的 exp 声明', () => {
+    // 与 Buddy 侧同一兜底策略：access_token 是 JWT 时其 exp 才是权威过期时刻。
+    const exp = Math.floor((Date.now() + 3_600_000) / 1000)
+    const payload = Buffer.from(JSON.stringify({ exp })).toString('base64url')
+    const parsed = traeCredentialExpiresAtMs(makeCredential({
+      expires_at: undefined, access_token: `h.${payload}.s`,
+    }))
+    expect(parsed).toBe(exp * 1000)
+  })
+
+  it('无法解析过期时间时不判定为已过期', () => {
+    // 与参考实现一致：宁可让上层按 401 处理，也不要凭猜测拒绝可用凭据。
+    expect(isTraeExpired(makeCredential({ expires_at: undefined }))).toBe(false)
+  })
+
+  it('已过去的过期时间判为已过期', () => {
+    expect(isTraeExpired(makeCredential({ expires_at: String(Date.now() - 1000) }))).toBe(true)
+  })
+
+  it('isTraeRefreshable 以 refresh_token 长度判定', () => {
+    expect(isTraeRefreshable(makeCredential())).toBe(true)
+    expect(isTraeRefreshable(makeCredential({ refresh_token: '' }))).toBe(false)
+  })
+})
+
+describe('TRAE 请求头构造', () => {
+  it('SOLO 头含三处相同 token 与全部 X-* 身份头', () => {
+    // 对齐 Go 端 SOLOHeaders：Authorization / X-Cloudide-Token / X-Ide-Token
+    // 三处都要带，实测缺任一个都可能被上游拒绝。
+    const headers = traeSOLOHeaders(makeCredential(), TRAE, true)
+    expect(headers.Authorization).toBe('Cloud-IDE-JWT AT')
+    expect(headers['X-Cloudide-Token']).toBe('AT')
+    expect(headers['X-Ide-Token']).toBe('AT')
+    expect(headers['X-Uid']).toBe('uid-1')
+    expect(headers['X-App-Id']).toBe(TRAE.appId)
+    expect(headers['X-Ide-Version']).toBe(TRAE.ideVersion)
+    expect(headers['X-Ide-Version-Code']).toBe(TRAE.ideVersionCode)
+    expect(headers['X-Machine-Id']).toBe('a'.repeat(32))
+    expect(headers['X-Device-Id']).toBe('c'.repeat(32))
+    expect(headers['Request-Traffic-Type']).toBe('prod')
+  })
+
+  it('SOLO 头的 Accept 随 stream 切换', () => {
+    expect(traeSOLOHeaders(makeCredential(), TRAE, true).Accept).toBe('text/event-stream')
+    expect(traeSOLOHeaders(makeCredential(), TRAE, false).Accept).toBe('application/json')
+  })
+
+  it('machine_id / device_id 为空时不带对应头（而非带空串）', () => {
+    const headers = traeSOLOHeaders(makeCredential({ machine_id: '', device_id: '' }), TRAE, false)
+    expect(headers).not.toHaveProperty('X-Machine-Id')
+    expect(headers).not.toHaveProperty('X-Device-Id')
+  })
+
+  it('Ug 头带 X-User-Region: CN 且不带 SOLO 专属头', () => {
+    const headers = traeUgHeaders(makeCredential(), TRAE)
+    expect(headers.Authorization).toBe('Cloud-IDE-JWT AT')
+    expect(headers['X-User-Region']).toBe('CN')
+    expect(headers['X-Device-Id']).toBe('c'.repeat(32))
+    // 签到接口不需要这些头，带上反而可能被按错误的客户端形态归因。
+    expect(headers).not.toHaveProperty('X-Ide-Version')
+    expect(headers).not.toHaveProperty('X-Machine-Id')
+    expect(headers).not.toHaveProperty('Request-Traffic-Type')
+  })
+
+  it('OAuth 头无 Authorization（换 token 时还没有 token）', () => {
+    const headers = traeOAuthHeaders(TRAE)
+    expect(headers).not.toHaveProperty('Authorization')
+    expect(headers['Content-Type']).toBe('application/json')
+    expect(headers['User-Agent']).toBe(TRAE.userAgent)
+  })
+})
+
+describe('ExchangeToken / GetUserInfo 响应解析', () => {
+  it('解析 Result.Token 等字段（Go 端 PascalCase 形态）', () => {
+    const parsed = parseTraeExchangeResponse({
+      Result: {
+        Token: 'AT-NEW',
+        RefreshToken: 'RT-NEW',
+        TokenExpireAt: 1_786_847_930_141,
+        TokenExpireDuration: 3600,
+        RefreshExpireAt: 1_790_000_000_000,
+      },
+    })
+    expect(parsed).toMatchObject({
+      accessToken: 'AT-NEW',
+      refreshToken: 'RT-NEW',
+      tokenExpireAt: 1_786_847_930_141,
+      tokenExpireDuration: 3600,
+    })
+  })
+
+  it('兼容 camelCase 形态', () => {
+    const parsed = parseTraeExchangeResponse({
+      result: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 60 },
+    })
+    expect(parsed?.accessToken).toBe('AT')
+  })
+
+  it('缺少 accessToken 时返回 undefined（视为不可用）', () => {
+    expect(parseTraeExchangeResponse({ Result: { RefreshToken: 'RT' } })).toBeUndefined()
+    expect(parseTraeExchangeResponse({})).toBeUndefined()
+    expect(parseTraeExchangeResponse({ Result: 'not-an-object' })).toBeUndefined()
+  })
+
+  it('解析 GetUserInfo 的 UserID / ScreenName / EnterpriseID', () => {
+    const parsed = parseTraeUserInfoResponse({
+      Result: { UserID: 'u-1', ScreenName: '张三', EnterpriseID: 'ent-1' },
+    })
+    expect(parsed).toEqual({ uid: 'u-1', screenName: '张三', enterpriseId: 'ent-1' })
+  })
+
+  it('GetUserInfo 缺少 UserID 时返回 undefined', () => {
+    expect(parseTraeUserInfoResponse({ Result: { ScreenName: 'X' } })).toBeUndefined()
+  })
+})
+
+describe('凭据组装与续期合并', () => {
+  const exchange = {
+    accessToken: 'AT', refreshToken: 'RT', tokenExpireAt: 0,
+    tokenExpireDuration: 3600, refreshExpireAt: 0,
+  }
+  const userInfo = { uid: 'u-1', screenName: '张三', enterpriseId: 'ent-1' }
+  const session = { machineId: 'a'.repeat(32), deviceId: 'c'.repeat(32) }
+
+  it('buildTraeCredential 保留机器指纹与用户信息', () => {
+    const credential = buildTraeCredential(exchange, userInfo, session, 1_700_000_000_000)
+    expect(credential).toMatchObject({
+      access_token: 'AT',
+      refresh_token: 'RT',
+      uid: 'u-1',
+      nickname: '张三',
+      machine_id: 'a'.repeat(32),
+      device_id: 'c'.repeat(32),
+      enterprise_id: 'ent-1',
+    })
+    // expiresIn=3600，基准时刻 + 3600s。
+    expect(credential.expires_at).toBe(String(1_700_000_000_000 + 3_600_000))
+  })
+
+  it('tokenExpireAt 为毫秒级时直接采用', () => {
+    const ms = 1_786_847_930_141
+    const credential = buildTraeCredential({ ...exchange, tokenExpireAt: ms }, userInfo, session)
+    expect(credential.expires_at).toBe(String(ms))
+  })
+
+  it('tokenExpireAt 为秒级时换算为毫秒（对齐 Go 的 normalizeExpiresAt）', () => {
+    const credential = buildTraeCredential({ ...exchange, tokenExpireAt: 1_786_847_930 }, userInfo, session)
+    expect(credential.expires_at).toBe(String(1_786_847_930_000))
+  })
+
+  it('applyTraeRefresh 轮换 token 但保留全部身份字段', () => {
+    // 这是本 provider 的关键契约：machine_id / device_id 必须原样保留，
+    // 重新生成会让服务端按新设备处理，可能要求重新登录。
+    const previous = makeCredential({ uid: 'u-1', nickname: '张三' })
+    const refreshed = applyTraeRefresh(previous, { ...exchange, accessToken: 'AT2', refreshToken: 'RT2' })
+    expect(refreshed.access_token).toBe('AT2')
+    expect(refreshed.refresh_token).toBe('RT2')
+    expect(refreshed.machine_id).toBe(previous.machine_id)
+    expect(refreshed.device_id).toBe(previous.device_id)
+    expect(refreshed.uid).toBe('u-1')
+    expect(refreshed.nickname).toBe('张三')
+  })
+
+  it('续期响应未返回新 refresh_token 时沿用旧值（不覆盖成空串）', () => {
+    const previous = makeCredential({ refresh_token: 'OLD-RT' })
+    const refreshed = applyTraeRefresh(previous, { ...exchange, accessToken: 'AT2', refreshToken: '' })
+    expect(refreshed.refresh_token).toBe('OLD-RT')
+  })
+})
+
+describe('模型列表解析', () => {
+  it('解析 config_info_list 的 config_name 与 display_config.display_name', () => {
+    const models = parseTraeModelList({
+      config_info_list: [
+        { config_name: 'glm-5.2', display_config: { display_name: 'GLM-5.2' } },
+        { config_name: 'DeepSeek-V4-Pro', display_config: { display_name: 'DeepSeek V4 Pro' } },
+      ],
+    })
+    expect(models).toEqual([
+      { id: 'glm-5.2', name: 'GLM-5.2' },
+      { id: 'DeepSeek-V4-Pro', name: 'DeepSeek V4 Pro' },
+    ])
+  })
+
+  it('display_name 缺失时回退为 config_name', () => {
+    const models = parseTraeModelList({ config_info_list: [{ config_name: 'glm-5' }] })
+    expect(models).toEqual([{ id: 'glm-5', name: 'glm-5' }])
+  })
+
+  it('无 config_name 的条目被跳过', () => {
+    const models = parseTraeModelList({
+      config_info_list: [{ display_config: { display_name: 'X' } }, { config_name: 'ok' }],
+    })
+    expect(models).toEqual([{ id: 'ok', name: 'ok' }])
+  })
+
+  it('结构不符时返回空数组（由调用方回退兜底表）', () => {
+    for (const bad of [null, undefined, 'str', 42, {}, { config_info_list: 'x' }]) {
+      expect(parseTraeModelList(bad), String(bad)).toEqual([])
+    }
+  })
+
+  /**
+   * `display_config.is_custom_model` —— 「仅可见但不可调用」的权威判据。
+   *
+   * 实测（2026-09-19，遍历 45 个远端模型）：该标志为 `true` 的 5 个模型
+   * （`deepseek-v4-flash` / `glm-5.3-flash` / `qwen3.8-flash` /
+   * `agnes-2.5-flash` / `silk-gpt-5.6-luna`）**全部**被上游以流内
+   * `event:error code=4001 param is invalid` 拒绝；其余（含名字带
+   * `custom_model_` 前缀但该标志为 `false` 的）均正常。适配器据此把它们
+   * 挡在模型目录外。
+   */
+  describe('is_custom_model 标志（4001 真实缺陷回归）', () => {
+    it('true / false 都被如实读出', () => {
+      const models = parseTraeModelList({
+        config_info_list: [
+          { config_name: 'bad', display_config: { is_custom_model: true } },
+          { config_name: 'good', display_config: { is_custom_model: false } },
+        ],
+      })
+      expect(models).toEqual([
+        { id: 'bad', name: 'bad', isCustomModel: true },
+        { id: 'good', name: 'good', isCustomModel: false },
+      ])
+    })
+
+    it('字段缺失时留 undefined，而不是填 false', () => {
+      // 「上游没说」与「上游说不自定义」是两回事：后者可安全保留，
+      // 前者若被伪造成 false，也只是不过滤（保守方向），但绝不能反过来
+      // 把「没说」当成 true 而误删可用模型。
+      const models = parseTraeModelList({
+        config_info_list: [{ config_name: 'x', display_config: { display_name: 'X' } }],
+      })
+      expect(models).toEqual([{ id: 'x', name: 'X' }])
+      expect(models[0]).not.toHaveProperty('isCustomModel')
+    })
+
+    it('兼容 PascalCase 形态', () => {
+      const models = parseTraeModelList({
+        config_info_list: [{ config_name: 'x', DisplayConfig: { IsCustomModel: true } }],
+      })
+      expect(models[0]!.isCustomModel).toBe(true)
+    })
+
+    it('非布尔噪声不被当作 true（避免误删可用模型）', () => {
+      for (const noise of ['', 'yes', {}, [], null]) {
+        const models = parseTraeModelList({
+          config_info_list: [{ config_name: 'x', display_config: { is_custom_model: noise } }],
+        })
+        expect(models[0]!.isCustomModel, JSON.stringify(noise)).toBeUndefined()
+      }
+    })
+  })
+})
+
+/**
+ * `batch_get_detail_param` 的**多通道**解析。
+ *
+ * fixture 直接照抄 Reqable 抓到的真实 TRAE CN 3.3.94 响应形状（含
+ * `context_window_tokens` / `model_detail_list[].max_tokens` /
+ * `is_invisible_to_user` / `config_switch`），只把值裁剪到最小可判定集合。
+ */
+describe('多通道批量解析（batch_get_detail_param）', () => {
+  /** 一条真实形状的 config 条目。 */
+  function entry(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      config_name: id,
+      config_source: 1,
+      config_switch: true,
+      context_window_tokens: { dev: 200000, max: 1000000 },
+      display_config: { display_name: id, is_custom_model: false },
+      is_default: false,
+      is_invisible_to_user: false,
+      model_detail_list: [{ model_name: `${id}__dev`, max_tokens: 32000, max_turn: 500 }],
+      ...extra,
+    }
+  }
+
+  /** 构造真实形状的批量响应。 */
+  function batch(groups: Array<[string, Array<Record<string, unknown>>]>): unknown {
+    return {
+      allow_tenant_user_add_model: true,
+      function_configs: groups.map(([fn, list]) => ({ function: fn, ab_versions: [], config_info_list: list })),
+    }
+  }
+
+  it('后面的覆盖前面的——同一模型在多个 function 中取最后一条', () => {
+    const models = parseTraeBatchModelList(batch([
+      ['solo_work_lite', [entry('glm-5.2'), entry('glm-5-turbo')]],
+      ['solo_agent_remote', [entry('glm-5.2'), entry('glm-5.1')]],
+    ]))
+    // glm-5.2 出现在两个通道中，后面的 solo_agent_remote 覆盖前面的 solo_work_lite
+    expect(models.map((m) => [m.id, m.function])).toEqual([
+      ['glm-5.2', 'solo_agent_remote'],
+      ['glm-5-turbo', 'solo_work_lite'],
+      ['glm-5.1', 'solo_agent_remote'],
+    ])
+  })
+
+  it('读取 context_window_tokens.dev（不是 max）与 model_detail_list.max_tokens', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [entry('glm-5.2')]]]))
+    // dev=200000：max=1000000 需开 max_mode，本插件不实现，采信会让请求被拒
+    expect(model!.contextWindow).toBe(200_000)
+    expect(model!.maxOutputTokens).toBe(32_000)
+  })
+
+  it('dev 缺失时回退 max', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('x', { context_window_tokens: { max: 1_000_000 } }),
+    ]]]))
+    expect(model!.contextWindow).toBe(1_000_000)
+  })
+
+  it('多条 model_detail_list 时优先取 __dev 那条的 max_tokens', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('custom_model_1M', {
+        model_detail_list: [
+          { model_name: 'custom_model_1M__max', max_tokens: 384000 },
+          { model_name: 'custom_model_1M__dev', max_tokens: 64000 },
+        ],
+      }),
+    ]]]))
+    expect(model!.maxOutputTokens).toBe(64_000)
+  })
+
+  it('parseTraeBatchModelList 过滤 isHidden / config_switch / usage 三类条目', () => {
+    const models = parseTraeBatchModelList(batch([['solo_work_lite', [
+      entry('visible'),
+      entry('summary', { is_invisible_to_user: true }),
+      entry('retired', { config_switch: false }),
+      entry('deepseek-v4-flash', { display_config: { display_name: 'X', is_custom_model: true } }),
+    ]]]))
+    // `is_invisible_to_user` 和 `config_switch` 在解析时硬性过滤；
+    // `is_custom_model` 不在此过滤（运行时 `isTraeModelCallable` 中处理）
+    expect(models.map((m) => m.id)).toEqual(['visible', 'deepseek-v4-flash'])
+  })
+
+  it('isTraeModelUsable 仍可独立控制 hideInternal', () => {
+    // isTraeModelUsable 是纯函数，保留 hideInternal 参数供直接使用。
+    // parseTraeBatchModelList 内部现在硬性过滤 isHidden，但函数本身不变。
+    const visible = { id: 'visible', name: 'V' } as TraeRemoteModel
+    const hidden = { id: 'summary', name: 'Summary', isHidden: true } as TraeRemoteModel
+    const retired = { id: 'retired', name: 'R', isEnabled: false } as TraeRemoteModel
+    const custom = { id: 'df-v4', name: 'X', isCustomModel: true } as TraeRemoteModel
+    expect(isTraeModelUsable(visible)).toBe(true)
+    expect(isTraeModelUsable(hidden)).toBe(true) // hideInternal 默认 false
+    expect(isTraeModelUsable(hidden, { hideInternal: true })).toBe(false)
+    expect(isTraeModelUsable(retired)).toBe(false)
+    expect(isTraeModelUsable(custom)).toBe(false)
+  })
+
+  // ── 推理强度（reasoning_effort_config）──
+
+  it('读出 reasoning_effort_config 的 default_level / options / support_thinking', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('glm-5.3', {
+        reasoning_effort_config: {
+          default_level: 'high',
+          options: ['light', 'high', 'extra_high'],
+          support_thinking: true,
+        },
+      }),
+    ]]]))
+    expect(model!.reasoningConfig).toEqual({
+      defaultLevel: 'high',
+      options: ['light', 'high', 'extra_high'],
+      supportThinking: true,
+    })
+  })
+
+  it('无 reasoning_effort_config 的模型不声明该字段（而不是空配置）', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [entry('kimi-k3')]]]))
+    expect(model!.reasoningConfig).toBeUndefined()
+  })
+
+  it('options 为对象数组时也能读出 wire 值（防御性兼容双字段形态）', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('x', {
+        reasoning_effort_config: {
+          default_level: 'max',
+          options: [
+            { level: 'max', openclawLevel: 'xhigh' },
+            { level: 'low', openclawLevel: 'low' },
+          ],
+        },
+      }),
+    ]]]))
+    // 优先取 openclawLevel（wire 值），缺失时回退 level
+    expect(model!.reasoningConfig?.options).toEqual(['xhigh', 'low'])
+  })
+
+  it('support_thinking=false 时如实读出（调用方据此不声明档位）', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('x', { reasoning_effort_config: { options: ['high'], support_thinking: false } }),
+    ]]]))
+    expect(model!.reasoningConfig?.supportThinking).toBe(false)
+    expect(model!.reasoningConfig?.options).toEqual(['high'])
+  })
+
+  // ── Max 模式（1M 上下文）──
+
+  it('读出 display_config.max_mode 与 context_window_tokens.max', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('glm-5.3', {
+        context_window_tokens: { dev: 200000, max: 1000000 },
+        display_config: { display_name: 'GLM-5.3', max_mode: true },
+      }),
+    ]]]))
+    expect(model!.maxMode).toBe(true)
+    expect(model!.maxContextWindow).toBe(1_000_000)
+    // dev 仍是常规窗口，两者不可混用
+    expect(model!.contextWindow).toBe(200_000)
+  })
+
+  it('未标 max_mode 的模型 maxMode 为 undefined（不臆造 1M 能力）', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('glm-5.3', {
+        context_window_tokens: { dev: 200000, max: 1000000 },
+        display_config: { display_name: 'GLM-5.3' },
+      }),
+    ]]]))
+    expect(model!.maxMode).toBeUndefined()
+    // 窗口仍可读出（供 resolveModel 在 Max 模式开启时使用），但能力标志未置位
+    expect(model!.maxContextWindow).toBe(1_000_000)
+  })
+
+  it('读出 __max 明细的 max_tokens 作为 Max 模式输出上限', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('custom_model_1M', {
+        model_detail_list: [
+          { model_name: 'custom_model_1M__dev', max_tokens: 64000 },
+          { model_name: 'custom_model_1M__max', max_tokens: 384000 },
+        ],
+      }),
+    ]]]))
+    expect(model!.maxOutputTokens).toBe(64_000)
+    expect(model!.maxModeOutputTokens).toBe(384_000)
+  })
+
+  it('traeMaxModeFields 成套下发 strategy/mode_type/窗口三件套', () => {
+    const fields = traeMaxModeFields(1_000_000, 384_000)
+    expect(fields).toMatchObject({
+      model_selection_strategy: 'max',
+      mode_type: 1,
+      context_window_size: 1_000_000,
+      prompt_max_tokens: 936_000,
+      max_tokens: 384_000,
+    })
+    expect(fields.model_auto_selection).toEqual({
+      strategy: 'max',
+      fallback_to_advance_model: null,
+      entitlement_id: null,
+    })
+  })
+
+  it('traeMaxModeFields 未给输出上限时用 64K 兜底', () => {
+    expect(traeMaxModeFields(1_000_000)).toMatchObject({
+      context_window_size: 1_000_000,
+      prompt_max_tokens: 936_000,
+      max_tokens: 64_000,
+    })
+  })
+
+  it('同一模型在 A 通道不可调用、B 通道可调用时，保留可调用的那条及其通道', () => {
+    // 可调用性是**逐通道**的：不能因为先遍历到不可调用的条目就把模型整个丢掉。
+    const models = parseTraeBatchModelList(batch([
+      ['solo_agent', [entry('kimi-k3', { display_config: { display_name: 'K', is_custom_model: true } })]],
+      ['solo_work_lite', [entry('kimi-k3')]],
+    ]))
+    expect(models).toHaveLength(1)
+    expect(models[0]!.function).toBe('solo_work_lite')
+    expect(isTraeModelCallable(models[0]!)).toBe(true)
+  })
+
+  it('无 config_name 的条目被跳过；结构不符返回空数组', () => {
+    const models = parseTraeBatchModelList(batch([['solo_agent', [{ config_switch: true }]]]))
+    expect(models).toEqual([])
+    for (const bad of [null, undefined, 'str', 42, {}, { function_configs: 'x' }]) {
+      expect(parseTraeBatchModelList(bad), String(bad)).toEqual([])
+    }
+  })
+})
+
+describe('readBooleanField', () => {
+  it('只有明确布尔语义才返回值', () => {
+    expect(readBooleanField({ v: true }, 'v')).toBe(true)
+    expect(readBooleanField({ v: false }, 'v')).toBe(false)
+    expect(readBooleanField({ v: 1 }, 'v')).toBe(true)
+    expect(readBooleanField({ v: 0 }, 'v')).toBe(false)
+    expect(readBooleanField({ v: 'true' }, 'v')).toBe(true)
+    expect(readBooleanField({ v: 'false' }, 'v')).toBe(false)
+  })
+
+  it('缺失或非布尔语义返回 undefined', () => {
+    for (const noise of [undefined, null, '', 'yes', {}, [], 2]) {
+      expect(readBooleanField({ v: noise }, 'v'), JSON.stringify(noise)).toBeUndefined()
+    }
+    expect(readBooleanField({}, 'v')).toBeUndefined()
+  })
+})
+
+describe('machine_id / device_id 生成', () => {
+  it('machine_id 为 32 位 hex 字符', () => {
+    for (let i = 0; i < 20; i++) {
+      const id = generateMachineId()
+      expect(id).toMatch(/^[0-9a-f]{32}$/)
+    }
+  })
+
+  it('machine_id 每次生成都不同', () => {
+    const ids = new Set(Array.from({ length: 50 }, () => generateMachineId()))
+    expect(ids.size).toBe(50)
+  })
+
+  it('device_id 为 32 位 hex（对齐 login.sh 的 openssl rand -hex 16）', () => {
+    // 早期实现错误地生成了「16 位纯数字」（那是 CodeBuddy 的签到格式），
+    // 与 TRAE 协议不符：该值随登录 URL 下发并用于签到 X-Device-Id 头。
+    // 空值签到会报 9004；两账号共用同一 deviceId 会被「该设备已签到」拦截。
+    for (let i = 0; i < 20; i++) {
+      const id = generateDeviceId()
+      expect(id).toMatch(/^[0-9a-f]{32}$/)
+    }
+  })
+
+  it('device_id 每次生成都不同（账号间必须互异）', () => {
+    const ids = new Set(Array.from({ length: 50 }, () => generateDeviceId()))
+    expect(ids.size).toBe(50)
+  })
+})
+
+describe('签到设备号派生（9074 轮换）', () => {
+  const base = 'c'.repeat(32)
+
+  it('generation <= 0 时原样返回基础 id（既有账号行为不变）', () => {
+    expect(deriveCheckinDeviceId(base, 0)).toBe(base)
+    expect(deriveCheckinDeviceId(base, -1)).toBe(base)
+    expect(deriveCheckinDeviceId(base, Number.NaN)).toBe(base)
+  })
+
+  it('⚠️ 派生结果必须是 32 位 hex（不是 sha256 的 64 位）', () => {
+    // device_id 是 openssl rand -hex 16 的产物，即 16 字节 = **32** 个 hex 字符。
+    // 直接下发 sha256 的 64 位会与协议格式不符。
+    for (const generation of [1, 2, 7, 99]) {
+      expect(deriveCheckinDeviceId(base, generation)).toMatch(/^[0-9a-f]{32}$/)
+    }
+  })
+
+  it('同一 (id, 代次) 派生的结果稳定（可跨重启复现，无需持久化新 id）', () => {
+    expect(deriveCheckinDeviceId(base, 3)).toBe(deriveCheckinDeviceId(base, 3))
+  })
+
+  it('不同代次派生出不同 id（否则轮换无效）', () => {
+    const ids = new Set([1, 2, 3, 4, 5].map((g) => deriveCheckinDeviceId(base, g)))
+    expect(ids.size).toBe(5)
+  })
+
+  it('不同基础 id 派生结果也不同（账号间互异）', () => {
+    expect(deriveCheckinDeviceId('a'.repeat(32), 1)).not.toBe(deriveCheckinDeviceId('b'.repeat(32), 1))
+  })
+})
+
+describe('机器指纹轮换派生', () => {
+  const base = 'd'.repeat(32)
+
+  it('generation <= 0 时原样返回（默认不轮换）', () => {
+    expect(deriveRotatingMachineId(base, 0)).toBe(base)
+  })
+
+  it('派生结果为 32 位 hex，且不同代次互异', () => {
+    const first = deriveRotatingMachineId(base, 1)
+    const second = deriveRotatingMachineId(base, 2)
+    expect(first).toMatch(/^[0-9a-f]{32}$/)
+    expect(first).not.toBe(second)
+  })
+})
+
+describe('max_tokens 收敛（上游 64K 安全线）', () => {
+  it('超过上限时收敛到上限', () => {
+    expect(clampTraeMaxTokens(131_072, 64_000)).toBe(64_000)
+  })
+
+  it('小于上限时原样返回', () => {
+    expect(clampTraeMaxTokens(1024, 64_000)).toBe(1024)
+  })
+
+  it('undefined / 非正数原样返回（不编造数值）', () => {
+    expect(clampTraeMaxTokens(undefined, 64_000)).toBeUndefined()
+    expect(clampTraeMaxTokens(0, 64_000)).toBe(0)
+    expect(clampTraeMaxTokens(-5, 64_000)).toBe(-5)
+  })
+
+  it('上限为 0 表示关闭收敛（可用环境变量放开）', () => {
+    expect(clampTraeMaxTokens(131_072, 0)).toBe(131_072)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI 到 SOLO 载荷转换（本 provider 最核心的差异）
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('OpenAI 到 SOLO 载荷转换', () => {
+  it('强制 stream=true 并注入固定 function', () => {
+    const out = transformToSOLOBody({ model: 'glm-5.2', messages: [], stream: false })
+    expect(out.stream).toBe(true)
+    expect(out.function).toBe('solo_work_lite')
+  })
+
+  it('model 同时写入 config_name 与 model（上游两个字段都要）', () => {
+    const out = transformToSOLOBody({ model: 'DeepSeek-V4-Pro', messages: [] })
+    expect(out.config_name).toBe('DeepSeek-V4-Pro')
+    expect(out.model).toBe('DeepSeek-V4-Pro')
+  })
+
+  it('model 缺失时回退默认值 glm-5.2', () => {
+    const out = transformToSOLOBody({ messages: [] })
+    expect(out.config_name).toBe(TRAE_DEFAULT_MODEL)
+    expect(out.model).toBe(TRAE_DEFAULT_MODEL)
+  })
+
+  it('去除内部名后缀 __dev（对齐 Go 端 mapModel）', () => {
+    const out = transformToSOLOBody({ model: 'glm-5.2__dev', messages: [] })
+    expect(out.config_name).toBe('glm-5.2')
+  })
+
+  it('显式 modelMapping 优先于请求体里的 model', () => {
+    const out = transformToSOLOBody({ model: 'alias', messages: [] }, 'glm-5.2')
+    expect(out.config_name).toBe('glm-5.2')
+  })
+
+  it('messages.content 字符串转为 [{type:"text",text}] 数组', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2',
+      messages: [{ role: 'user', content: '你好' }],
+    })
+    expect((out.messages as Array<Record<string, unknown>>)[0]).toEqual({
+      role: 'user',
+      content: [{ type: 'text', text: '你好' }],
+    })
+  })
+
+  it('content 已是数组时原样透传（兼容多模态）', () => {
+    const parts = [{ type: 'text', text: 'x' }]
+    const out = transformToSOLOBody({
+      model: 'glm-5.2', messages: [{ role: 'user', content: parts }],
+    })
+    expect((out.messages as Array<Record<string, unknown>>)[0]!.content).toBe(parts)
+  })
+
+  it('assistant 的 tool_calls.function 转为 function_call（SOLO 字段名）', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2',
+      messages: [{
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } }],
+      }],
+    })
+    const msg = (out.messages as Array<Record<string, unknown>>)[0]!
+    const call = (msg.tool_calls as Array<Record<string, unknown>>)[0]!
+    expect(call).toHaveProperty('function_call')
+    expect(call).not.toHaveProperty('function')
+    expect((call.function_call as Record<string, unknown>).name).toBe('read')
+  })
+
+  it('无 name 的 tool_call 被剔除（上游要求 FunctionCall.Name 必填）', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2',
+      messages: [{
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: '', arguments: '{}' } },
+          { id: 'c2', type: 'function', function: { name: 'read', arguments: '{}' } },
+        ],
+      }],
+    })
+    const msg = (out.messages as Array<Record<string, unknown>>)[0]!
+    expect((msg.tool_calls as unknown[]).length).toBe(1)
+  })
+
+  it('全部 tool_call 都无 name 时删除该字段（而非留空数组）', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2',
+      messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', function: { name: '' } }] }],
+    })
+    expect((out.messages as Array<Record<string, unknown>>)[0]).not.toHaveProperty('tool_calls')
+  })
+
+  it('tools 的 parameters 对象序列化为 JSON 字符串（SOLO 上游要求 string）', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2',
+      messages: [],
+      tools: [{
+        type: 'function',
+        function: { name: 'read', description: 'd', parameters: { type: 'object', properties: {} } },
+      }],
+    })
+    const tool = (out.tools as Array<Record<string, unknown>>)[0]!
+    const fn = tool.function as Record<string, unknown>
+    expect(typeof fn.parameters).toBe('string')
+    expect(JSON.parse(fn.parameters as string)).toEqual({ type: 'object', properties: {} })
+  })
+
+  it('tool_choice "none" 同时删除 tools（上游据此判定不调用工具）', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2', messages: [], tool_choice: 'none',
+      tools: [{ type: 'function', function: { name: 'x', parameters: {} } }],
+    })
+    expect(out).not.toHaveProperty('tool_choice')
+    expect(out).not.toHaveProperty('tools')
+  })
+
+  it('tool_choice 对象 {type:"auto"} 归一化为字符串 "auto"', () => {
+    const out = transformToSOLOBody({ model: 'glm-5.2', messages: [], tool_choice: { type: 'auto' } })
+    expect(out.tool_choice).toBe('auto')
+  })
+
+  it('tool_choice {type:"function",function:{name}} 归一化为该名字字符串', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2', messages: [],
+      tool_choice: { type: 'function', function: { name: 'read' } },
+    })
+    expect(out.tool_choice).toBe('read')
+  })
+
+  it('缺 function.name 的 tool_choice 回退为 "auto"', () => {
+    const out = transformToSOLOBody({
+      model: 'glm-5.2', messages: [], tool_choice: { type: 'function', function: {} },
+    })
+    expect(out.tool_choice).toBe('auto')
+  })
+
+  it('未知 tool_choice 形态被删除（不把非法值发给上游）', () => {
+    const out = transformToSOLOBody({ model: 'glm-5.2', messages: [], tool_choice: 42 })
+    expect(out).not.toHaveProperty('tool_choice')
+  })
+
+  it('不修改传入的原始对象（纯函数语义）', () => {
+    const original = { model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }] }
+    const snapshot = JSON.stringify(original)
+    transformToSOLOBody(original)
+    expect(JSON.stringify(original)).toBe(snapshot)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SOLO 到 OpenAI SSE 解析
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('SOLO SSE 事件解析', () => {
+  it('解析 output 事件的 response 与 reasoning_content', () => {
+    const ev = parseTraeSSELine('output', JSON.stringify({
+      response: '正文', reasoning_content: '思考', tool_calls: null,
+    }))
+    expect(ev).toMatchObject({ event: 'output', response: '正文', reasoningContent: '思考' })
+  })
+
+  it('output 的 function_call 归一化为 function 并清理 SOLO 专属字段', () => {
+    const ev = parseTraeSSELine('output', JSON.stringify({
+      tool_calls: [{
+        index: 0,
+        function_call: { name: 'read', arguments: '{}', namespace: 'ns', partial_arguments: 'p' },
+      }],
+    }))
+    const call = (ev!.toolCalls as Array<Record<string, unknown>>)[0]!
+    expect(call).toHaveProperty('function')
+    expect(call).not.toHaveProperty('function_call')
+    const fn = call.function as Record<string, unknown>
+    expect(fn.name).toBe('read')
+    expect(fn).not.toHaveProperty('namespace')
+    expect(fn).not.toHaveProperty('partial_arguments')
+  })
+
+  it('解析 token_usage 事件', () => {
+    const ev = parseTraeSSELine('token_usage', JSON.stringify({
+      prompt_tokens: 21, completion_tokens: 142, total_tokens: 163, reasoning_tokens: 135,
+    }))
+    expect(ev?.usage).toMatchObject({ prompt_tokens: 21, completion_tokens: 142 })
+  })
+
+  it('解析 done 事件的 finish_reason', () => {
+    expect(parseTraeSSELine('done', JSON.stringify({ finish_reason: 'stop' }))?.finishReason).toBe('stop')
+  })
+
+  it('解析 error 事件的 code 与 message', () => {
+    const ev = parseTraeSSELine('error', JSON.stringify({ code: 4008, message: '配额超限' }))
+    expect(ev).toMatchObject({ errorCode: 4008, errorMessage: '配额超限' })
+  })
+
+  it('data 非 JSON 时只保留事件名（不抛错）', () => {
+    expect(parseTraeSSELine('output', 'not-json')).toEqual({ event: 'output' })
+  })
+
+  it('data 为空时只保留事件名', () => {
+    expect(parseTraeSSELine('metadata', '')).toEqual({ event: 'metadata' })
+  })
+})
+
+describe('SOLO SSE 聚合（非流式）', () => {
+  it('拼接多帧 output 为完整正文与思考', () => {
+    const lines = [
+      'event:metadata', 'data:{"model":"","session_id":"s1"}', '',
+      'event:output', 'data:{"response":"你","reasoning_content":"思"}', '',
+      'event:output', 'data:{"response":"好","reasoning_content":"考"}', '',
+      'event:done', 'data:{"finish_reason":"stop"}', '',
+    ]
+    const result = aggregateTraeSSE(lines)
+    expect(result.content).toBe('你好')
+    expect(result.reasoningContent).toBe('思考')
+    expect(result.finishReason).toBe('stop')
+  })
+
+  it('保留 token_usage', () => {
+    const result = aggregateTraeSSE([
+      'event:output', 'data:{"response":"x"}', '',
+      'event:token_usage', 'data:{"prompt_tokens":5,"completion_tokens":9}', '',
+      'event:done', 'data:{"finish_reason":"stop"}', '',
+    ])
+    expect(result.usage).toMatchObject({ prompt_tokens: 5, completion_tokens: 9 })
+  })
+
+  it('error 事件被记录为 error 字段', () => {
+    const result = aggregateTraeSSE([
+      'event:error', 'data:{"code":1005,"message":"plan 权益不足"}', '',
+    ])
+    expect(result.error).toEqual({ code: 1005, message: 'plan 权益不足' })
+  })
+
+  it('无 done 事件时 finishReason 保持默认 stop', () => {
+    const result = aggregateTraeSSE(['event:output', 'data:{"response":"x"}', ''])
+    expect(result.finishReason).toBe('stop')
+  })
+
+  it('合并多帧 tool_calls', () => {
+    const result = aggregateTraeSSE([
+      'event:output', 'data:{"response":"","tool_calls":[{"index":0,"function_call":{"name":"read","arguments":"{\\"a\\":"}}]}', '',
+      'event:output', 'data:{"tool_calls":[{"index":0,"function_call":{"arguments":"1}"}}]}', '',
+      'event:done', 'data:{"finish_reason":"tool_calls"}', '',
+    ])
+    expect(result.toolCalls.length).toBe(2)
+    expect(result.finishReason).toBe('tool_calls')
+  })
+})
+
+describe('OpenAI chunk 构造', () => {
+  it('buildOpenAIChunk 产出合法的 chat.completion.chunk', () => {
+    const raw = buildOpenAIChunk('chatcmpl-1', { content: 'hi' })
+    expect(raw.startsWith('data: ')).toBe(true)
+    expect(raw.endsWith('\n\n')).toBe(true)
+    const payload = JSON.parse(raw.slice(6).trim())
+    expect(payload).toMatchObject({
+      id: 'chatcmpl-1',
+      object: 'chat.completion.chunk',
+      choices: [{ index: 0, delta: { content: 'hi' } }],
+    })
+  })
+
+  it('带 finishReason 时写入 choices[0].finish_reason', () => {
+    const raw = buildOpenAIChunk('id', {}, 'stop')
+    const payload = JSON.parse(raw.slice(6).trim())
+    expect(payload.choices[0].finish_reason).toBe('stop')
+  })
+
+  it('带 usage 时写入顶层 usage', () => {
+    const raw = buildOpenAIChunk('id', {}, undefined, { prompt_tokens: 1 })
+    const payload = JSON.parse(raw.slice(6).trim())
+    expect(payload.usage).toEqual({ prompt_tokens: 1 })
+  })
+
+  it('[DONE] 信号格式正确', () => {
+    expect(OPENAI_DONE).toBe('data: [DONE]\n\n')
+  })
+})
+
+describe('模块导出面', () => {
+  it('积分余额端点常量由 trae.ts 定义（供 trae-credits.ts 导入，单一真相源）', () => {
+    // 端点变更只改一处会让语义分叉且无测试失败，故锁住它的导出位置。
+    expect(traeModule).toHaveProperty('TRAE_ENT_USAGE_PATH')
+  })
+})

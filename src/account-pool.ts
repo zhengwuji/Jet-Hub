@@ -635,4 +635,38 @@ export class AccountPool {
     })
     if (changed) await this.writeAccounts(next)
   }
+
+  /**
+   * 记录 TRAE 签到设备轮换代次（命中 9074 后由积分领取流程调用）。
+   *
+   * 与 {@link updateModelRateLimit} 同款：在**最新快照**上做局部合并后整体
+   * 写回，避免与并发的账号操作互相覆盖。
+   *
+   * 只接受比现值**更大**的代次，防止乱序/重复回调把代次写回小值而让同一个
+   * 被限流的设备号复活。
+   */
+  async updateTraeCheckinDeviceGeneration(accountId: string, generation: number): Promise<void> {
+    if (!Number.isFinite(generation) || generation <= 0) return
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] updateTraeCheckinDeviceGeneration: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const current = accounts[idx]!.traeCheckinDeviceGeneration ?? 0
+    if (generation <= current) return
+    const next = [...accounts]
+    next[idx] = { ...next[idx]!, traeCheckinDeviceGeneration: generation }
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 签到设备代次 → ${generation}`)
+  }
+
+  /** 读取 TRAE 签到设备轮换代次（未设置时为 0）。 */
+  traeCheckinDeviceGenerationFor(accountId: string): number {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    const value = entry?.traeCheckinDeviceGeneration
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+  }
 }

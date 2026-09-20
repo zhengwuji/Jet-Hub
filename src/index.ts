@@ -5,15 +5,19 @@ import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
+import { registerTraeLlm } from './trae-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
+import { TraeAuth } from './trae-auth.js'
 import { AccountPool } from './account-pool.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
+import { TRAE } from './trae-product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+import type { TraeCredential } from './trae.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -118,7 +122,7 @@ export function apply(ctx: Context): void {
   // registerBuddyLlm / registerLobsteraiLlm 以 `llm-${product.id}` 派生，
   // 漏注册会让模型设置页在 `refFor → deriveKeyRef(provider)` 处以
   // `provider.toUpperCase is not a function` 崩溃。
-  registerProviderSettings(ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai')
+  registerProviderSettings(ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae')
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
 
@@ -307,6 +311,36 @@ export function apply(ctx: Context): void {
     product: LOBSTERAI,
   })
 
+  // ===== TRAE（字节 TRAE IDE）服务 =====
+  // 第四个产品线，协议与前面三者**完全不同**：认证用 ExchangeToken（轮换 refreshToken），
+  // 对话用 Cloud-IDE-JWT 鉴权，载荷需从 OpenAI 格式转换为 SOLO 格式，
+  // SSE 为自定义格式（非 OpenAI 标准），需独立解析。
+  // 服务名由 TraeAuth 依 product.id 派生，注册为 ctx.traeAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 TRAE 面板。
+  const trae = new TraeAuth(ctx)
+  registerTraeLlm(ctx, {
+    credentialRef: credentialRef(TRAE.defaultCredentialRef),
+    resolveCredential: async () => {
+      const available = await pool.getAvailableAccount(TRAE.id, '')
+      if (available) return available.credential as TraeCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(TRAE.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as TraeCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(TRAE.id, '')
+      if (available) await trae.refreshAccountCredential(available.entry.credentialRef)
+      else await trae.refresh()
+    },
+    fetchRemoteModels: () => trae.fetchModels(pool),
+    accountPool: pool,
+    product: TRAE,
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -323,6 +357,9 @@ export function apply(ctx: Context): void {
     } catch { /* 静默 */ }
     try {
       await lobsterai.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await trae.refreshAll(pool)
     } catch { /* 静默 */ }
   }
 
@@ -343,6 +380,7 @@ export function apply(ctx: Context): void {
         buddy.stop()
         workbuddy.stop()
         lobsterai.stop()
+        trae.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -353,9 +391,10 @@ export function apply(ctx: Context): void {
     buddy.stop()
     workbuddy.stop()
     lobsterai.stop()
+    trae.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, trae)
   ctx.provide('accountPool', pool)
 }

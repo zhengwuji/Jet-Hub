@@ -23,11 +23,42 @@ const WORKBUDDY_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEgAAABICA
  */
 const LOBSTERAI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjZTg1MDNhIi8+PHBhdGggZD0iTTEyIDUuNWMtMi40IDAtNC4yIDEuNi00LjIgNHY1LjJjMCAyLjMgMS44IDMuOCA0LjIgMy44czQuMi0xLjUgNC4yLTMuOFY5LjVjMC0yLjQtMS44LTQtNC4yLTR6IiBmaWxsPSIjZmZmIi8+PGNpcmNsZSBjeD0iMTAuMyIgY3k9IjEwLjIiIHI9IjEiIGZpbGw9IiNlODUwM2EiLz48Y2lyY2xlIGN4PSIxMy43IiBjeT0iMTAuMiIgcj0iMSIgZmlsbD0iI2U4NTAzYSIvPjxwYXRoIGQ9Ik04LjQgNy4yIDYuMiA0LjltOS40IDIuMyAyLjItMi4zTTkuOSAxOC41bC0xLjQgMm02LjYtMiAxLjQgMiIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjEuNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBmaWxsPSJub25lIi8+PC9zdmc+'
 
+/**
+ * TRAE 面板图标（内联 SVG data URI，还原自官方标志）。
+ *
+ * TRAE 的官方标志是**纯色平涂**图形：亮绿色（`#32F08C`）的「错位方框 + 两枚菱形」。
+ * 素材为用户提供的 Trae 官方 CDN 图（512×512 调色板 PNG，黑底不透明）。
+ * 这里不是直接内联那张 PNG，而是**逐像素实测几何后重绘为 SVG**，理由有三：
+ *
+ * 1. 官方 PNG 是**黑底不透明**的（调色板仅含 `#000000` 与各级绿色），
+ *    直接放进 `.dim-jh-providerIcon` 的白底容器里会显示成一块黑方块；
+ * 2. 原图实为单色 alpha 蒙版 —— 每级绿都是 `#32F08C` 与黑的线性混合
+ *    （实测 `#197846`≈50%、`#1F9658`≈63%、`#2CD27B`≈87.5%），
+ *    因此几何形状可被精确还原，无需保留位图；
+ * 3. SVG 体积约为同尺寸 PNG 的 1/3，且任意 DPI 下都清晰。
+ *
+ * 几何提取方式（扫描线实测原图 512×512 坐标）：
+ * - 外框实心区 `58..453 × 116..395`；
+ * - 左下缺角 `58..115 × 340..395`（这就是「错位」的来源：底部横条左端内缩）；
+ * - 中央留空 `115..396 × 172..340`（用 `fill-rule="evenodd"` 挖出）；
+ * - 两枚菱形中心 `(215.5, 254.5)` 与 `(329, 254.5)`，曼哈顿半径 39。
+ *
+ * 按上述模型做全图像素比对，与原图吻合率 **99.775%**
+ * （不一致仅 591/262144 个抗锯齿边缘像素）。viewBox 取 `38 38 435 435`
+ * 使图形带均匀留白并居中。
+ *
+ * 用 SVG 而非 base64 PNG 与 LobsterAI 图标的做法一致；内容是**预先算好的
+ * base64 字面量**，不用 `btoa()` 运行时拼接 —— 该 bundle 由 esbuild 打包，
+ * 目标环境未必提供 `btoa`，字面量最稳妥。
+ */
+const TRAE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjM4IDM4IDQzNSA0MzUiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCI+PHBhdGggZmlsbD0iIzMyRjA4QyIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNTggMTE2aDM5NXYyNzlIMTE1di01NUg1OHpNMTE1IDE3MmgyODF2MTY4SDExNXoiLz48cGF0aCBmaWxsPSIjMzJGMDhDIiBkPSJNMjE1LjUgMjE1LjVsMzkgMzktMzkgMzktMzktMzl6TTMyOSAyMTUuNWwzOSAzOS0zOSAzOS0zOS0zOXoiLz48L3N2Zz4='
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
   { id: 'workbuddy', label: 'WorkBuddy (国际版)', icon: WORKBUDDY_ICON, logoClass: 'workbuddy' },
   { id: 'lobsterai', label: 'LobsterAI (有道)', icon: LOBSTERAI_ICON, logoClass: 'lobsterai' },
+  { id: 'trae', label: 'TRAE (字节)', icon: TRAE_ICON, logoClass: 'trae' },
 ]);
 
 /**

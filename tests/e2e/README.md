@@ -11,6 +11,7 @@
 | `buddy-cache-probe.e2e.spec.ts` | `DSH_BUDDY_E2E=1` + `DSH_BUDDY_E2E_CONFIRM=yes` | 直连 `/v2/chat/completions`，发 3 组前缀做缓存对比 |
 | `buddy-pool-probe.e2e.spec.ts` | `DSH_BUDDY_POOL_E2E=1` + `DSH_BUDDY_POOL_E2E_CONFIRM=yes` | 用账号池凭据走完整 LLM 链路 |
 | `buddy-ratelimit-probe.e2e.spec.ts` | `DSH_BUDDY_RATELIMIT_E2E=1` + `DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes` | 对记录「限额重置」的账号实发一次请求，**判定是否真限流** |
+| `trae-channels-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | 拉真实多通道目录，并用**真实适配器**对 `glm-5.1`（agent 通道）与 `glm-5-turbo`（work 通道）各发一条最短消息 —— **验证「模型只在列出它的通道里可调用」**。消耗 2 次极小额度 |
 
 > LobsterAI **没有**发 chat 请求的 e2e —— 它的对话链路可在 Jet Hub 里人工验证
 > （选一个模型发一句话即可），单独写探针的边际价值低于维护成本。
@@ -29,6 +30,8 @@
 | `lobsterai-claim-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` + `DSH_LOBSTERAI_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
 | `codearts-credits-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | **只读**：凭据结构、**账户类型检测**（`is_credit_package`）、积分余额、活动列表。**绝不领取** |
 | `codearts-claim-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` + `DSH_CODEARTS_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（会改动当日领取状态；**不消耗模型积分**，重复运行幂等） |
+| `trae-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | **只读**：凭据结构（含 machine_id / device_id）、积分余额、签到状态、远端模型列表。**不签到、不发模型请求** |
+| `trae-claim-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` + `DSH_TRAE_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -68,6 +71,15 @@ pnpm test:e2e:codearts-credits
 
 # ⚠️ 会真实领取积分（改动当日领取状态；不消耗模型积分，重复运行幂等）
 pnpm test:e2e:codearts-claim
+
+# 安全：TRAE 只读探针（凭据/余额/签到状态/远端模型列表，不签到）
+pnpm test:e2e:trae
+
+# ⚠️ 会真实签到（改动当日签到状态；不消耗模型积分，重复运行幂等）
+pnpm test:e2e:trae-claim
+
+# ⚠️ 会消耗极小额度：验证多通道目录与「按模型路由通道」
+pnpm test:e2e:trae-channels
 ```
 
 > **CodeArts 凭据必须新鲜**：其 `refresh_token` 是**一次性轮换**的（用一次即

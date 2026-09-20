@@ -18,9 +18,13 @@ import type { CodeArtsAuth } from './service.js'
 import type { CodeArtsCredential } from './types.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
+import type { TraeAuth } from './trae-auth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
+import { TRAE } from './trae-product.js'
 import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobsterai.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+import { isTraeRefreshable, traeCredentialExpiresAtMs } from './trae.js'
+import type { TraeCredential } from './trae.js'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
@@ -41,6 +45,10 @@ import {
   claimCodeArtsDailyCheckin,
   fetchCodeArtsAccountInfoDetailed,
 } from './codearts-credits.js'
+import {
+  claimTraeDailyCheckin,
+  fetchTraeCreditBalance,
+} from './trae-credits.js'
 import {
   resetAccount,
   resetAllAccounts,
@@ -125,6 +133,18 @@ function parseLobsteraiCredential(raw: string): LobsteraiCredential | undefined 
   }
 }
 
+/** 解析 TRAE 凭据 JSON；解析失败返回 undefined。 */
+function parseTraeCredential(raw: string): TraeCredential | undefined {
+  try {
+    const parsed = JSON.parse(raw) as TraeCredential
+    return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * 汇总一次批量领取的结果。
  * 纯函数，便于单测；inactive（无资格/活动结束）与 failed 分开计数，
@@ -189,7 +209,7 @@ export interface CreditsEndpointDeps<
   /** 查询签到状态；默认使用真实的 fetchCheckinStatus。 */
   fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>
   /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
-  claim?: (credential: TCredential, product: TProduct) => Promise<ClaimOutcome>
+  claim?: (credential: TCredential, product: TProduct, entry: ProviderAccountEntry) => Promise<ClaimOutcome>
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
   /**
@@ -289,7 +309,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
         const credential = JSON.parse(resolved.value) as TCredential
         if (!precheck) {
           // 领取流程自带状态判断（LobsterAI 的 slot/context 检查在 claim 内部）。
-          outcome = await claim(credential, product)
+          outcome = await claim(credential, product, entry)
         } else {
           // 先查状态：活动未开启或今日已领则跳过领取请求，减少无效调用
           const status = await fetchStatus(credential, product)
@@ -300,7 +320,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
           } else {
             // 状态查询失败（status 为 null）时仍然尝试领取：
             // 无法确认不代表不能领，交给领取接口以响应体 code 定夺。
-            outcome = await claim(credential, product)
+            outcome = await claim(credential, product, entry)
           }
         }
       }
@@ -401,9 +421,10 @@ export function registerJetHubRpc(
   buddy: BuddyAuth,
   workbuddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
+  trae: TraeAuth,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai)
+    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, trae)
   })
 }
 
@@ -415,6 +436,7 @@ function registerJetHubEndpoints(
   buddy: BuddyAuth,
   workbuddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
+  trae: TraeAuth,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -598,6 +620,32 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === TRAE.id) {
+          // TRAE 回调式登录 + 两步式返回（与 LobsterAI / codearts 同因）。
+          const started = await trae.startLogin({ refName })
+          await pool.addAccount({
+            id,
+            provider: TRAE.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            const credential = parseTraeCredential(loginResult.access)
+            await pool.updateAccount(id, {
+              nickname: credential?.nickname !== undefined && credential.nickname.length > 0
+                ? credential.nickname
+                : id,
+              expiresAt: credential !== undefined ? traeCredentialExpiresAtMs(credential) : undefined,
+              refreshable: credential !== undefined && isTraeRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${TRAE.id} login failed for ${id}: ${String(error)}`)
+            void pool.removeAccount(id).catch(() => {})
+          })
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -678,6 +726,9 @@ function registerJetHubEndpoints(
               break
             case LOBSTERAI.id:
               await lobsterai.refreshAccountCredential(entry.credentialRef)
+              break
+            case TRAE.id:
+              await trae.refreshAccountCredential(entry.credentialRef)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -783,6 +834,17 @@ function registerJetHubEndpoints(
             } satisfies RpcCreditsStatusResponse,
           }
         }
+        if (req.provider === TRAE.id) {
+          // TRAE 有签到状态端点，但需要发起 Ug 请求获取（见 claim 内部的多步流程）。
+          // 与 LobsterAI/CodeArts 一样如实返回 null，由 claimAll 自行处理预检。
+          const accounts = await pool.listAccounts(req.provider)
+          return {
+            ok: true,
+            value: {
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
+            } satisfies RpcCreditsStatusResponse,
+          }
+        }
         const product = productById(req.provider)
         if (product === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -821,6 +883,24 @@ function registerJetHubEndpoints(
             claim: (credential, product) =>
               claimLobsteraiDailyCheckin(credential, product, clientVersion),
             // 领取流程内部已做 slot/context 预检，不需要外部再查一次状态。
+            precheckStatus: false,
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
+        if (req.provider === TRAE.id) {
+          const value = await collectClaimResults<TraeCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            // 9074 的限流范围是 device_id 而非账号：命中后换一个派生设备号重试
+            // 一次，并把新代次持久化到账号条目（见 trae-credits.ts）。
+            claim: (credential, _product, entry) =>
+              claimTraeDailyCheckin(
+                credential as TraeCredential,
+                TRAE,
+                fetch,
+                pool.traeCheckinDeviceGenerationFor(entry.id),
+                (next) => pool.updateTraeCheckinDeviceGeneration(entry.id, next),
+              ),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
@@ -880,6 +960,14 @@ function registerJetHubEndpoints(
           const values = await collectCreditBalances(accounts, LOBSTERAI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === TRAE.id) {
+          const values = await collectCreditBalances(accounts, TRAE, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalance: (credential, product) => fetchTraeCreditBalance(credential as TraeCredential, product),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }

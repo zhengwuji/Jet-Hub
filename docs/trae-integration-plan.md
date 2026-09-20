@@ -41,11 +41,11 @@ TRAE 的 SOLO 通道与**现有三个脉系都不同源**，属全新脉系：
 ### 2.2 认证流程
 
 ```
-登录:
+登录（⚠️ 下方为**已被实现推翻的早期假设**，见「修订记录」）:
   machine_id = randomHex(16)    ← 32 hex 字符
-  device_id = randomDigits(16)  ← 16 位纯数字
-  loginURL = https://www.trae.cn/authorization?client_id=en1oxy7wnw8j9n&machine_id=...&device_id=...&redirect_uri=http://127.0.0.1:18080/authorize
-  → 用户浏览器授权 → TRAE 回调 redirect_uri?code=...&state=...
+  device_id = randomDigits(16)  ← 16 位纯数字（❌ 错误，实为 hex32）
+  loginURL = https://www.trae.cn/authorization?client_id=...&machine_id=...&device_id=...&redirect_uri=...
+  → 用户浏览器授权 → TRAE 回调 redirect_uri?code=...&state=...   ← ❌ 参数名与回调形态都不对
   → POST ExchangeToken { ClientID, RefreshToken: code, ClientSecret: "-", UserID: "" }
   → 返回 { Result: { Token, TokenExpireAt, RefreshToken, RefreshExpireAt } }
   → POST GetUserInfo (带 Cloud-IDE-JWT header)
@@ -131,6 +131,7 @@ Response:
 | 1005 | plan 权益不足 | 长冷却（12h） |
 | 4008 | 配额超限（ide_credits 耗尽） | 等重置/签到 |
 | 4011 | 请求频率超限 | 短冷却（60s） |
+| 4001 | 参数无效 —— **实测成因是「模型不可调用」**（`is_custom_model` 条目），不是版本号 | 换模型（版本号归因未复现） |
 | 401 + body 含 token/login | session 失效 | 需重新登录 |
 | 429 | 软限流 | 短冷却（60s） |
 
@@ -202,7 +203,40 @@ interface TraeCredential {
 
 与 CodeArts/LobsterAI 相同的两步式模式：
 1. `startLogin()` → 生成 machine_id/device_id，构建 loginURL，起本地回调服务器，立即返回 `{ loginUrl, result, close }`
-2. 回调触发后，ExchangeToken(code) → GetUserInfo → 落盘
+2. 回调触发后，ExchangeToken(refreshToken) → GetUserInfo → 落盘
+
+> ⚠️ 原文写的是 `ExchangeToken(code)` —— 那是早期假设。实测回调**不返回 `code`**，
+> 而是直接回传 `refreshToken`；详见下方「修订记录」。
+
+## 修订记录（实测推翻的早期假设）
+
+本文档最初基于**对协议的推断**写成，实现过程中被实测/对账逐一推翻。
+以下记录差异，避免后人再按旧假设改动代码：
+
+| 项 | 早期假设（本文档原文） | 实测结论 | 影响 |
+|---|---|---|---|
+| 回调参数名 | `redirect_uri` | **`auth_callback_url`** | 参数名错 → 登录页停在授权中 |
+| 回调载荷 | `?code=...&state=...` | **直接回传 `refreshToken` / `userInfo` / `userJwt`**（并存 PKCE 新流程带 `code`） | 找 `code` 会恒失败 |
+| 是否**只能**是老流程 | 「没有 code 参数」 | ⚠️ **两套并存**，不能把带 `code` 的回调判为无效 | 过度断言会把合法回调判成失败 |
+| 登录 URL 参数 | 4~5 个 | **18 个**（含 `auth_from=solo`、`login_trace_id`、`x_*` 系列） | 少发 → 停在授权中 |
+| `device_id` 格式 | `randomDigits(16)`（16 位数字） | **hex32**（`openssl rand -hex 16`） | 那是 CodeBuddy 的格式 |
+| `plugin_version` | 未提及 | **独立字段** `2.3.62834`，与 `X-Ide-Version` 不同 | 混用会出问题 |
+| `userInfo` 企业字段 | `EnterpriseID` | **`TenantID`** | 读错则企业信息恒空 |
+| 消息序列化 | 未提及 | **必须先做**（DSH 原生块 → OpenAI wire） | 漏掉则模型看不到工具调用/结果 |
+| 续期终态判定 | 未提及 | 三条依据（401/403、`session-dead`、2xx 无 `accessToken`） | 缺则用户卡在无解重试 |
+| `4001` 的成因 | `X-Ide-Version` 过低（`0.1.43` 请求 `glm-5.3` 报错、`0.1.52` 正常） | ⚠️ **复测未重现**（`glm-5.3` 在两版本下都通过）；稳定成因是**模型不可调用** | 归因错会去调版本号（无效），实际该换模型 |
+| 模型目录过滤 | 未提及 | 必须剔除 `display_config.is_custom_model === true` 的条目 | 不剔则用户选中即报 `4001`，且文案指向「参数格式」把人带偏 |
+| 模型目录端点 | `POST /api/ide/v1/get_detail_param`（单 `function`） | **`POST /api/ide/v1/batch_get_detail_param`**：一次传多个 `functions`，响应 `function_configs[]` 为**每通道各自一套**目录 | 用单通道端点只能看到一个通道的模型，agent 专有模型永远不可见 |
+| 通道（`function`）语义 | 未提及（`function` 写死 `solo_work_lite`） | ⚠️ **模型只在列出它的通道里可调用**：`glm-5.1` 在 `solo_agent_remote` 正常、在 `solo_work_lite` 流内 `4001`；`glm-5-turbo`/`sagitta` 相反 | 不按模型路由通道 → agent 专有模型一用就 `4001` |
+| `is_invisible_to_user` | 未提及 | **与「能不能调用」无关**：官方隐藏但可调用（`glm-5.1` 即如此） | 并进可用性判定会连带删掉 `glm-5-turbo`/`sagitta`/`qwen-3.5`（目录 47→29） |
+| `context_window_tokens` | 兜底表写死 `131072` | 真实为 `{dev:200000, max:1000000}`；`max` 需开官方 `max_mode` | 采信 `max` 会让 DSH 以为有 1M 窗口而请求被拒；采信 131072 则过早压缩 |
+| `max_tokens` | 兜底表 `128000` / 收敛 `64000` | 远端主流模型声明的是 **32000** | 索要 128000 会被上游拒；旧实现根本没读远端这个字段 |
+| CN IDE 客户端版本 | 未提及 | 真实为 **3.3.94 / 20260820**（本插件 0.1.52 是旧 SOLO 协议）；`x-machine-id` 是 **64 hex**、`x-device-id` 是 **16 位数字** | 勿照搬新客户端头 —— 与旧协议不兼容（实测混用会 400） |
+| 对话体加密 | 未提及 | `llm_utils_chat` / `create_agent_task` 真实请求体**加密**（`x-helios`/`x-medusa`/`x-neptune`） | 仅换版本头解不开依赖它的模型（`deepseek-v4-flash` 等），**尚未实现** |
+
+另有若干**实现期新增**的防护，均由 `Trae2api-cn`（同协议 Python 实现）对账后加入：
+签到 `9074` 设备级轮换、历史超限裁剪（上游约 500K 字符静默断流）、
+空响应单次重试、`max_tokens` 收敛 64K、可选的机器指纹轮换。
 
 ### 3.5 LLM 适配器的关键决策
 

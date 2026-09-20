@@ -49,6 +49,7 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   buddy: Object.freeze({ balance: true, dailyCheckin: true }),
   workbuddy: Object.freeze({ balance: true, dailyCheckin: false }),
   lobsterai: Object.freeze({ balance: true, dailyCheckin: true }),
+  trae: Object.freeze({ balance: true, dailyCheckin: true }),
 });
 
 /**
