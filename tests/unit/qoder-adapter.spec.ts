@@ -92,6 +92,63 @@ describe('QoderAdapter 模型目录', () => {
   it('providerInfo 返回 qoder', () => {
     expect(makeAdapter().providerInfo('qoder')).toEqual({ id: 'qoder', name: QODER.displayName })
   })
+
+  // 计费倍率展示（目录 `price_factor`）。
+  //
+  // ⚠️ **必须写进 `name`，不是 `description`**：composer 的模型切换菜单只渲染
+  // `name`（ModelSelect 的 `children: model.name`），`description` 仅用于
+  // `/model` 弹窗。用户报障「消耗倍率没有显示在切换模型列表的后面」。
+  describe('listModels 的计费倍率', () => {
+    it('price_factor=0 显示为「免费」而非 x0', async () => {
+      // 实测 Qwen3.8-Flash（qfmodel）的 price_factor 正是 0。
+      const models = await makeAdapter().listModels('qoder')
+      const flash = models.find((m) => m.id === 'qfmodel')
+      expect(flash?.name).toBe('Qwen3.8-Flash · 免费')
+    })
+
+    it('其余模型显示 x 倍率', async () => {
+      const models = await makeAdapter().listModels('qoder')
+      expect(models.find((m) => m.id === 'dmodel')?.name).toBe('DeepSeek-V4-Pro · x0.8')
+      expect(models.find((m) => m.id === 'gfmodel')?.name).toBe('GLM-5.3-Flash · x0.1')
+      expect(models.find((m) => m.id === 'smodel')?.name).toBe('Sonus · x3.2')
+    })
+
+    // 错峰折扣只在**当前生效**（active=true）时显示：
+    // active=false 表示还没到折扣时段，显示折扣价会让用户按折扣价预期、
+    // 实际被按原价计费。兜底表里的三个 promotion 实测都是 active:false。
+    it('promotion.active=false 时不显示折扣角标', async () => {
+      const models = await makeAdapter().listModels('qoder')
+      for (const m of models) expect(m.name).not.toContain('折')
+    })
+
+    it('promotion.active=true 时显示折扣角标', async () => {
+      const product = {
+        ...QODER,
+        fallbackModels: [{
+          id: 'promo', name: 'Promo', contextWindow: 1000, priceFactor: 0.5,
+          promotion: { active: true, discountFactor: 0.4, badgeZh: '错峰 4 折' },
+        }],
+      }
+      const adapter = makeAdapter({ product: product as never })
+      const models = await adapter.listModels('qoder')
+      expect(models[0]?.name).toBe('Promo · x0.5 错峰 4 折')
+    })
+
+    it('无 priceFactor 时 name 保持原样（不编造倍率）', async () => {
+      const product = {
+        ...QODER,
+        fallbackModels: [{ id: 'unknown', name: 'Unknown', contextWindow: 1000 }],
+      }
+      const adapter = makeAdapter({ product: product as never })
+      expect((await adapter.listModels('qoder'))[0]?.name).toBe('Unknown')
+    })
+
+    // resolveModel 的 name 用于会话中的模型显示，**不带**价格后缀
+    // （价格只属于选择列表这个语境）。
+    it('resolveModel 的 name 不带倍率后缀', async () => {
+      expect((await makeAdapter().resolveModel('qoder', 'qfmodel')).name).toBe('Qwen3.8-Flash')
+    })
+  })
 })
 
 describe('QoderAdapter resolveModel', () => {

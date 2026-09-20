@@ -405,6 +405,33 @@ export async function generateRuntimeAuthFields(user: QoderWasmUserInfo): Promis
 }
 
 /**
+ * 解密 Qoder 的模型目录缓存（`~/.qoder/.models/{uid}/catalog-v6`）。
+ *
+ * 目录文件是 WASM 加密的 base64 文本，明文是模型目录 JSON —— 里面有
+ * **倍率**（`cost_multiplier`）等本插件兜底表尚未收录的字段。
+ * WASM 自己导出了 `model_cache_decrypt`，直接调用即可（不是破解）。
+ *
+ * ⚠️ **`machineId` 是必填的第二参**（官方调用点 `model_cache_decrypt(i, A)`，
+ * `A` 即 machineId）。漏传会得到 `AES-GCM decrypt failed: aead::Error` ——
+ * 这个报错看起来像「密文损坏」，实际是缺参数。
+ * 该值由本插件生成并随凭据持久化（`QoderCredential.machine_id`）。
+ *
+ * 仅用于离线读取本机缓存做核对/排查；线上模型列表仍走兜底表
+ * （目录端点需 WASM 签名，见 `qoder-adapter.ts` 的 `listModels`）。
+ */
+export async function decryptModelCatalog(encrypted: string, machineId: string): Promise<unknown> {
+  const g = await getGlue()
+  const raw = g.callString((stack) => {
+    const a = g.writeString(encrypted)
+    const aLen = g.lastLength()
+    const b = g.writeString(machineId)
+    const bLen = g.lastLength()
+    g.exports.model_cache_decrypt!(stack, a, aLen, b, bLen)
+  })
+  return JSON.parse(raw)
+}
+
+/**
  * Qoder 加密推理客户端。
  *
  * 持有 WASM 上下文（`QoderContext`）与运行时鉴权字段，用于反复生成

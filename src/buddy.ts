@@ -427,10 +427,133 @@ export interface BuddyRemoteModel {
   maxOutputTokens?: number
   /** 是否接受图片输入（data.models[].supportsImages）。 */
   supportsImages?: boolean
+  /**
+   * 计费倍率（`data.models[].credits`）。
+   *
+   * 真实形态是**字符串**且格式不固定：`"x0.29"` / `"x0.03 credits"` / `""`（空）。
+   * 归一化后存**纯文本**（如 `"x0.29"`），不存数字——因为它只是展示用，
+   * 且带 ` credits` 后缀与空串两种退化形态，转数字会引入无谓的解析失败分支。
+   * 远端未下发或解析不出时缺省。
+   */
+  creditsRate?: string
+  /**
+   * 促销后的实际倍率（`data.modelPromotions.discount.discountedCredits`）。
+   *
+   * 与 `creditsRate` 是**同族但独立**的两个字段：促销是全局活动（按模型 id
+   * 索引），活动结束后服务端会把它改成 `"0x"` 或移除。存在且非 `0x` 时才带上。
+   */
+  discountedCreditsRate?: string
   /** 可选思考等级（data.models[].reasoning.supportedEfforts）；无等级可选的模型缺省。 */
   reasoningEfforts?: string[]
   /** 默认思考等级（data.models[].reasoning.defaultEffort）。 */
   defaultReasoningEffort?: string
+}
+
+/**
+ * 归一化 `data.models[].credits` 为可展示的倍率文本。
+ *
+ * 真实形态（2026-09-19 实测，**字符串**而非数字）：
+ * - `"x0.29"` / `"x1.62"` —— 常态（**x 在前**）
+ * - `"x0.03 credits"` —— 早期 scoped 端点会带 ` credits` 后缀
+ * - `""` / 字段缺失 —— 无倍率信息（如 `auto` / `codewise-*`）
+ *
+ * 返回 `"x0.29"` 这类**纯展示文本**（统一成 `x` 前缀，与官方 UI 一致）。
+ * 解析不出时返回 undefined，**不回退成 `x1`**：编造倍率比不显示更糟。
+ */
+export function normalizeCreditsRate(value: unknown): string | undefined {
+  return normalizeRate(value, /^(?:x(\d+(?:\.\d+)?))\b/i, /^(\d+(?:\.\d+)?)x\b/i)
+}
+
+/**
+ * 归一化 `modelPromotions[].discount.discountedCredits`。
+ *
+ * ⚠️ 与 {@link normalizeCreditsRate} **形态相反**：实测促销值是 `"0.50x"`
+ * （**x 在后**），而模型的 `credits` 是 `"x0.29"`（x 在前）。两者是同一后端
+ * 的两套写法，不能共用一个正则 —— 早期版本只认前缀，导致**促销价全部解析
+ * 失败且静默丢失**（单测直接暴露了这一点）。
+ *
+ * 另有一种已结束占位值 `"0x"`，归一化后是 `x0`，由调用方排除。
+ */
+export function normalizeDiscountedRate(value: unknown): string | undefined {
+  return normalizeRate(value, /^(?:x(\d+(?:\.\d+)?))\b/i, /^(\d+(?:\.\d+)?)x\b/i)
+}
+
+/**
+ * 倍率文本的共用解析：先试前缀写法，再试后缀写法，统一输出 `x<数字>`。
+ *
+ * 两种写法都接受（而非按调用方区分），是为了对上游格式变更更鲁棒：
+ * 实测已经出现过同一后端两套写法共存的情况，若将来它们互换，本函数仍正确。
+ */
+function normalizeRate(value: unknown, prefixed: RegExp, suffixed: RegExp): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const text = value.trim()
+  // 去掉可能存在的单位后缀（如 "x0.03 credits"）。
+  const head = text.split(/\s+/)[0] ?? ''
+  const match = prefixed.exec(head) ?? suffixed.exec(head)
+  return match?.[1] !== undefined ? `x${match[1]}` : undefined
+}
+
+/**
+ * 从 `data.modelPromotions` 提取「模型 id → 促销价」映射。
+ *
+ * 真实结构（**数组**，不是对象；每项按 `modelIds` 关联，不是全局）：
+ * ```json
+ * [{ "kind": "discount", "enabled": true,
+ *    "discount": { "discountedCredits": "0.50x", "displayMode": "strikethrough" },
+ *    "modelIds": ["deepseek-v4-flash", "deepseek-v4-flash-ioa"] }]
+ * ```
+ *
+ * 三个必须处理的退化情形：
+ * - `"0x"` —— 活动已结束占位，**视为无促销**（照显会误导用户以为免费）；
+ * - `enabled: false` —— 已停用，跳过；
+ * - 同一模型命中多个活动 —— 取 `priority` 最高者（服务端用该字段表达优先级）。
+ */
+export function parsePromotions(record: Record<string, unknown>): Map<string, string> {
+  const result = new Map<string, string>()
+  const promotions = record.modelPromotions
+  if (!Array.isArray(promotions)) return result
+  // 按 priority 升序排序后依次写入，使高 priority 覆盖低 priority。
+  const sorted = [...promotions].sort((a, b) => priorityOf(a) - priorityOf(b))
+  for (const item of sorted) {
+    if (typeof item !== 'object' || item === null) continue
+    const promotion = item as Record<string, unknown>
+    if (promotion.enabled === false) continue
+    const discount = promotion.discount
+    if (typeof discount !== 'object' || discount === null) continue
+    const rate = normalizeDiscountedRate((discount as Record<string, unknown>).discountedCredits)
+    // "0x" 表示活动已结束：normalizeCreditsRate 会得到 "x0"，此处显式排除。
+    if (rate === undefined || rate === 'x0') continue
+    const modelIds = promotion.modelIds
+    if (!Array.isArray(modelIds)) continue
+    for (const id of modelIds) {
+      if (typeof id === 'string' && id.length > 0) result.set(id, rate)
+    }
+  }
+  return result
+}
+
+/** 读取促销项的 priority；缺失或非法时按 0（最低）处理。 */
+function priorityOf(item: unknown): number {
+  if (typeof item !== 'object' || item === null) return 0
+  const priority = (item as Record<string, unknown>).priority
+  return typeof priority === 'number' && Number.isFinite(priority) ? priority : 0
+}
+
+/**
+ * 组合计费倍率的展示文案：有促销时标出促销价，否则只显示原价。
+ *
+ * 形态：`"x0.17→x0.50"`；无促销时 `"x0.03"`。
+ *
+ * 用箭头而非「（促销 x…）」：这段文案会被拼进**模型切换菜单的名字**里
+ * （见 buddy-adapter 的 displayNameFor），菜单宽度有限，箭头更短且一眼
+ * 看出折扣幅度。
+ */
+export function formatCreditsRate(
+  rate: string | undefined,
+  discounted: string | undefined,
+): string | undefined {
+  if (rate === undefined) return discounted
+  return discounted !== undefined ? `${rate}→${discounted}` : rate
 }
 
 /**
@@ -470,6 +593,10 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
     }
   }
 
+  // 促销折扣是**独立于 data.models 的全局活动表**，故先解析成 id → 促销价映射，
+  // 再在 push 时按 id 关联（见 parsePromotions 的注释）。
+  const promotions = parsePromotions(record)
+
   const parsed: BuddyRemoteModel[] = []
   const seen = new Set<string>()
   const push = (id: string): void => {
@@ -480,7 +607,15 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
     // 静态表只在服务端未给 name 时兜底 —— 新模型不在静态表里，
     // 而静态表对老模型的叫法可能已过时（如 kimi-k2.6 旧名 Kimi K2.6）。
     const remoteName = typeof meta?.name === 'string' && meta.name.length > 0 ? meta.name : undefined
-    parsed.push({ id, name: remoteName ?? displayNameForModel(id), ...parseModelMeta(meta) })
+    const rate = normalizeCreditsRate(meta?.credits)
+    const discounted = promotions.get(id)
+    parsed.push({
+      id,
+      name: remoteName ?? displayNameForModel(id),
+      ...parseModelMeta(meta),
+      ...rate !== undefined ? { creditsRate: rate } : {},
+      ...discounted !== undefined ? { discountedCreditsRate: discounted } : {},
+    })
   }
 
   // 1. 主对话 agent 引用的模型优先。
@@ -515,7 +650,16 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
   for (const id of trialModelIds(record)) {
     if (id === 'auto' || seen.has(id)) continue
     seen.add(id)
-    parsed.push({ id, name: displayNameForModel(id), ...parseModelMeta(metaById.get(id)) })
+    const meta = metaById.get(id)
+    const rate = normalizeCreditsRate(meta?.credits)
+    const discounted = promotions.get(id)
+    parsed.push({
+      id,
+      name: displayNameForModel(id),
+      ...parseModelMeta(meta),
+      ...rate !== undefined ? { creditsRate: rate } : {},
+      ...discounted !== undefined ? { discountedCreditsRate: discounted } : {},
+    })
   }
 
   return parsed

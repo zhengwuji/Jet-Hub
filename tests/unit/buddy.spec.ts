@@ -5,10 +5,13 @@ import {
   credentialExpiresAtMs,
   credentialRequestHeaders,
   displayNameForModel,
+  formatCreditsRate,
   isExpired,
   isRefreshable,
+  normalizeCreditsRate,
   parseAccountData,
   parseModelsFromConfig,
+  parsePromotions,
   parseTokenData,
 } from '../../src/buddy.js'
 
@@ -394,5 +397,104 @@ describe('buddy model config parsing', () => {
   it('displayNameForModel falls back to the raw id', () => {
     expect(displayNameForModel('deepseek-v4-flash')).toBe('DeepSeek V4 Flash')
     expect(displayNameForModel('some-unknown-model')).toBe('some-unknown-model')
+  })
+
+  // ── 计费倍率（credits）解析 ──
+  //
+  // 真实形态（2026-09-19 实测 /v3/config）：`data.models[].credits` 是
+  // **字符串** `"x0.29"`，早期 scoped 端点会带 ` credits` 后缀，无倍率信息时
+  // 是空串或字段缺失。归一化必须宽容这些退化形态，但**绝不编造**倍率。
+  describe('计费倍率解析', () => {
+    it('normalizeCreditsRate 提取 x<数字> 前缀并容忍后缀', () => {
+      expect(normalizeCreditsRate('x0.29')).toBe('x0.29')
+      expect(normalizeCreditsRate('x1.62')).toBe('x1.62')
+      // 早期 scoped 端点真实形态。
+      expect(normalizeCreditsRate('x0.03 credits')).toBe('x0.03')
+      expect(normalizeCreditsRate('  x0.5  ')).toBe('x0.5')
+    })
+
+    it('normalizeCreditsRate 对无倍率信息返回 undefined 而非编造', () => {
+      expect(normalizeCreditsRate('')).toBeUndefined()
+      expect(normalizeCreditsRate(undefined)).toBeUndefined()
+      expect(normalizeCreditsRate(null)).toBeUndefined()
+      expect(normalizeCreditsRate(0.29)).toBeUndefined()
+      // 非法形态不得被强行解析成 "x0"。
+      expect(normalizeCreditsRate('free')).toBeUndefined()
+      expect(normalizeCreditsRate('0.29')).toBeUndefined()
+    })
+
+    it('credits 字段写入 creditsRate（字符串，非数字）', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['deepseek-v4.1-flash', 'bare'] }],
+          models: [
+            { id: 'deepseek-v4.1-flash', credits: 'x0.03 credits' },
+            { id: 'bare' },
+          ],
+        },
+      })
+      expect(models[0]?.creditsRate).toBe('x0.03')
+      // 无 credits 的模型不带该字段（而非 undefined 占位）。
+      expect(models[1]).not.toHaveProperty('creditsRate')
+    })
+
+    it('parsePromotions 按 modelIds 关联并跳过已结束的 0x 活动', () => {
+      const promotions = parsePromotions({
+        modelPromotions: [
+          {
+            kind: 'discount', enabled: true, priority: 100,
+            discount: { discountedCredits: '0.50x' },
+            modelIds: ['deepseek-v4-flash'],
+          },
+          {
+            // 活动已结束的占位形态：必须被当成「无促销」，
+            // 否则用户会误以为免费。
+            kind: 'discount', enabled: true, priority: 100,
+            discount: { discountedCredits: '0x' },
+            modelIds: ['kimi-k3-1'],
+          },
+          {
+            kind: 'discount', enabled: false, priority: 100,
+            discount: { discountedCredits: '0.10x' },
+            modelIds: ['glm-5.3'],
+          },
+        ],
+      })
+      expect(promotions.get('deepseek-v4-flash')).toBe('x0.50')
+      expect(promotions.has('kimi-k3-1')).toBe(false)
+      expect(promotions.has('glm-5.3')).toBe(false)
+    })
+
+    it('parsePromotions 同模型多活动时取 priority 最高者', () => {
+      const promotions = parsePromotions({
+        modelPromotions: [
+          { enabled: true, priority: 10, discount: { discountedCredits: '0.10x' }, modelIds: ['m'] },
+          { enabled: true, priority: 999, discount: { discountedCredits: '0.90x' }, modelIds: ['m'] },
+          { enabled: true, priority: 100, discount: { discountedCredits: '0.50x' }, modelIds: ['m'] },
+        ],
+      })
+      expect(promotions.get('m')).toBe('x0.90')
+    })
+
+    it('促销价随模型一起下发', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['deepseek-v4-flash'] }],
+          models: [{ id: 'deepseek-v4-flash', credits: 'x0.17' }],
+          modelPromotions: [
+            { enabled: true, priority: 100, discount: { discountedCredits: '0.50x' }, modelIds: ['deepseek-v4-flash'] },
+          ],
+        },
+      })
+      expect(models[0]?.creditsRate).toBe('x0.17')
+      expect(models[0]?.discountedCreditsRate).toBe('x0.50')
+    })
+
+    it('formatCreditsRate 在有促销时用箭头标出促销价', () => {
+      expect(formatCreditsRate('x0.03', undefined)).toBe('x0.03')
+      expect(formatCreditsRate('x0.17', 'x0.50')).toBe('x0.17→x0.50')
+      expect(formatCreditsRate(undefined, 'x0.50')).toBe('x0.50')
+      expect(formatCreditsRate(undefined, undefined)).toBeUndefined()
+    })
   })
 })

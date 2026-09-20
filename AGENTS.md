@@ -219,6 +219,105 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - 排查脚本（均为**只读 GET**，零模型额度）：`scripts/dump-max-output.mjs`
   导出全模型 `id → maxOutputTokens`；`scripts/probe-max-output.mjs` 打印原始条目
 
+## 模型计费倍率与同名模型（必须写进 `name`，不是 `description`）
+
+**倍率必须拼进 `name`。** 这是被用户报障纠正过的结论：
+
+- composer 的**模型切换菜单只渲染 `name`** —— `dsh-client-ui-model-selection`
+  的 ModelSelect 里只有 `title: model.name` 与 `children: model.name`，
+  **完全不读 `description`**。
+- `description` 只在 **`/model` 弹窗**里用（`optionsOf` 的 `detail`，渲染成
+  `提供方 · description`）。
+
+**真实缺陷**（用户报障）：「消耗倍率没有显示在切换模型列表的后面」——
+早期版本把倍率放进 `description`（因为误以为那是"唯一的展示位"），
+结果在切换菜单里根本不可见。
+
+安全性：`name` **纯属展示**，DSH 的选择与持久化只用 `id`
+（`selectionOf` 返回 `model: model.id`），故附加价格不会污染会话历史。
+
+展示形态：`Deepseek-V4.1-Flash · x0.03`；有促销时 `GLM-5.3 · x0.79→x0.50`
+（箭头比「（促销 …）」短，适合窄菜单）。
+
+三套远端的倍率字段**形态互不相同**，绝不可共用解析：
+
+| provider | 字段 | 真实形态 | 归一化 |
+|---|---|---|---|
+| `buddy` / `workbuddy` | `data.models[].credits` | **字符串 `"x0.29"`**（x 在前），早期带 `"x0.03 credits"` 后缀，可为空串 | `normalizeCreditsRate` |
+| `buddy` / `workbuddy` | `modelPromotions[].discount.discountedCredits` | **字符串 `"0.50x"`（x 在后！）**，已结束占位为 `"0x"` | `normalizeDiscountedRate` |
+| `lobsterai` | `data[].costMultiplier` | **裸数字 `0.05`** | `displayNameFor` 里拼 `x${n}` |
+| `qoder` | 目录 `chat[].price_factor` | **裸数字**，`0` = **免费**，另有 `original_price_factor` + `promotion` | `qoderDisplayName` |
+| `codearts` | 无 | 两个目录端点都不含计费字段 | — |
+
+要点与坑：
+
+- ⚠️ **`credits` 与 `discountedCredits` 的 x 位置相反**（`"x0.29"` vs `"0.50x"`）。
+  早期版本只认前缀写法，导致**促销价全部静默丢失** —— 单测直接暴露了它。
+  两个 `normalize*` 函数各自接受两种写法（对上游格式变更更鲁棒）
+- ⚠️ **`"0x"` 是「活动已结束」占位**，必须当成无促销，否则用户会误以为免费
+- ⚠️ `modelPromotions` 是**数组**（不是对象），且用 `modelIds[]` **按模型关联**
+  （不是全局折扣）；同模型命中多个活动时取 `priority` 最高者
+- ⚠️ **LobsterAI 的 `description` 可能已自带倍率文案**（实测 DeepSeek-V4.1-Flash
+  写着「分时计价：当前空闲时段 x0.05…」）。前置倍率前必须 `includes` 判重，
+  否则出现「x0.05 · …x0.05…」重复
+- `reconcileWithFallback` 是**白名单式重建**：新增的远端字段不在此显式搬运就会
+  被静默丢弃（`creditsRate` / `discountedCreditsRate` 已加）
+
+### Qoder 倍率（`price_factor`，与腾讯系语义不同）
+
+模型目录来自本机加密缓存 `~/.qoder/.models/{uid}/catalog-v6`
+（`chat` 场景 17 个模型），倍率字段是 **`price_factor`**：
+
+- ⚠️ **不是 `cost_multiplier`** —— 那是 LobsterAI 的字段名，两者易混
+- ⚠️ **`price_factor: 0` 是「免费」**（实测 `qfmodel` / Qwen3.8-Flash），
+  **0 是合法值**，不能用 `> 0` 过滤，否则恰好漏掉用户最关心的免费模型。
+  展示为「免费」而非 `x0`
+- 另有 `original_price_factor`（如 `qfmodel` 的 0.1 = 免费前的原价）
+- **错峰折扣只在 `promotion.active === true` 时展示**：`active: false` 表示
+  当前不在折扣时段，显示折扣价会让用户按折扣价预期、实际被按原价计费。
+  实测三个 `promotion` 全部是 `active: false`，窗口统一 22:00–08:00
+- `resolveModel` 的 `name` **不带**倍率后缀（价格只属于选择列表语境）
+
+**解密该缓存**（`decryptModelCatalog`，`src/qoder-wasm.ts`）：
+
+⚠️ **第二个参数是 `uid`，不是 `machine_id`**。两个官方调用点容易读反：
+目录缓存的 `readSharedCacheSnapshot(A)` 传 uid，BYOK 的
+`model_cache_decrypt(i, n)` 传 machineId。传错会得到
+`AES-GCM decrypt failed: aead::Error` —— 看着像密文损坏，实为参数错。
+调试脚本：`scripts/probe-qoder-catalog-debug.mjs`（两个候选都试）、
+`scripts/probe-qoder-pricing.mjs`（打印 17 个模型的计费字段全貌）
+
+### 同名模型必须消歧（`buildDisplayNames`）
+
+远端会给**不同 id 配同一个 `name`**，而 DSH 按 `name` 展示 → 列表里出现
+两个完全一样的条目。实测三组：
+
+| 组 | 远端 name | 区别 |
+|---|---|---|
+| `deepseek-v4.1-flash` / `-sg` | 都是 `Deepseek-V4.1-Flash` | 新加坡区，`credits` x0.00 vs x0.03 |
+| `hy3` / `hy3-x` | 都是 `Hy3` | — |
+| `hy4-preview-f` / `hy4-preview` | 都是 `Hy4 preview` | — |
+
+**用户报障**：「workbuddy 国际版同时显示 2 个 ds v4.1 flash，IDE 只有一个」。
+IDE 按 name 归并，我们按 id 列出。二者是**不同区域的独立计费实体**，
+不能靠丢弃其一来回避。
+
+- 算法：对每组同名 id 求**公共前缀**，剩余段作为变体标记追加
+  （`Deepseek-V4.1-Flash · x0.03 SG`、`Hy3 · x0.05 X`），空剩余段者不加标记
+- ⚠️ **不要硬编码 `-sg`**：撞车组随服务端上新变化，本次实测三组里只有一组是
+  `-sg`；也不要「取 id 最后一段」（会把 `gpt-5.6-sol` 的 `sol` 当变体）。
+  公共前缀只在**确实撞车时**才切分
+- ⚠️ **倍率与变体标记都只在 `name` 里出现一次**：初版两处都写，
+  端到端实测出现重复文案与「计费 x0.00 · 」这种孤立分隔符
+- LobsterAI **实测无同名**（28 个模型，0 组重名），故它不做消歧；
+  兜底表路径也**不显示倍率**（兜底表无该字段，不猜价格）
+
+排查脚本（全部只读 GET，零模型额度）：`scripts/probe-pricing.mjs`（各 provider
+计费字段）、`scripts/probe-promotions.mjs`（`credits` 全量与促销结构）、
+`scripts/probe-lobsterai-cost.mjs`（LobsterAI 倍率归属）、
+`scripts/probe-lobsterai-dupes.mjs`（LobsterAI 同名检查）、
+`scripts/verify-description.mjs`（端到端打印**切换菜单实际渲染的 name**）
+
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
 同一 `jet-hub` 命名空间的 `disabledModels` 字段保存「被关闭的模型」，形如 `{ buddy: { 'glm-5.2': true } }`。要点：

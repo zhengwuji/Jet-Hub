@@ -224,6 +224,22 @@ describe('LobsterAI 远端模型参数解析', () => {
       expect(model!.thinkingConfig, JSON.stringify(bad)).toBeUndefined()
     }
   })
+
+  // 计费倍率：远端 `costMultiplier` 是**裸数字**（实测 0.05 / 1.08 / 20），
+  // 与 buddy 系的字符串 `"x0.05"` 形态完全不同，故各自解析。
+  it('costMultiplier 解析为数字（裸数字，非 buddy 的 x 前缀串）', () => {
+    const [model] = parseLobsteraiModels({
+      code: 0, data: [{ modelId: 'deepseek-flash', modelName: 'DS', costMultiplier: 0.05 }],
+    })
+    expect(model!.costMultiplier).toBe(0.05)
+  })
+
+  it('costMultiplier 缺失或非正数时不带该字段', () => {
+    const [missing] = parseLobsteraiModels({ code: 0, data: [{ modelId: 'm1' }] })
+    expect(missing).not.toHaveProperty('costMultiplier')
+    const [zero] = parseLobsteraiModels({ code: 0, data: [{ modelId: 'm2', costMultiplier: 0 }] })
+    expect(zero).not.toHaveProperty('costMultiplier')
+  })
 })
 
 describe('LobsterAI 模型列表 query', () => {
@@ -309,6 +325,47 @@ describe('LobsteraiAdapter 模型目录', () => {
     })
     const models = await adapter.listModels('lobsterai')
     expect(models).toEqual([{ provider: 'lobsterai', id: 'remote-only', name: 'Remote Only', inputModalities: ['text'] }])
+  })
+
+  // 计费倍率展示。⚠️ **必须写进 `name`，不是 `description`**：composer 的模型
+  // 切换菜单只渲染 `name`（ModelSelect 的 `children: model.name`），
+  // `description` 仅用于 `/model` 弹窗。用户报障「消耗倍率没有显示在切换模型
+  // 列表的后面」正是因为放在了 `description`。
+  describe('listModels 的计费倍率', () => {
+    it('裸数字 costMultiplier 补 x 前缀并追加到 name', async () => {
+      const { adapter } = makeAdapter(() => textSse('x'), {
+        fetchRemoteModels: async () => [{ id: 'm', name: 'M', costMultiplier: 0.05 }],
+      })
+      const models = await adapter.listModels('lobsterai')
+      expect(models[0]?.name).toBe('M · x0.05')
+    })
+
+    it('远端原始 description 原样透传，不被倍率污染', async () => {
+      const { adapter } = makeAdapter(() => textSse('x'), {
+        fetchRemoteModels: async () => [{ id: 'm', name: 'M', costMultiplier: 1.08, description: '很强大的模型' }],
+      })
+      const models = await adapter.listModels('lobsterai')
+      // 倍率只在 name 里出现一次，description 保持远端原文。
+      expect(models[0]?.name).toBe('M · x1.08')
+      expect(models[0]?.description).toBe('很强大的模型')
+    })
+
+    it('无倍率信息时 name 保持原样', async () => {
+      const { adapter } = makeAdapter(() => textSse('x'), {
+        fetchRemoteModels: async () => [{ id: 'm', name: 'M' }],
+      })
+      const models = await adapter.listModels('lobsterai')
+      expect(models[0]?.name).toBe('M')
+    })
+
+    // 远端整体失败时回退兜底表，而兜底表**不含倍率**（编译期快照，价格会变）
+    // —— 此时不显示倍率，而不是猜一个。
+    it('兜底表路径不显示倍率（兜底表无该字段）', async () => {
+      const { adapter } = makeAdapter(() => textSse('x'), { fetchRemoteModels: async () => [] })
+      for (const model of await adapter.listModels('lobsterai')) {
+        expect(model.name).not.toContain('· x')
+      }
+    })
   })
 
   it('远端返回空数组时回退兜底目录', async () => {

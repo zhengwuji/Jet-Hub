@@ -158,7 +158,9 @@ export class QoderAdapter extends LlmAdapter {
     return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
-      name: model.name,
+      // 倍率拼进 `name`（**不是** `description`）：composer 的模型切换菜单
+      // 只渲染 name，description 仅用于 /model 弹窗。见 qoderDisplayName。
+      name: qoderDisplayName(model),
       inputModalities: this.inputModalitiesFor(model.id),
     }))
   }
@@ -366,6 +368,33 @@ export class QoderAdapter extends LlmAdapter {
       throw error
     }
   }
+}
+
+/**
+ * 生成模型选择器里显示的名字：`Qwen3.8-Flash · 免费` / `GLM-5.3 · x0.6`。
+ *
+ * ⚠️ **倍率必须写进 `name` 而不是 `description`**：composer 的模型切换菜单
+ * 只渲染 `name`（见 dsh-client-ui-model-selection 的 ModelSelect：
+ * `children: model.name`），`description` 仅用于 `/model` 弹窗。
+ *
+ * 展示规则（Qoder 目录的 `price_factor` 语义与腾讯系不同，故单独实现）：
+ * - `priceFactor === 0` → **「免费」**，不显示 `x0`（用户关心的是"不要钱"）；
+ * - 其余 → `x<值>`（如 `x0.6`）；
+ * - 仅在**促销生效中**（`promotion.active === true`）才附折扣角标 ——
+ *   `active: false` 表示当前不在错峰时段，显示折扣价会让用户按折扣价预期、
+ *   实际被按原价计费。
+ */
+function qoderDisplayName(model: QoderFallbackModel): string {
+  const parts: string[] = []
+  if (model.priceFactor === 0) {
+    parts.push('免费')
+  } else if (model.priceFactor !== undefined) {
+    parts.push(`x${model.priceFactor}`)
+  }
+  if (model.promotion?.active === true && model.promotion.badgeZh !== undefined) {
+    parts.push(model.promotion.badgeZh)
+  }
+  return parts.length > 0 ? `${model.name} · ${parts.join(' ')}` : model.name
 }
 
 /**

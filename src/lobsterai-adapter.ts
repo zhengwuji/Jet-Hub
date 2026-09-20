@@ -124,15 +124,24 @@ export interface LobsteraiThinkingConfig {
  * 输入，后者只能保守按不支持处理 —— 填 false 会让将来新增的视觉模型被
  * 静默误判。
  *
- * `runtimeProfile` / `supportsToolCalling` / `agenticReady` / `costMultiplier`
- * 等字段**当前不消费**：前三个是 IDE 内置 agent 内核（OpenClaw）的编排概念，
+ * `runtimeProfile` / `supportsToolCalling` / `agenticReady`
+ * 等字段**当前不消费**：它们是 IDE 内置 agent 内核（OpenClaw）的编排概念，
  * 本插件只做 OpenAI 兼容转发，没有对应语义。
+ *
+ * `costMultiplier` **消费**（2026-09-19 起）：它是计费倍率，展示在模型选择器里。
  */
 export interface LobsteraiRemoteModel {
   id: string
   name: string
   /** 上下文窗口（远端权威值；缺失时由兜底表补位）。 */
   contextWindow?: number
+  /**
+   * 计费倍率（`data.costMultiplier`）。
+   *
+   * ⚠️ 与 buddy 系的 `credits` **形态完全不同**：本处是**裸数字**（实测 `0.05`），
+   * 而 buddy 是字符串 `"x0.05"`。不要共用解析函数。
+   */
+  costMultiplier?: number
   /** 是否接受图片输入。 */
   supportsImage?: boolean
   /** 是否支持思考（无 `thinkingConfig` 时无可选档位，仅作展示参考）。 */
@@ -258,6 +267,10 @@ export function parseLobsteraiModels(body: unknown): LobsteraiRemoteModel[] {
     }
     const description = readStringField(record, 'description')
     if (description.length > 0) model.description = description
+    // 计费倍率：**裸数字**（实测 0.05 / 1.08 / 20）。与 buddy 系的字符串
+    // `"x0.05"` 形态不同，故各自解析。只在为正数时带上（0 在业务上无意义）。
+    const costMultiplier = readNumberField(record, 'costMultiplier')
+    if (costMultiplier !== undefined && costMultiplier > 0) model.costMultiplier = costMultiplier
 
     models.push(model)
   }
@@ -677,9 +690,16 @@ export class LobsteraiAdapter extends LlmAdapter {
    * **不做 buddy 那样的「以兜底表为准」裁剪**（`reconcileWithFallback`）：
    * LobsterAI 的远端接口是**权威的**（产品兜底表本身就是从它实测抄来的），
    * 远端可用时应完全采信，兜底只在远端整体失败时顶替。
+   *
+   * ⚠️ 兜底表**不含 `costMultiplier`**：它是编译期快照，而价格会变；
+   * 远端整体失败时拿不到权威倍率，此时**不显示**倍率（不猜）。
    */
-  private staticFallbackModels(): readonly { id: string; name: string }[] {
-    return this.product.fallbackModels.map((model) => ({ id: model.id, name: model.name }))
+  private staticFallbackModels(): readonly LobsteraiRemoteModel[] {
+    return this.product.fallbackModels.map((model) => ({
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow,
+    }))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
@@ -693,7 +713,10 @@ export class LobsteraiAdapter extends LlmAdapter {
     return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
-      name: model.name,
+      // 倍率写进 name（**不是** description）：composer 的模型切换菜单只渲染
+      // `name`，description 仅用于 /model 弹窗。见 displayNameFor 的说明。
+      name: displayNameFor(model),
+      ...model.description !== undefined ? { description: model.description } : {},
       // 远端 supportsImage 权威；未声明时保守报 text（见 inputModalitiesFor）。
       inputModalities: this.inputModalitiesFor(model.id),
     }))
@@ -1226,6 +1249,26 @@ export class LobsteraiAdapter extends LlmAdapter {
         : { kind: 'stop' as const }
     yield { type: 'finish', reason }
   }
+}
+
+/**
+ * 生成模型选择器里显示的名字：`模型名 · x0.05`。
+ *
+ * ⚠️ **倍率必须写进 `name` 而不是 `description`**：composer 的模型切换菜单
+ * 只渲染 `name`（见 dsh-client-ui-model-selection 的 ModelSelect：
+ * `children: model.name`），`description` 仅用于 `/model` 弹窗。用户报障
+ * 「消耗倍率没有显示在切换模型列表的后面」正是因为早期版本放在了
+ * `description`。
+ *
+ * 安全性：`name` **纯属展示** —— DSH 的选择与持久化只用 `id`
+ * （`selectionOf` 返回 `model: model.id`），故附加价格不会污染会话。
+ *
+ * 形态差异：本 provider 的 `costMultiplier` 是**裸数字**（`0.05`），
+ * 展示时补 `x` 前缀（buddy 系远端给的字符串本身已带 `x`）。
+ */
+function displayNameFor(model: LobsteraiRemoteModel): string {
+  if (model.costMultiplier === undefined) return model.name
+  return `${model.name} · x${model.costMultiplier}`
 }
 
 /**

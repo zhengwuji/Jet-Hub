@@ -301,6 +301,76 @@ bundle）。
 > `completion_tokens`（实测 `thinking` 内容与正文同池），故思考开到 `max`
 > 时正文更早撞上上限。
 
+### 模型计费倍率与同名模型
+
+模型切换列表里每个模型后面会显示它的**计费倍率**：
+
+```
+Deepseek-V4.1-Flash · x0.03
+GLM-5.3 · x0.79→x0.50          ← 有促销活动时显示 原价→促销价
+```
+
+倍率拼在**模型名**（`name`）后面，而不是说明（`description`）里 ——
+composer 的模型切换菜单**只渲染 `name`**，`description` 仅用于 `/model` 弹窗。
+`name` 纯属展示，DSH 的选择与持久化只用 `id`，所以附加价格不会影响会话。
+
+各 provider 的倍率字段**形态互不相同**，实现里是分开解析的：
+
+| provider | 远端字段 | 真实形态 |
+|---|---|---|
+| `buddy` / `workbuddy` | `data.models[].credits` | 字符串 `"x0.29"`（可为空串） |
+| `buddy` / `workbuddy` | `modelPromotions[].discount.discountedCredits` | 字符串 `"0.50x"`（**x 在后**） |
+| `lobsterai` | `data[].costMultiplier` | 裸数字 `0.05` |
+| `qoder` | 目录 `chat[].price_factor` | 裸数字，**`0` = 免费** |
+| `codearts` | 无 | 两个目录端点都不含计费字段 |
+
+已结束的促销占位值 `"0x"` 被当作无促销（否则用户会误以为免费）。
+
+Qoder 的免费模型（`price_factor: 0`）显示为「免费」而不是 `x0`：
+
+```
+Qwen3.8-Flash · 免费
+DeepSeek-V4-Pro · x0.8
+```
+
+> ⚠️ `credits` 与 `discountedCredits` 的 `x` **位置相反**（`"x0.29"` vs
+> `"0.50x"`）。早期版本只认前缀写法，导致促销价被静默丢弃。
+>
+> ⚠️ Qoder 的字段是 `price_factor`，**不是** `cost_multiplier`（后者是
+> LobsterAI 的）。而 `price_factor: 0` 是**合法的免费值**，不能用 `> 0`
+> 过滤掉。
+>
+> ⚠️ 倍率**不能**放进 `description`：那在切换模型列表里根本不可见
+> （用户报障「消耗倍率没有显示在切换模型列表的后面」）。
+>
+> 错峰折扣只在**当前生效**时显示：Qoder 目录的 `promotion.active` 为 `false`
+> 表示还没到折扣时段，此时按原价计费，显示折扣价会误导用户。
+
+#### 同名模型会自动区分
+
+服务端会给**不同 id 配同一个展示名**，实测三组：
+
+| 模型 id | 远端展示名 | 实际差异 |
+|---|---|---|
+| `deepseek-v4.1-flash` / `deepseek-v4.1-flash-sg` | 都是 `Deepseek-V4.1-Flash` | 新加坡区，倍率 x0.00 vs x0.03 |
+| `hy3` / `hy3-x` | 都是 `Hy3` | — |
+| `hy4-preview-f` / `hy4-preview` | 都是 `Hy4 preview` | — |
+
+由于选择器按展示名渲染，这些会变成无法区分的重复条目（用户报障：
+「workbuddy 国际版同时显示 2 个 ds v4.1 flash，IDE 只有一个」——IDE 按展示名
+归并，本插件按 id 列出）。二者是**不同区域的独立计费实体**，不能简单丢弃其一，
+故对撞车的 id 求公共前缀、把剩余段追加到名字后：
+
+```
+Deepseek-V4.1-Flash · x0.00        (deepseek-v4.1-flash)
+Deepseek-V4.1-Flash · x0.03 SG     (deepseek-v4.1-flash-sg)
+Hy3 · x0.00                        (hy3)
+Hy3 · x0.05 X                      (hy3-x)
+```
+
+用公共前缀而不是硬编码 `-sg`，是因为撞车组会随服务端上新变化（本次实测三组
+里只有一组带 `-sg`）。LobsterAI 实测无同名（28 个模型 0 组重名），故不做消歧。
+
 ## WorkBuddy provider（国际版）
 
 独立路由 `workbuddy`（腾讯 **WorkBuddy 国际版 / WorkBuddy AI**），与

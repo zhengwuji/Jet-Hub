@@ -26,6 +26,7 @@ import {
   HTTP_HEADER_PRODUCT,
   HTTP_HEADER_PRODUCT_CODE,
   credentialExpiresAtMs,
+  formatCreditsRate,
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
@@ -655,6 +656,13 @@ export class BuddyAdapter extends LlmAdapter {
         ...entry.defaultReasoningEffort !== undefined || remote?.defaultReasoningEffort !== undefined
           ? { defaultReasoningEffort: remote?.defaultReasoningEffort ?? entry.defaultReasoningEffort }
           : {},
+        // 计费倍率只可能来自远端（兜底表是编译期快照，价格会变，不写死）。
+        // 注意本函数是**白名单式重建**：不在这里显式搬运的字段会被静默丢弃，
+        // 新增远端字段时必须同步加一行，否则 listModels 看不到它。
+        ...remote?.creditsRate !== undefined ? { creditsRate: remote.creditsRate } : {},
+        ...remote?.discountedCreditsRate !== undefined
+          ? { discountedCreditsRate: remote.discountedCreditsRate }
+          : {},
       }
     })
   }
@@ -736,7 +744,7 @@ export class BuddyAdapter extends LlmAdapter {
     return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
-      name: model.name,
+      name: displayNameFor(model, listed),
       inputModalities: this.inputModalitiesFor(model.id),
     }))
   }
@@ -1313,6 +1321,69 @@ export class BuddyAdapter extends LlmAdapter {
 function isCredentialExpired(credential: BuddyCredential): boolean {
   const expiresAt = credentialExpiresAtMs(credential)
   return expiresAt === undefined ? false : Date.now() >= expiresAt
+}
+
+/**
+ * 生成模型选择器里显示的名字，承载**两类**信息：计费倍率与同名消歧。
+ *
+ * ⚠️ **必须写进 `name` 而不是 `description`**：composer 的模型切换菜单只渲染
+ * `name`（见 ModelSelect 的 `children: model.name`），`description` 仅用于
+ * `/model` 弹窗。用户报障「消耗倍率没有显示在切换模型列表的后面」正是因为
+ * 早期版本放在了 `description`。
+ *
+ * 安全性：`name` **纯属展示** —— DSH 的选择与持久化只用 `id`
+ * （见 `selectionOf` 返回 `model: model.id`），故在名字里附加价格不会污染会话。
+ *
+ * 形如 `Deepseek-V4.1-Flash · x0.03`；有促销时 `· x0.17→x0.50`（用箭头而
+ * 不是「（促销 …）」，避免在窄菜单里过长）。同名撞车时再加变体标记。
+ */
+function displayNameFor(model: BuddyRemoteModel, all: readonly BuddyRemoteModel[]): string {
+  const suffix = displaySuffix(model, all)
+  return suffix.length > 0 ? `${model.name} · ${suffix}` : model.name
+}
+
+/** 组装展示名的后缀部分：倍率 + 同名变体标记。 */
+function displaySuffix(model: BuddyRemoteModel, all: readonly BuddyRemoteModel[]): string {
+  const parts: string[] = []
+  // 倍率：有促销时用 `原价→促销价` 一眼看出折扣幅度。
+  const rate = formatCreditsRate(model.creditsRate, model.discountedCreditsRate)
+  if (rate !== undefined) parts.push(rate)
+  // 同名消歧：只在**确实撞车**时追加，避免影响其它模型。
+  const variant = variantLabelFor(model, all)
+  if (variant.length > 0) parts.push(variant)
+  return parts.join(' ')
+}
+
+/**
+ * 判断该模型是否需要变体标记，需要时返回标记文本。
+ *
+ * 远端会给**不同 id 配同一个 name**（实测 `deepseek-v4.1-flash` /
+ * `deepseek-v4.1-flash-sg` 都是 "Deepseek-V4.1-Flash"；`hy3`/`hy3-x` 都是
+ * "Hy3"），而选择器按 name 展示 → 出现无法区分的重复条目。
+ *
+ * 用**公共前缀**切分而非硬编码 `-sg`：撞车组随服务端上新变化（本次实测三组
+ * 里只有一组带 `-sg`）；也不用「取 id 最后一段」（会把 `gpt-5.6-sol` 的
+ * `sol` 当变体）。公共前缀只在撞车时才计算，不影响其它模型。
+ */
+function variantLabelFor(model: BuddyRemoteModel, all: readonly BuddyRemoteModel[]): string {
+  const group = all.filter((candidate) => candidate.name === model.name)
+  if (group.length <= 1) return ''
+  const prefix = commonPrefix(group.map((candidate) => candidate.id))
+  const variant = model.id.slice(prefix.length).replace(/^-+/, '')
+  return variant.toUpperCase()
+}
+
+/** 求一组字符串的公共前缀（逐字符比较）。 */
+function commonPrefix(values: readonly string[]): string {
+  if (values.length === 0) return ''
+  let prefix = values[0]!
+  for (const value of values.slice(1)) {
+    let i = 0
+    while (i < prefix.length && i < value.length && prefix[i] === value[i]) i++
+    prefix = prefix.slice(0, i)
+    if (prefix.length === 0) break
+  }
+  return prefix
 }
 
 /**

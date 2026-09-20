@@ -142,6 +142,125 @@ describe('BuddyAdapter', () => {
     expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
   })
 
+  // ── 计费倍率与同名区分（写进 name）──
+  //
+  // ⚠️ **必须写进 `name`，不是 `description`**：composer 的模型切换菜单只渲染
+  // `name`（见 dsh-client-ui-model-selection 的 ModelSelect：`children: model.name`），
+  // `description` 仅用于 `/model` 弹窗。用户报障「消耗倍率没有显示在切换模型
+  // 列表的后面」正是因为早期版本放在了 `description`。
+  //
+  // 安全性：`name` 纯属展示 —— DSH 的选择与持久化只用 `id`
+  // （`selectionOf` 返回 `model: model.id`）。
+  describe('listModels 的计费倍率与同名区分', () => {
+    it('把 credits 追加到 name 后面', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'glm-5.3', name: 'GLM-5.3', creditsRate: 'x0.79' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models[0]?.name).toBe('GLM-5.3 · x0.79')
+    })
+
+    it('有促销时显示 原价→促销价', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4-flash', name: 'DS', creditsRate: 'x0.17', discountedCreditsRate: 'x0.50' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models[0]?.name).toBe('DS · x0.17→x0.50')
+    })
+
+    it('无倍率信息时 name 保持原样', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [{ id: 'mystery', name: 'M' }],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models[0]?.name).toBe('M')
+    })
+
+    // 真实问题（用户报障）：国际版 `deepseek-v4.1-flash` 与
+    // `deepseek-v4.1-flash-sg` 的远端 name **完全相同**，而 IDE 只显示一个。
+    // 两者是不同区域/计费的实体（credits x0.00 vs x0.03），不能简单丢弃其一，
+    // 故对撞车的 name 追加变体标记。
+    it('同名模型追加变体标记以区分', async () => {
+      const adapter = makeAdapter({
+        product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.00' },
+          { id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.03' },
+        ],
+      })
+      const models = await adapter.listModels('workbuddy')
+      expect(models.map((m) => m.name)).toEqual([
+        'Deepseek-V4.1-Flash · x0.00',
+        'Deepseek-V4.1-Flash · x0.03 SG',
+      ])
+      // 唯一性：选择器里不会再出现两个无法区分的条目。
+      expect(new Set(models.map((m) => m.name)).size).toBe(2)
+    })
+
+    // 实测另有 hy3/hy3-x 与 hy4-preview-f/hy4-preview 两组撞车，
+    // 硬编码 `-sg` 会漏掉它们，故用公共前缀的通用算法。
+    it('非 -sg 的同名组同样被区分（公共前缀算法）', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'hy3', name: 'Hy3' },
+          { id: 'hy3-x', name: 'Hy3' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models.map((m) => m.name)).toEqual(['Hy3', 'Hy3 · X'])
+    })
+
+    it('三个以上同名 id 仍能全部区分', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'gpt-5.6', name: 'GPT-5.6' },
+          { id: 'gpt-5.6-sol', name: 'GPT-5.6' },
+          { id: 'gpt-5.6-luna', name: 'GPT-5.6' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(new Set(models.map((m) => m.name)).size).toBe(3)
+    })
+
+    it('不同名的模型不追加变体标记', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' },
+          { id: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models.map((m) => m.name)).toEqual(['GPT-5.6-Sol', 'GPT-5.6-Luna'])
+    })
+
+    // 真实回归：初版把倍率与变体标记写进 description，导致
+    // 「计费 x0.00 · 」（孤立分隔符）与重复的「SG」，而且**在切换模型列表里
+    // 根本看不到**（用户报障）。
+    it('倍率不进 description（否则切换菜单看不到）', async () => {
+      const adapter = makeAdapter({
+        product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'a', name: 'Same', creditsRate: 'x0.10' },
+          { id: 'a-sg', name: 'Same', creditsRate: 'x0.20' },
+        ],
+      })
+      const models = await adapter.listModels('workbuddy')
+      for (const model of models) expect(model).not.toHaveProperty('description')
+      expect(models[0]?.name).toBe('Same · x0.10')
+      expect(models[1]?.name).toBe('Same · x0.20 SG')
+    })
+  })
+
   it('resolveModel reports the known context window', async () => {
     const resolved = await makeAdapter().resolveModel('buddy', 'deepseek-v4-flash')
     expect(resolved).toMatchObject({ provider: 'buddy', id: 'deepseek-v4-flash', context: { contextWindow: 1_000_000 } })
