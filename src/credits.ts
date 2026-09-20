@@ -481,7 +481,10 @@ export async function fetchCreditBalance(
  * 用 `Math.round(v * 100) / 100` 而不是 `toFixed` 后 parse：后者对
  * 负数与极大值的行为不一致，且返回字符串会污染数值类型。这里只处理
  * 服务端下发的正数额度，乘法取整足够且结果仍是 number。
+ *
+ * 导出供其它 provider 复用（`qoder-credits.ts`）：多包相加的浮点尾数噪声
+ * 是所有 provider 的共同问题，各写一份必然分叉。
  */
-function roundCredits(value: number): number {
+export function roundCredits(value: number): number {
   return Math.round(value * 100) / 100
 }

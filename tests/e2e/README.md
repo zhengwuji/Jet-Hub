@@ -20,6 +20,7 @@
 
 | 文件 | 闸门 | 说明 |
 |------|------|------|
+| `qoder-chat-probe.e2e.spec.ts` | `DSH_QODER_CHAT_E2E=1` + `DSH_QODER_CHAT_E2E_CONFIRM=yes` | 发一次推理请求验证 SSE，并**验证续期接受本插件生成的 `machine_id`**。默认模型 `qmodel_38max`（**免费额度**）；设 `DSH_QODER_MODEL` 可换付费模型（那时会消耗积分） |
 | `v4-models.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | deepseek-v4-flash / pro（**每日 1000 万免费 Tokens**） |
 | `v4-large-write.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | deepseek-v4-flash 大文件写入（同上，免费额度） |
 | `login.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | 只走 CodeArts 浏览器登录与凭据换取 |
@@ -29,6 +30,7 @@
 | `lobsterai-claim-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` + `DSH_LOBSTERAI_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
 | `codearts-credits-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | **只读**：凭据结构、**账户类型检测**（`is_credit_package`）、积分余额、活动列表。**绝不领取** |
 | `codearts-claim-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` + `DSH_CODEARTS_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（会改动当日领取状态；**不消耗模型积分**，重复运行幂等） |
+| `qoder-probe.e2e.spec.ts` | `DSH_QODER_E2E=1` | **只读**：凭据结构（含 `machine_id`）、令牌对 `/api/v1/userinfo` 的有效性、静态兜底模型表。**不发模型请求、不续期** |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -68,12 +70,23 @@ pnpm test:e2e:codearts-credits
 
 # ⚠️ 会真实领取积分（改动当日领取状态；不消耗模型积分，重复运行幂等）
 pnpm test:e2e:codearts-claim
+
+# 安全：Qoder 只读探针（凭据结构/令牌有效性/模型表，不发模型请求、不续期）
+pnpm test:e2e:qoder
+
+# ⚠️ 发一次 Qoder 推理请求（默认 qmodel_38max（Qwen3.8-Max）**免费**，不消耗积分）
+pnpm test:e2e:qoder-chat
 ```
 
 > **CodeArts 凭据必须新鲜**：其 `refresh_token` 是**一次性轮换**的（用一次即
 > 作废，服务端回 `STS5.1806 the refresh token has been used`）。两个 CodeArts
 > 积分探针都**只读凭据、不刷新**，因此凭据过期时会如实报签名请求失败 ——
 > 此时请在 Jet Hub 重新登录，或等续期调度跑过一轮，**不要**为此给探针加刷新逻辑。
+
+> **Qoder 探针要先看续期**：`qoder-chat-probe` 里「续期」用例比「推理」更重要。
+> Qoder 官方客户端用**硬件指纹**派生 `machine_id`，而本插件用**随机 UUID**
+> （见设计文档 §8）。若续期返回 4xx（非 401），说明服务端校验了设备标识，
+> 该假设被推翻 —— 此时必须改用硬件指纹派生，否则用户每天都要重新登录。
 
 ## 限流真实性判定
 

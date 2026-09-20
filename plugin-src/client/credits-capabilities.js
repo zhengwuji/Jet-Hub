@@ -25,11 +25,13 @@
  * | `buddy`     | ✓                   | ✓                            |
  * | `workbuddy` | ✓                   | ✗ 国际版后端无签到接口        |
  * | `lobsterai` | ✓                   | ✓ `client-activities` 三步流程 |
+ * | `qoder`     | ✓ `sash/api/v2/me/usage` | ✗ 未见签到接口            |
  *
  * - `balance`：CodeBuddy 系用 `POST /v2/billing/meter/get-user-resource`
  *   （CodeBuddy 与 WorkBuddy 国际版**通用**，仅 baseURL 随 `product.endpoint`
  *   切换）；LobsterAI 用 `GET /api/user/profile-summary`；CodeArts 用
- *   `GET /snap-manager/v1/statistics/plugin`（与账户类型检测同一响应）。
+ *   `GET /snap-manager/v1/statistics/plugin`（与账户类型检测同一响应）；
+ *   Qoder 用 `GET /sash/api/v2/me/usage`（见 `src/qoder-credits.ts`）。
  *   见 README「积分余额」。
  * - `dailyCheckin`：CodeBuddy 系用 `checkin-activity-status` + `daily-checkin`
  *   （**仅 CodeBuddy 中国版**有；WorkBuddy 国际版内核里只有
@@ -37,6 +39,11 @@
  *   slot → context → check_in 三步（见 `src/lobsterai-credits.ts`）；
  *   CodeArts 用 `/v1/ops/delivery` + `/v1/ops/claim`(+`confirm`)
  *   （见 `src/codearts-credits.ts`）。
+ * - `qoder` **有余额、无签到**。⚠️ 早期误判为「两项皆无」，原因是只按
+ *   `/api/` 前缀搜索端点，而它挂在 **`/sash/`** 下、且**只需 Bearer +
+ *   `Cosy-ClientType`、不需要 WASM 签名**（实测 200 并返回
+ *   `addOnQuota.remaining: 100`）。`/sash/api/v1/me/campaigns` 实测
+ *   `claimable: false` 且逆向未发现签到动作端点，故签到仍为 false。
  *
  * 判定一律**默认关闭**：未登记的 provider 视为不支持任何积分能力。这样将来
  * 新增 provider 时，若忘记在此登记，最坏结果是「暂时看不到积分」，而不是
@@ -49,6 +56,9 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   buddy: Object.freeze({ balance: true, dailyCheckin: true }),
   workbuddy: Object.freeze({ balance: true, dailyCheckin: false }),
   lobsterai: Object.freeze({ balance: true, dailyCheckin: true }),
+  // Qoder：有余额（`sash/api/v2/me/usage`）、无签到。
+  // 显式登记而非省略 —— 单测要求本表与 PROVIDERS 同步。
+  qoder: Object.freeze({ balance: true, dailyCheckin: false }),
 });
 
 /**

@@ -23,11 +23,25 @@ const WORKBUDDY_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEgAAABICA
  */
 const LOBSTERAI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjZTg1MDNhIi8+PHBhdGggZD0iTTEyIDUuNWMtMi40IDAtNC4yIDEuNi00LjIgNHY1LjJjMCAyLjMgMS44IDMuOCA0LjIgMy44czQuMi0xLjUgNC4yLTMuOFY5LjVjMC0yLjQtMS44LTQtNC4yLTR6IiBmaWxsPSIjZmZmIi8+PGNpcmNsZSBjeD0iMTAuMyIgY3k9IjEwLjIiIHI9IjEiIGZpbGw9IiNlODUwM2EiLz48Y2lyY2xlIGN4PSIxMy43IiBjeT0iMTAuMiIgcj0iMSIgZmlsbD0iI2U4NTAzYSIvPjxwYXRoIGQ9Ik04LjQgNy4yIDYuMiA0LjltOS40IDIuMyAyLjItMi4zTTkuOSAxOC41bC0xLjQgMm02LjYtMiAxLjQgMiIgc3Ryb2tlPSIjZmZmIiBzdHJva2Utd2lkdGg9IjEuNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBmaWxsPSJub25lIi8+PC9zdmc+'
 
+/**
+ * Qoder 面板图标（内联 SVG data URL）。
+ *
+ * 与 LobsterAI 同因用 SVG 而非 base64 PNG：Qoder 没有可取的小图标资源，
+ * 内联 SVG 体积小、无色差，且在 `.dim-jh-providerIcon` 白底容器里显示清晰。
+ *
+ * 内容是**预先算好的 base64 字面量**，不用 `btoa()` 运行时拼接：
+ * 该 bundle 由 esbuild 打包，目标环境未必提供 `btoa`。
+ *
+ * 图形：深色圆角方块 + 白色「Q」字形（圆环加右下角笔尾），呼应 Qoder 品牌。
+ */
+const QODER_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ij48cmVjdCB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjMWYyYTNmIi8+PGNpcmNsZSBjeD0iMTEiIGN5PSIxMSIgcj0iNC42IiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44Ii8+PHBhdGggZD0iTTEzLjkgMTMuOSAxNyAxN2EwLjk1IDAuOTUgMCAwIDEtMS4zNSAxLjM1bC0zLjEtMy4xIiBmaWxsPSIjZmZmIi8+PC9zdmc+'
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
   { id: 'workbuddy', label: 'WorkBuddy (国际版)', icon: WORKBUDDY_ICON, logoClass: 'workbuddy' },
   { id: 'lobsterai', label: 'LobsterAI (有道)', icon: LOBSTERAI_ICON, logoClass: 'lobsterai' },
+  { id: 'qoder', label: 'Qoder', icon: QODER_ICON, logoClass: 'qoder' },
 ]);
 
 /**

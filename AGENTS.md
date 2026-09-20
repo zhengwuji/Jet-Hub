@@ -8,11 +8,76 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）与 `lobsterai`（有道 **LobsterAI** / 龙虾）三个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）与 `qoder`（阿里系 **Qoder**）四个 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
 `lobsterai` 与上述两者**完全不同源**：登录方式、请求头、续期载荷、签到流程、版本号来源都不一样，因此实现是独立一套 `src/lobsterai*.ts`。它只**共用架构模式**（产品配置驱动、账号池、限流切换、模型黑名单），**不共用 `BuddyProduct` 类型** —— 那里面 `apiDomain` / `productCode` / `attributionName` / `userAgentByModelFamily` / `appendSessionParams` 等字段对 LobsterAI 全部无意义。详见 README 的「LobsterAI provider」章节与 `docs/lobsterai-integration-plan.md`。
+
+`qoder` 是**第五个、也是与其余四者都不同源**的协议族：**PKCE 设备码轮询**登录（不起本地监听端口）、续期请求体需带 **`machine_id`**、推理走**加密端点**（请求体由客户端内嵌 WASM 加密，响应套一层信封）。实现为独立一套 `src/qoder*.ts`（含 `qoder-wasm.ts` / `qoder-envelope.ts`），同样只共用架构模式。五个必须记住的点：
+
+1. **两条推理路径认两套模型名，且 host 不同（最容易踩的坑）**：
+   - **加密（本插件使用）**：`POST api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`，请求体与签名头由 WASM 生成，**认模型目录 key**（`qfmodel` / `dmodel`）。
+   - **公开**：`POST api2-v2.qoder.sh/model/v1/chat/completions`，**认通用名**（`qwen-flash` / `qwen-plus`），目录 key 一律 `Unsupported model`。
+   ⚠️ `api2.qoder.sh` 与 `api2-v2.qoder.sh` **不是同一个 host**，混用 404。配置项见 `QoderProduct.inferBase` / `encryptedInferBase`。
+   **真实缺陷**（用户报障）：「向 qwen3.8-flash 发消息后没收到回复就终止」—— 把目录 key 发给了公开端点；随后又误判为「目录 key 不可用」而把表换成通用名，结果拿到 Qwen3.5/2.5 而非 3.8 系列。
+2. **加密推理用 `src/qoder-wasm.ts`**（复用客户端内嵌 WASM 生成加密体与签名头）。**不是「破解密码学」** —— WASM 自己导出了成对编解码函数，我们只是调用它。响应**无需解密**，只在每帧外套一层信封，由 `src/qoder-envelope.ts` 剥离。
+   ⚠️ **签名头必须原样透传**，用普通 `Bearer <token>` 覆盖会被判签名无效。
+   ⚠️ 改这个文件前先读 **不入库**的 `docs/qoder-encryption-notes.md`：里面有 glue 约定、请求体字段结构与三个已踩过的坑（写错会得到 Rust panic 或 `null pointer passed to rust`），重新实现代价很高。
+3. **模型列表恒用静态表**（`src/qoder-product.ts` 的 `fallbackModels`）：远端 `GET /algo/api/v2/model/list` 需 **WASM 签名**，故 `listModels` **不发网络请求**。
+   表里是**17 个目录 key**（全部可用），取自客户端下发的模型目录。
+   ⚠️ **请求体必须带 `business` 字段**（`business: { type: 'agent' }`）—— 缺了服务端会把请求路由到**故障节点** `oa_qwen-plus-2025-04-28` 并返回 `[FAIL]node:... msg:Execution failed`。
+   **真实缺陷**（2026-09-20 定位，极隐蔽）：`qfmodel`（Qwen3.8-Flash）因此「看起来不可用」，而**同一模型在 Qoder IDE 里完全正常**。
+   ⚠️ **判据是「IDE 能否用同一模型」**：IDE 能用 → 是我们的请求缺东西，不是服务端故障。当时我错误地排除了 8 类假设（host / query / 明文体 / 模型配置字段 / 客户端版本 / 设备标识 / 会话类型 / 凭据字段），逐条记录见 `docs/qoder-encryption-notes.md` —— 别重复这条路。
+   ⚠️ **其余模型恰好不受影响**，所以现象像「只有这一个模型坏」，极易误判为服务端故障。
+   ⚠️ **展示名必须含模型名与版本，不能只写厂商**（用户报障：「看到的是 GLM、DeepSeek、MiniMax，只有厂商名字没有模型名字和版本」）。
+   ⚠️ **改表必须逐个实发验证可推理**，不能只照抄目录 key。免费额度模型：`qmodel_38max` / `qfmodel`（e2e 探针默认用前者）。
+   ⚠️ **错误帧必须能抛错**：Qoder 用独立 `event: error` 行 + 顶层 `{code,message,type}`，**不是** OpenAI 的 `{error:{message}}`。早期解析器只认后者 → 错误被静默当成「正常结束、无内容」，UI 表现为「干净地停止、无任何报错」。见 `src/openai-compat.ts` 的 `consumeOpenAiSse`。
+4. **轮询的 `404` 表示「用户尚未完成授权」，必须继续轮询，不是错误**。实测依据：该端点返回 404 而任意不存在的路径返回 401，说明它被网关豁免认证、由业务层报「会话未就绪」。轮询 host 是 **`openapi.qoder.sh`**（`qoder.com` 的同名路径返回 401）。
+5. **prod 的 `client_id` 是 `J_a`（`e883ade2-…`），不是 `G_a`**。源码 `client_id: i ? J_a : G_a`，而调用点 `loginWithDeviceFlow` 传的第 4 参是 **`isProd()`**（`$Oa(){return "prod"===db()}`）—— prod 为 `true` 故用 `J_a`；`G_a`（`e93fe488-…`）只在 daily/test 用。
+   ⚠️ **真实缺陷**（用户报障）：初版把第 4 参误读成「useIdeClientId」，于是 prod 用了 `G_a`，GitHub 授权点击后页面报「**参数无效 / 你可以稍后前往 IDE 客户端并登录Qoder**」。根因是服务端在**授权回调阶段**才校验 client_id。
+   ⚠️ **只靠入口 302 检查发现不了该错误**：`GET /device/selectAccounts` 对**任一** client_id（含全零 UUID）都返回 302。必须在源码层面核对第 4 参语义。见 `src/qoder-product.ts` 的 `clientId` / `testClientId` 字段注释。
+
+⚠️ **`src/qoder-auth-wasm.wasm`（298 KB）随插件分发**，构建时由 `scripts/copy-assets.mjs` 复制到 `lib/`（`tsc` 不搬 `.wasm`）。`build:all` 已含该步骤。
+
+⚠️ **WASM 提取自 Qoder `0.3.4`**（runtime `1.1.57`）。升级方式：
+
+```
+pnpm qoder:wasm            # 自动取 .qoder-versions 下版本号最高的
+pnpm qoder:wasm 0.3.5      # 指定版本
+pnpm build:assets          # 同步到 lib/
+```
+
+取 `.qoder-versions/<v>` 而非 `resources/` —— 后者可能是与 IDE **实际运行**不同的版本
+（实测 IDE 跑 0.3.4）。刷新后**必须实测一次对话**（`qfmodel` / `qmodel_38max`）确认签名仍被接受。
+
+它**有积分余额、无签到**（能力矩阵登记为 `{balance:true, dailyCheckin:false}`），并复用 `src/openai-compat.ts` 的 OpenAI 协议层共享实现（消息序列化 / SSE 消费 / 错误归类）。详见 README 的「Qoder provider」章节与 `docs/superpowers/specs/2026-09-19-qoder-provider-design.md`。
+
+### ⚠️ Qoder 积分余额：路径在 `/sash/` 下，且只需 Bearer
+
+`GET {openApiBase}/sash/api/v2/me/usage`（实现见 `src/qoder-credits.ts`），
+请求头 `Authorization: Bearer` + **`Cosy-ClientType`**，**不需要** WASM 签名。
+
+两个**真实踩过的坑**：
+
+1. **只按 `/api/` 前缀搜端点会漏掉它** —— 它挂在 `/sash/` 下。早期据此误判
+   「Qoder 无积分端点」并把能力登记成 `balance:false`（用户报障：
+   「登录成功了，没有获取积分吗？现在应该是一个资源包 100 积分」）。
+2. **余额不只在 `userQuota` 里** —— 实测 `userQuota.remaining=0` 而
+   `addOnQuota.remaining=100`（资源包）。只读 `userQuota` 会显示 0。
+   另有 `dedicatedResourcePackages` 需一并累加。
+
+企业版（`displayMode:"enterprise"`）不下发额度数字、只给外部链接 →
+返回 `null`（UI 显示「查询失败」）而非 `0`。
+
+签到仍为 **false**：`/sash/api/v1/me/campaigns` 实测 `claimable:false`，
+逆向未发现签到动作端点。**余额与签到是彼此独立的能力**，不可互相推断。
+
+### ⚠️ `openai-compat.ts` 只服务 qoder，不要顺手重构既有适配器
+
+`src/openai-compat.ts` 把「消息序列化 + SSE 消费」抽成共享实现给 **qoder 适配器**用。`buddy-adapter.ts` / `lobsterai-adapter.ts` **刻意不改用它** —— 那两份实现已被大量单测与线上流量验证，重构它们属于与本任务无关的高风险改动。若将来要统一，应作为独立任务并配以逐条对拍测试。
+
+它承载的教训（改它时必须保留）：`delta.content` / `delta.reasoning_content` 会显式返回 **`null`**（必须 `typeof === 'string'` 判定）；孤儿工具调用须剔除（否则后端 400 且坏历史被反复重放）；`function.name` 只允许非空覆盖；残缺参数**不补 `{}`**（补了会让 harness 报 schema 错误而非重试）。
 
 Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI 与 CodeArts 三个面板提供** —— 国际版 WorkBuddy 后端没有签到接口，故不提供。三者是**三套互不相同的协议**（见下「积分领取」）。
 
@@ -57,7 +122,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 ## 工作方式
 
-本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`）均遵循统一接口：
+本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`）均遵循统一接口：
 
 - `login(options?)` — 执行浏览器登录流程
 - `status()` — 查询凭据状态（configured、source、expiresAt、refreshable）
@@ -82,11 +147,11 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - `src/index.ts` 的 `accounts.some(a => a.refreshable && a.enabled)`
   → **所有账号都停用时续期定时器根本不启动**。
 
-用户重新启用后拿到的是死凭据，只能重新登录。四个 provider 的
-`refreshAll`（`buddy-auth.ts` / `service.ts` / `lobsterai-auth.ts`）与调度器
+用户重新启用后拿到的是死凭据，只能重新登录。五个 provider 的
+`refreshAll`（`buddy-auth.ts` / `service.ts` / `lobsterai-auth.ts` / `qoder-auth.ts`）与调度器
 **都必须保持只看 `refreshable`**。
 
-服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，互不覆盖。
+服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，`QoderAuth` 注册为 `qoderAuth`，互不覆盖。
 
 各 provider 的登录/续期机制不同（详见 README.md），但均通过 `ctx.credentials` 统一管理凭据生命周期。
 
@@ -190,15 +255,17 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 ## LLM Provider 约定
 
-- provider 名称：`codearts` / `buddy` / `workbuddy` / `lobsterai`
+- provider 名称：`codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder`
 - 端点格式为 OpenAI 兼容
 - 请求签名/鉴权方式因 provider 而异：
   - `codearts`：华为云 `SDK-HMAC-SHA256` 签名方案
   - `buddy` / `workbuddy`：Bearer access_token + 额外自定义头（`X-Product-Code` 随产品切换）
   - `lobsterai`：Bearer access_token + `X-LobsterAI-Client-*` 头（**无签名**，也**不带**腾讯系归属头）
+  - `qoder`：推理请求头**由 WASM 生成**（含签名），**必须原样透传**，不能自行构造；请求体加密。积分余额端点另走纯 `Bearer`。
 - provider 在 `ctx.llm` 上注册，配置在 profile 中可选
 - `buddy` 与 `workbuddy` 共用 `BuddyAdapter`，行为差异全部由 `src/product.ts` 的 `BuddyProduct` 配置驱动；新增同源产品只需加一份配置并注册实例
 - `lobsterai` 用独立的 `LobsteraiAdapter`（协议不同源，见项目概述）；它的产品配置是 `src/lobsterai-product.ts` 的 `LobsteraiProduct`，与 `BuddyProduct` **平行而非继承**
+- `qoder` 用独立的 `QoderAdapter`（协议不同源，见项目概述）；产品配置是 `src/qoder-product.ts` 的 `QoderProduct`，同样**平行而非继承**。它的 OpenAI 协议层逻辑复用 `src/openai-compat.ts`
 
 ## LobsterAI 模型列表（三个易踩的坑）
 
@@ -237,9 +304,9 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - 工具结果内嵌图片（`read_image`）不能留在 `role:'tool'` 消息里（该角色 content 只能是字符串），须提升为**其后的独立 user 消息**；`userContentParts` 与 `collectImages` 必须**对称递归**，否则深层图片会被静默吞掉
 - 只声明 `inputModalities` 而不实现比不声明**更糟**：DSH 在 `LlmRuntime` 里按它决定是否把图片投影成文本占位符，声明支持就必须真支持
 
-## 「+ 新建账号」必须两步式返回 loginUrl（四个 provider 一致）
+## 「+ 新建账号」必须两步式返回 loginUrl（五个 provider 一致）
 
-`account.create` 对**全部四个 provider** 都必须在**用户完成授权之前**返回
+`account.create` 对**全部五个 provider** 都必须在**用户完成授权之前**返回
 `loginUrl`，由前端立即 `window.open`，后台再异步等回调。
 
 这不是风格偏好，而是浏览器硬约束：`window.open` 只在用户点击后的
@@ -252,6 +319,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - `buddy` / `workbuddy`：`runBuddyLoginFlow` 不 await，立即返回 URL
 - `codearts`：`CodeArtsAuth.startLogin()`（`src/service.ts`），底层 `startOAuthFlow`（`src/login.ts`）
 - `lobsterai`：`LobsteraiAuth.startLogin()`（`src/lobsterai-auth.ts`），底层 `startLobsteraiLoginFlow`（`src/lobsterai-oauth.ts`）
+- `qoder`：`QoderAuth.startLogin()`（`src/qoder-auth.ts`），底层 `startQoderLoginFlow`（`src/qoder-oauth.ts`）—— 它是**设备码轮询**，不起本地回调服务器，故没有端口/超时收尾问题
 
 要点：
 
@@ -343,6 +411,15 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 | `buddy` | ✓ | ✓ |
 | `workbuddy` | ✓ | ✗（国际版后端无签到接口） |
 | `lobsterai` | ✓ | ✓（`client-activities` 三步流程） |
+| `qoder` | ✓（`sash/api/v2/me/usage`，只需 Bearer） | ✗（未见签到接口） |
+
+> ⚠️ `qoder` **必须显式登记**，不能省略：上面那条「能力矩阵与 `PROVIDERS` 条目集合相等」的断言要求两者同步，而 qoder 必然要进 `PROVIDERS`（否则面板不渲染）。
+>
+> ⚠️ **早期把 qoder 误判为两项皆无**（登记成 `balance:false`），根因有二，都值得记住：
+> 1. **只按 `/api/` 前缀搜端点**，而余额挂在 **`/sash/`** 下 → 漏检；
+> 2. **误以为用量端点也需要 WASM 签名** —— 实测只需 `Bearer` + `Cosy-ClientType`。
+>
+> **余额与签到彼此独立**：不能因为「没有签到接口」就推断「也查不到余额」。
 
 要点：
 
