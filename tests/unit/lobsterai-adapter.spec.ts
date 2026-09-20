@@ -432,12 +432,21 @@ describe('LobsteraiAdapter resolveModel', () => {
   /**
    * 思考档位：远端 `thinkingConfig.options` 是权威来源。
    *
-   * 关键语义（真实凭据实测 2026-09-17）：发给服务端的 `reasoning_effort`
-   * 用 **`openclawLevel`**，不是 `level`。实测 `reasoning_effort=max` 与不带
-   * 参数无差异（走服务端默认），而 `xhigh` 才真正触发最高档 —— 与远端把
-   * `level: max` 映射到 `openclawLevel: xhigh` 完全自洽。
+   * ## `id` 与 `name` 来源不同（务必分清）
+   *
+   * - **`id` 用 `openclawLevel`（wire 值）**：DSH 把选中的 id 原样写进请求体的
+   *   `reasoning_effort`，故必须是服务端认的取值。真实凭据实测（2026-09-17）：
+   *   `reasoning_effort=max` 与不带参数**无差异**（走服务端默认），
+   *   `xhigh` 才真正触发最高档。
+   * - **`name` 用 `level`（产品侧档位名）**：纯展示。远端把 `level: 'max'`
+   *   映射到 `openclawLevel: 'xhigh'`，产品侧（IDE）显示的正是 **Max**。
+   *
+   * ⚠️ **真实缺陷回归**（Issue #IKHCZF，用户报障）：早期用 `openclawLevel`
+   * 同时查展示名表，最强档显示成 **XHigh**，与产品侧命名 **Max** 不一致 ——
+   * 用户按 IDE 里的「Max」找，界面上却只有「XHigh」。根因是把「wire 值」与
+   * 「展示名」当成同一个概念。
    */
-  it('远端 thinkingConfig 映射为 reasoning 档位（id 用 openclawLevel）', async () => {
+  it('远端 thinkingConfig 映射为 reasoning 档位（id 用 wire 值、name 用产品侧名）', async () => {
     const { adapter } = makeAdapter(() => textSse('x'), {
       fetchRemoteModels: async () => [{
         id: 'deepseek-flash',
@@ -453,11 +462,38 @@ describe('LobsteraiAdapter resolveModel', () => {
       }],
     })
     const resolved = await adapter.resolveModel('lobsterai', 'deepseek-flash')
+    // id 必须是 wire 值（发请求用）。
     expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['off', 'high', 'xhigh'])
-    expect(resolved.reasoning?.efforts.map((e) => e.name)).toEqual(['Off', 'High', 'XHigh'])
+    // ⚠️ name 必须是产品侧命名：最强档是 **Max**，不是 XHigh。
+    expect(resolved.reasoning?.efforts.map((e) => e.name)).toEqual(['Off', 'High', 'Max'])
     // defaultEffort 必须是 openclawLevel（'high' 恰好同名），
     // 且必须落在 efforts 内 —— 否则 DSH 会拿一个不存在的档位去请求。
     expect(resolved.reasoning?.defaultEffort).toBe('high')
+  })
+
+  it('⚠️ 最强档展示名为 Max（不是 XHigh）—— Issue #IKHCZF 回归', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      fetchRemoteModels: async () => [{
+        id: 'glm-5.3-flashx',
+        name: 'GLM-5.3-FlashX',
+        thinkingConfig: {
+          options: [
+            { level: 'off', openclawLevel: 'off' },
+            { level: 'high', openclawLevel: 'high' },
+            { level: 'max', openclawLevel: 'xhigh' },
+          ],
+          defaultLevel: 'max',
+        },
+      }],
+    })
+    const resolved = await adapter.resolveModel('lobsterai', 'glm-5.3-flashx')
+    const efforts = resolved.reasoning?.efforts ?? []
+    const strongest = efforts.find((e) => e.id === 'xhigh')
+    expect(strongest?.name, '产品侧命名为 Max').toBe('Max')
+    // 展示名里不应出现 XHigh（那是 wire 值的直译）。
+    expect(efforts.map((e) => e.name)).not.toContain('XHigh')
+    // 但 id 仍必须是 wire 值 xhigh —— 否则请求会走服务端默认档。
+    expect(efforts.map((e) => e.id)).toContain('xhigh')
   })
 
   it('defaultLevel 为 max 时 defaultEffort 映射成 xhigh', async () => {

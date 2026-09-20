@@ -50,11 +50,15 @@ import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reso
 export const PROVIDER = 'lobsterai'
 
 /**
- * 思考档位 wire 值 → 展示名。
+ * 思考档位取值 → 展示名。
  *
- * 键用 `openclawLevel`（发给服务端的 `reasoning_effort` 取值），
- * **不是**产品侧的 `level` —— 两者在 `max`/`xhigh` 上不同名，
- * 见 {@link LobsteraiThinkingOption}。命名风格对齐 buddy 适配器。
+ * ⚠️ **展示名取自产品侧 `level`，不是 wire 值 `openclawLevel`**：远端把
+ * `level: 'max'` 映射到 `openclawLevel: 'xhigh'`，产品侧（IDE）显示的正是
+ * **Max**。故本表必须同时登记 `max` 与 `xhigh` 两个键 ——
+ * 前者给 `level` 查（正常路径），后者给 `openclawLevel` 查（兼容回退）。
+ *
+ * **历史缺陷**（Issue #IKHCZF）：早期只用 `openclawLevel` 查表，最强档显示
+ * 「XHigh」，与产品侧「Max」不一致，用户按 IDE 的命名找不到对应档位。
  */
 const EFFORT_NAMES: Readonly<Record<string, string>> = {
   off: 'Off',
@@ -63,6 +67,7 @@ const EFFORT_NAMES: Readonly<Record<string, string>> = {
   medium: 'Medium',
   high: 'High',
   xhigh: 'XHigh',
+  max: 'Max',
 }
 
 /**
@@ -662,21 +667,38 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   /**
-   * 模型可选的思考档位（id 为**发给服务端的 wire 值** `openclawLevel`）。
+   * 模型可选的思考档位。
    *
-   * 无 `thinkingConfig` 的模型返回空数组 —— 此时不声明 `reasoning`，
-   * UI 显示「当前模型未提供推理等级」，而不是给一个发了也没用的档位。
+   * ## `id` 与 `name` 的来源**不同**（这是本方法最容易搞错的地方）
+   *
+   * - **`id` = `openclawLevel`（wire 值）**：DSH 会把选中的 id 原样写进请求体的
+   *   `reasoning_effort`，故必须是服务端认的取值。⚠️ wire 侧**没有 `max`** ——
+   *   实测直接发 `reasoning_effort: 'max'` 与不带参数**无差异**（走服务端默认），
+   *   发 `'xhigh'` 才真正触发最高档。
+   * - **`name` = `level`（产品侧档位名）**：纯展示。远端把 `level: 'max'` 映射到
+   *   `openclawLevel: 'xhigh'`，用户在产品侧看到的就是 **Max**。
+   *
+   * ⚠️ **历史缺陷**（用户报障 / Issue #IKHCZF）：早期用 `openclawLevel` 同时查
+   * 展示名表，于是最强档显示成 **XHigh**，与产品侧命名 **Max** 不一致 ——
+   * 用户按 IDE 里的「Max」找，界面上却只有「XHigh」。
+   * 根因是把「wire 值」与「展示名」当成同一个概念。
+   *
+   * 无 `thinkingConfig` 的模型不声明 `reasoning`，UI 显示「当前模型未提供推理等级」，
+   * 而不是给一个发了也没用的档位。
    */
   private reasoningFor(model: string): LlmResolvedModelInfo['reasoning'] {
     const config = this.remoteMeta.get(model)?.thinkingConfig
     if (config === undefined) return undefined
     // defaultEffort 必须落在 efforts 内：DSH 会拿它直接发请求，
     // 给一个不存在的档位比不给更糟。远端数据不一致时退化为不声明默认值。
+    // `defaultLevel` 引用的是**产品侧 level**，故先按 level 找到那一档，再取它的 wire 值。
     const defaultWire = config.options.find((option) => option.level === config.defaultLevel)?.openclawLevel
     return {
       efforts: config.options.map((option) => ({
         id: ReasoningEffortId(option.openclawLevel),
-        name: EFFORT_NAMES[option.openclawLevel] ?? option.openclawLevel,
+        // 展示名优先用**产品侧 `level`**（含 `max`），再回退到按 wire 值查表。
+        // 回退分支只为兼容「上游只给 wire 值」的异常形态，正常不会走到。
+        name: EFFORT_NAMES[option.level] ?? EFFORT_NAMES[option.openclawLevel] ?? option.level,
       })),
       ...defaultWire !== undefined
         ? { defaultEffort: ReasoningEffortId(defaultWire) }

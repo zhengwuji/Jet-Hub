@@ -944,6 +944,28 @@ CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控�
 
 实测反证：直接发 `reasoning_effort: 'max'` 与不带参数**无差异**（走服务端默认），发 `'xhigh'` 才真正触发最高档。因此 `reasoningFor()` 用 `openclawLevel` 作 effort id，`defaultEffort` 也经 `options` 映射后再声明（必须落在 efforts 内，否则 DSH 会拿不存在的档位去请求）。
 
+#### ⚠️ 但**展示名**必须用 `level`（Issue #IKHCZF）
+
+**`id` 与 `name` 的来源不同，不能都取 `openclawLevel`**：
+
+| 字段 | 来源 | 理由 |
+|---|---|---|
+| `efforts[].id` | **`openclawLevel`** | DSH 把它原样写进 `reasoning_effort`，必须是服务端认的取值（无 `max`） |
+| `efforts[].name` | **`level`** | 纯展示；产品侧（IDE）显示的就是 `Max` |
+
+**真实缺陷**（用户报障 / Issue #IKHCZF「最强思考档显示为 XHigh，与产品侧命名 Max
+不一致」）：早期两处都用 `openclawLevel`，于是最强档显示 **XHigh** —— 用户按 IDE 里的
+「Max」找，界面上却只有「XHigh」，以为缺了最高档。根因是把「wire 值」与「展示名」
+当成同一个概念。
+
+⚠️ `EFFORT_NAMES` 因此**必须同时登记 `max` 与 `xhigh`**（前者给 `level` 查，
+后者给 `openclawLevel` 回退查）。对照 `buddy-adapter.ts` 的同类表：它同样两者都登记
+—— buddy 无双字段（id 即 wire 值），故不存在这个坑。
+
+实测（2026-09-20，真实凭据，28 个模型）：`level` 取值 `{off, high, max}`、
+`openclawLevel` 取值 `{off, high, xhigh}`，8 个模型含 `max→xhigh`。
+修复后 `id=xhigh / name=Max` —— **wire 行为不变，仅展示名纠正**。
+
 ### SSE 的 `delta.content` / `delta.reasoning_content` 会显式返回 `null`
 
 真实形态（实测 335 帧）：一个模型要么走 content、要么走 reasoning_content，**另一侧恒为 `null`**（227 帧 `content=null`）。解析必须用 `typeof x === 'string'` 而非 `!== undefined` —— 只判 undefined 会让 `.length` 在 null 上崩溃，表现为**每轮对话第一帧就报 `Cannot read properties of null`**。
