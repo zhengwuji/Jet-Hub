@@ -781,3 +781,67 @@ describe('AccountPool 模型黑名单', () => {
     expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
   })
 })
+
+describe('AccountPool · TRAE 签到设备轮换代次', () => {
+  let ctx: ReturnType<typeof createMockContext>
+  let pool: AccountPool
+
+  function makeTraeAccount(overrides: Partial<ProviderAccountEntry> = {}): ProviderAccountEntry {
+    return {
+      id: 'trae-1',
+      provider: 'trae',
+      nickname: 'trae-user',
+      enabled: true,
+      credentialRef: 'TRAE_ACCOUNT_T1',
+      createdAt: Date.now(),
+      refreshable: true,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    ctx = createMockContext()
+    pool = new AccountPool(ctx as never)
+  })
+
+  it('默认代次为 0（既有账号行为不变）', async () => {
+    await pool.addAccount(makeTraeAccount())
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(0)
+  })
+
+  it('写入后读回新代次', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 3)
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(3)
+  })
+
+  it('只接受更大的代次（防止乱序回调把代次写回小值）', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 5)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 2)
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(5)
+  })
+
+  it('非法代次（0 / 负数 / NaN）被忽略', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 0)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', -1)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', Number.NaN)
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(0)
+  })
+
+  it('账号不存在时不抛错', async () => {
+    await expect(pool.updateTraeCheckinDeviceGeneration('nope', 1)).resolves.toBeUndefined()
+    expect(pool.traeCheckinDeviceGenerationFor('nope')).toBe(0)
+  })
+
+  it('不破坏同一账号条目的其它字段（modelRateLimits 等）', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateModelRateLimit('trae-1', 'glm-5.2', Date.now() + 60_000)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 2)
+
+    const entry = (await pool.listAccounts('trae')).find(a => a.id === 'trae-1')!
+    expect(entry.traeCheckinDeviceGeneration).toBe(2)
+    expect(entry.modelRateLimits?.['glm-5.2']).toBeGreaterThan(0)
+  })
+})
