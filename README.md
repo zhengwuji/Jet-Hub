@@ -323,9 +323,14 @@ composer 的模型切换菜单**只渲染 `name`**，`description` 仅用于 `/m
 | `buddy` / `workbuddy` | `modelPromotions[].discount.discountedCredits` | 字符串 `"0.50x"`（**x 在后**） |
 | `lobsterai` | `data[].costMultiplier` | 裸数字 `0.05` |
 | `qoder` | 目录 `chat[].price_factor` | 裸数字，**`0` = 免费** |
+| `trae` | `display_contact_config.consumption_rate.data.rate` | **裸数字** `0.08`；`0` = 免费（⚠️ `display_contact_config` 本身是 **JSON 字符串**，须二次解析） |
 | `codearts` | 无 | 两个目录端点都不含计费字段 |
 
 已结束的促销占位值 `"0x"` 被当作无促销（否则用户会误以为免费）。
+
+TRAE 的活动折扣只用**当前确实生效**的那一档：`activity_discount.enable` 为
+`true` 也可能是「无折扣」（`discount_type: "none"`、原价==折后价，实测 `off_peak`
+型即如此），照显会得到 `x0.13→x0.13`；已过 `end_at` 的活动同样不展示。
 
 Qoder 的免费模型（`price_factor: 0`）显示为「免费」而不是 `x0`：
 
@@ -1020,11 +1025,11 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
   `trae: We're sorry, the param is invalid. (code=4001)`。
 - ⚠️ **两种「不可用」要分开看**：
   - `display_config.is_custom_model === true`（需在 IDE 内自行绑定供应商）
-    → **必然 4001，插件剔除**。实测该账号正好 5 个：`deepseek-v4-flash` /
-    `glm-5.3-flash` / `qwen3.8-flash` / `agnes-2.5-flash` / `silk-gpt-5.6-luna`。
-  - `is_invisible_to_user === true`（**官方 picker 不展示**）→ **仍可调用**，
-    默认**保留**（否则会连带删掉 `glm-5-turbo` / `sagitta` / `qwen-3.5` 等可用
-    模型，目录 47 → 29）。想与官方选择器完全一致就设 `DSH_TRAE_HIDE_INTERNAL=1`。
+    → **必然 4001，插件剔除**。实测 2026-09-19 该账号有 5 个，但**该名单已过期**
+    （复测 2026-09-20：3 个下架、2 个转为 `false` 可调用，全目录 custom 条目数为 0）
+    —— 判据是**标志的值**而非模型名，别把某一刻的快照写成规则。
+  - `is_invisible_to_user === true`（**官方 picker 不展示**）→ **硬性剔除**，
+    使目录与官方 Auto Mode 选择器一致（代价是看不到 `glm-5.1` 等可调用模型）。
   - 若仍选中了不可调用的模型（如会话里持久化的旧 id），报错文案会直接点明
     「模型不被上游接受」，而不是让人去查参数格式。
 - **远端参数会被消费**：`context_window_tokens.dev` → 上下文窗口
@@ -1038,9 +1043,18 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
   网络抖动与 5xx 走可重试路径。
 - 失败模式：`4008`（`ide_credits` 耗尽）与 `1005`（plan 权益不足）是最主要的
   两个，会被分类为需要冷却的类别并触发多账号轮换。
-- **签到 `9074` 是设备级限流**：命中后会自动换一个派生 `device_id` 重试一次
-  （同窗口内连续 claim 会延长上游限流，故只重试一次）。轮换代次持久化在账号
-  条目，原始 `device_id` 不变。
+- **签到所得积分如实上报**：`checkin_credits/claim` 的响应**只有**
+  `{"code":0,"message":"success"}`，**不含积分数** —— 故领取成功后会补查一次
+  `checkin_credits/status`（其 `credits` 字段即所得，实测 `150`，与积分余额里
+  「签到奖励」包的 `credits_limit` 吻合）。早期从 claim 响应读 `credits`，
+  于是恒为 0，界面显示「领取成功 **+0 积分**」。
+- **已签到必须靠状态判定**：claim 对「今天已签到」是**幂等**的，重复领取同样返回
+  `code:0`，与真正成功**无法区分** —— 故 `claimAll` 的 TRAE 分支**必须开启状态
+  预检**（`checked_in`），不能用 `precheckStatus: false`，否则已签到的账号会被
+  报成「领取成功」。
+- **签到 `9074`（人数过多）不再换设备号重试**：设备身份已由 `uid` 确定性派生、
+  每账号独立，「换个 id 就能成功」的前提不成立。命中即归为业务错误（300s 冷却）
+  并如实上报。
 - **空响应（HTTP 200 但零事件）重试一次**，且**仅在首个模型事件之前** ——
   已有输出后绝不放，避免重复计费与重复执行工具。
 - 可调环境变量：

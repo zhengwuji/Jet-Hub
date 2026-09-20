@@ -423,3 +423,86 @@ describe('登出与调度', () => {
     expect(await service.checkExpired()).toBe(false)
   })
 })
+
+/**
+ * `fetchModels` 的日志与缓存行为。
+ *
+ * 两个**真实用户报障**：
+ *
+ * 1. 「没有账号不需要显示 `no credential resolved from store`」—— 未登录时
+ *    每次列模型都会走到无凭据分支，早期用 `console.warn` 打日志，成了纯噪声。
+ * 2. 「fetch 的 log 似乎太多了」—— 成功路径也打了 `calling …` / `got N models`，
+ *    而该方法在冷启动阶段会被 `listModels` / `resolveModel` 反复触发
+ *    （适配器的 `ensureRemoteModels` **只缓存非空结果**），于是同一行刷屏。
+ */
+describe('fetchModels 的日志与缓存', () => {
+  /** 记录 fetcher 调用次数，并挂一个 logger 替身。 */
+  function instrument(): {
+    ctx: Context
+    credentials: FakeCredentials
+    fetcher: typeof fetch
+    calls: () => number
+    warn: ReturnType<typeof vi.fn>
+  } {
+    const { ctx, credentials } = makeContext()
+    let calls = 0
+    const fetcher = (async () => {
+      calls++
+      return new Response(JSON.stringify({ function_configs: [] }), { status: 200 })
+    }) as unknown as typeof fetch
+    const warn = vi.fn()
+    ;(ctx as unknown as { logger: unknown }).logger = { warn, info: vi.fn(), error: vi.fn() }
+    return { ctx, credentials, fetcher, calls: () => calls, warn }
+  }
+
+  it('未登录时不打日志，且反复调用都返回空（不再刷屏）', async () => {
+    const { ctx, fetcher, warn } = instrument()
+    const service = newService(ctx, { fetcher })
+    // 模拟冷启动期被反复触发。
+    for (let i = 0; i < 5; i++) expect(await service.fetchModels()).toEqual([])
+    expect(warn, '未登录不是异常，不应打任何日志').not.toHaveBeenCalled()
+  })
+
+  it('成功路径不打日志（calling / got N models 已移除）', async () => {
+    const { ctx, credentials, fetcher, warn, calls } = instrument()
+    await credentials.set('TRAE_ACCESS_TOKEN', JSON.stringify(makeCredential()))
+    const service = newService(ctx, { fetcher })
+    await service.fetchModels()
+    expect(calls(), '应真的发了一次请求').toBe(1)
+    expect(warn, '成功路径不应打日志').not.toHaveBeenCalled()
+  })
+
+  it('空结果也进缓存：第二次调用不再发请求（根治日志刷屏的根因）', async () => {
+    const { ctx, credentials, fetcher, calls } = instrument()
+    await credentials.set('TRAE_ACCESS_TOKEN', JSON.stringify(makeCredential()))
+    const service = newService(ctx, { fetcher })
+    await service.fetchModels()
+    await service.fetchModels()
+    await service.fetchModels()
+    // 适配器不缓存空结果，若这里也不缓存就会每次都打真实请求。
+    expect(calls(), '空结果应被缓存，只发一次请求').toBe(1)
+  })
+
+  it('未登录时根本不发网络请求', async () => {
+    const { ctx, fetcher, calls } = instrument()
+    const service = newService(ctx, { fetcher })
+    await service.fetchModels()
+    await service.fetchModels()
+    expect(calls(), '无凭据不应发网络请求').toBe(0)
+  })
+
+  it('登出后作废缓存：不会带着旧凭据继续返回缓存结果', async () => {
+    const { ctx, credentials, fetcher, calls } = instrument()
+    await credentials.set('TRAE_ACCESS_TOKEN', JSON.stringify(makeCredential()))
+    const service = newService(ctx, { fetcher })
+    await service.fetchModels()
+    expect(calls()).toBe(1)
+    // 缓存期内再取：不发请求。
+    await service.fetchModels()
+    expect(calls()).toBe(1)
+    await service.logout()
+    await service.fetchModels()
+    // 凭据已清除 → 不发请求（证明缓存确实作废、走了真实的无凭据分支）。
+    expect(calls(), '登出后不应带着旧凭据发请求').toBe(1)
+  })
+})

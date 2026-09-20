@@ -545,6 +545,14 @@ export interface TraeRemoteModel {
    * 而非该标志的模型（含名字带 `custom_model_` 前缀但标志为 `false` 的）均可用。
    *
    * 因此它是「**仅可见但不可调用**」的权威判据，本插件据此把它们挡在模型目录外。
+   *
+   * ⚠️⚠️ **该标志会随服务端下发变化，不要把某一刻的条目名写进代码或断言**。
+   * 复测（2026-09-20）时那份 5 个条目的快照**已完全失效**：
+   * `deepseek-v4-flash` / `agnes-2.5-flash` / `silk-gpt-5.6-luna` 已**下架**，
+   * `glm-5.3-flash` / `qwen3.8-flash` 已转为 `false`（即**已可调用**），
+   * 全目录里 `is_custom_model === true` 的条目数为 **0**。
+   * 曾据此把 `qwen3.8-flash` 误记为「应被剔除」，它其实是正常可用的合法模型。
+   * 判据是**标志的值**，不是模型名。
    */
   isCustomModel?: boolean
   /**
@@ -560,6 +568,32 @@ export interface TraeRemoteModel {
   isHidden?: boolean
   /** `config_switch` —— 上游是否启用该条目；`false` 表示已停用。 */
   isEnabled?: boolean
+  /**
+   * 消耗倍率（`display_contact_config.consumption_rate.data.rate`）。
+   *
+   * ⚠️ `display_contact_config` 是**一个 JSON 字符串**（不是对象），必须二次
+   * `JSON.parse` —— 直接读 `.consumption_rate` 会得到 undefined。
+   *
+   * 实测形态是**裸数字**（如 `0.08`），既不是 buddy 的字符串 `"x0.29"`，
+   * 也不是 LobsterAI 的 `costMultiplier` 字段名。**`enable: false` 视为无倍率**
+   * （不显示，而不是当成 0）。
+   */
+  creditsRate?: number
+  /**
+   * 活动折扣的原价（`activity_discount.data.current.before_consumption_rate`）。
+   *
+   * 只有**当前确实生效**时才填充（见 {@link readActivityDiscount} 的三条判据）。
+   * 与 {@link creditsRate} 配对展示为 `x原价→x折后价`。
+   */
+  originalCreditsRate?: number
+  /**
+   * 活动结束时间（Unix **秒**）。
+   *
+   * 仅 `limited` 型折扣带该字段（实测 `end_at: 1790265540`）；`subsidy` /
+   * `off_peak` 型没有截止时间。已过期的活动**不展示**折扣价 —— 与 Qoder 的
+   * `promotion.active === false` 同类语义：显示会误导用户按折扣价预期。
+   */
+  discountEndsAtSec?: number
   /**
    * 用途（`usage`），如 `"chat_completion"`、`"multimodal"` 等。
    *
@@ -754,6 +788,113 @@ function readReasoningEffortConfig(entry: Record<string, unknown>): TraeReasonin
   }
 }
 
+/**
+ * 解析 `display_contact_config` 里的**消耗倍率**。
+ *
+ * ## 为什么必须单独一个函数
+ *
+ * `display_contact_config` 是**一个 JSON 字符串**（不是对象）：
+ * ```json
+ * "{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":0.08}},\"multimodal\":{...}}"
+ * ```
+ * 直接读 `entry.display_contact_config.consumption_rate` 永远得到 undefined。
+ *
+ * ## 三条判据（缺一不可）
+ *
+ * 1. `consumption_rate.enable !== false` —— 上游显式关闭时**不显示**，而不是当成 0；
+ * 2. `data.rate` 是**有限非负数**（实测形态是裸数字 `0.08`，不是字符串 `"x0.08"`）；
+ * 3. ⚠️ **`rate: 0` 是合法值**（免费），不能用 `> 0` 过滤 —— 这条与 Qoder 的
+ *    `price_factor: 0` 一致，是「恰好漏掉用户最关心的免费模型」的经典坑。
+ *
+ * 解析失败一律返回 undefined（**不编造倍率**：宁可只显示模型名）。
+ */
+export function readConsumptionRate(entry: Record<string, unknown>): number | undefined {
+  const raw = entry.display_contact_config ?? entry.DisplayContactConfig
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  const config = parseJsonObject(raw)
+  if (config === undefined) return undefined
+  const rate = config.consumption_rate ?? config.ConsumptionRate
+  if (typeof rate !== 'object' || rate === null) return undefined
+  const rateRecord = rate as Record<string, unknown>
+  if (readBooleanField(rateRecord, 'enable') === false) return undefined
+  const data = rateRecord.data ?? rateRecord.Data
+  if (typeof data !== 'object' || data === null) return undefined
+  const value = readNumberField(data as Record<string, unknown>, 'rate')
+  return value !== undefined && value >= 0 ? value : undefined
+}
+
+/**
+ * 解析 `activity_discount` —— 只在**当前确实生效**时返回原价与截止时间。
+ *
+ * ## 为什么不能只看 `enable: true`
+ *
+ * 实测陷阱：`enable` 为 `true` 但**当前并没有折扣**。`off_peak` 型条目形如
+ * `{type:"none", before:0.13, after:0.13, discount:100}` —— `discount: 100`
+ * 表示「无折扣」（百分比制），`before === after`。若照显会显示
+ * `x0.13→x0.13`，让用户以为有活动。这与 Qoder 的 `promotion.active === false`
+ * 是同类语义，处理方式也必须一致：**不展示**。
+ *
+ * 三条判据：
+ * 1. `activity_discount.enable !== false`；
+ * 2. `data.current` 存在，且 `discount_type` **不是 `"none"`**；
+ * 3. `before_consumption_rate` 是有限正数，且**严格大于** `after`（真正的降价）。
+ *
+ * `end_at`（Unix 秒）仅 `limited` 型带；**已过期**时整个折扣视为不存在 ——
+ * 否则用户会按折扣价预期、实际被按原价计费。
+ */
+export function readActivityDiscount(
+  entry: Record<string, unknown>,
+  nowSec: number = Math.floor(Date.now() / 1000),
+): { originalRate: number; endsAtSec?: number } | undefined {
+  const raw = entry.display_contact_config ?? entry.DisplayContactConfig
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  const config = parseJsonObject(raw)
+  if (config === undefined) return undefined
+  const discount = config.activity_discount ?? config.ActivityDiscount
+  if (typeof discount !== 'object' || discount === null) return undefined
+  const discountRecord = discount as Record<string, unknown>
+  if (readBooleanField(discountRecord, 'enable') === false) return undefined
+  const data = discountRecord.data ?? discountRecord.Data
+  if (typeof data !== 'object' || data === null) return undefined
+  const dataRecord = data as Record<string, unknown>
+  const current = dataRecord.current ?? dataRecord.Current
+  if (typeof current !== 'object' || current === null) return undefined
+  const currentRecord = current as Record<string, unknown>
+  // `discount_type: "none"` = 当前无活动（实测 off_peak 型即为此）。
+  const type = (readStringField(currentRecord, 'discount_type')
+    || readStringField(currentRecord, 'discountType')).trim().toLowerCase()
+  if (type.length === 0 || type === 'none') return undefined
+  const before = readNumberField(currentRecord, 'before_consumption_rate')
+    ?? readNumberField(currentRecord, 'beforeConsumptionRate')
+  const after = readNumberField(currentRecord, 'consumption_rate')
+    ?? readNumberField(currentRecord, 'consumptionRate')
+  // 必须是真的降价：before 有值、为正、且严格大于 after。
+  if (before === undefined || before <= 0) return undefined
+  if (after !== undefined && before <= after) return undefined
+  // 截止时间：取 data 下任意带 end_at 的子对象（limited / 未来的新活动类型）。
+  let endsAtSec: number | undefined
+  for (const value of Object.values(dataRecord)) {
+    if (typeof value !== 'object' || value === null) continue
+    const end = readNumberField(value as Record<string, unknown>, 'end_at')
+      ?? readNumberField(value as Record<string, unknown>, 'endAt')
+    if (end !== undefined && end > 0) { endsAtSec = end; break }
+  }
+  // 已过期的活动不再是「当前生效」。
+  if (endsAtSec !== undefined && endsAtSec <= nowSec) return undefined
+  return endsAtSec === undefined ? { originalRate: before } : { originalRate: before, endsAtSec }
+}
+
+/** 宽松解析 JSON 对象字符串；非对象（数组/标量/非法 JSON）返回 undefined。 */
+function parseJsonObject(raw: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    return parsed as Record<string, unknown>
+  } catch {
+    return undefined
+  }
+}
+
 /** 解析单条 `config_info_list` 条目（两个端点的条目形状一致）。 */
 function parseTraeConfigEntry(
   entry: Record<string, unknown>,
@@ -788,6 +929,9 @@ function parseTraeConfigEntry(
   const maxContextWindow = readMaxContextWindowField(entry)
   const maxModeOutputTokens = readDetailMaxTokens(entry, '__max')
   const reasoningConfig = readReasoningEffortConfig(entry)
+  // 计费：`display_contact_config` 里的倍率与活动折扣（两次 JSON.parse）。
+  const creditsRate = readConsumptionRate(entry)
+  const discount = readActivityDiscount(entry)
   return {
     id,
     name,
@@ -802,6 +946,9 @@ function parseTraeConfigEntry(
     ...maxModeOutputTokens === undefined ? {} : { maxModeOutputTokens },
     ...contextWindow === undefined ? {} : { contextWindow },
     ...maxOutputTokens === undefined ? {} : { maxOutputTokens },
+    ...creditsRate === undefined ? {} : { creditsRate },
+    ...discount === undefined ? {} : { originalCreditsRate: discount.originalRate },
+    ...discount?.endsAtSec === undefined ? {} : { discountEndsAtSec: discount.endsAtSec },
   }
 }
 

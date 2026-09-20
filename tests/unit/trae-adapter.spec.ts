@@ -168,6 +168,66 @@ describe('TRAE 适配器 · listModels', () => {
   })
 
   /**
+   * 消耗倍率（`display_contact_config.consumption_rate.data.rate`）。
+   *
+   * 项目约定：倍率**必须拼进 `name`** —— composer 的模型切换菜单只渲染 `name`，
+   * `description` 完全不读（用户报障「消耗倍率没有显示在切换模型列表的后面」）。
+   */
+  describe('消耗倍率进展示名', () => {
+    it('常态倍率拼成 `名字 · x倍率`', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'qwen3.8-flash', name: 'Qwen3.8-Flash', creditsRate: 0.08 }],
+      })
+      const models = await adapter.listModels('trae')
+      expect(models[0]!.name).toBe('Qwen3.8-Flash · x0.08')
+    })
+
+    it('活动期内显示 `原价→折后价`', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{
+          id: 'doubao', name: 'Doubao Seed 2.1 Pro',
+          creditsRate: 0.08, originalCreditsRate: 0.8, discountEndsAtSec: 1790265540,
+        }],
+      })
+      const models = await adapter.listModels('trae')
+      expect(models[0]!.name).toBe('Doubao Seed 2.1 Pro · x0.8→x0.08')
+    })
+
+    it('倍率为 0 是「免费」（合法值，不能当成无倍率）', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'free', name: 'Free Model', creditsRate: 0 }],
+      })
+      const models = await adapter.listModels('trae')
+      expect(models[0]!.name).toBe('Free Model · 免费')
+    })
+
+    it('无倍率信息时只显示模型名（不编造 x1）', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'unknown', name: 'Unknown Model' }],
+      })
+      const models = await adapter.listModels('trae')
+      expect(models[0]!.name).toBe('Unknown Model')
+    })
+
+    it('原价不高于折后价时不显示箭头（避免 x0.5→x0.5 这类无意义展示）', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'x', name: 'X', creditsRate: 0.5, originalCreditsRate: 0.5 }],
+      })
+      const models = await adapter.listModels('trae')
+      expect(models[0]!.name).toBe('X · x0.5')
+    })
+
+    it('兜底表路径不带倍率（兜底表无该字段，不猜价格）', async () => {
+      const { adapter } = makeAdapter()
+      const models = await adapter.listModels('trae')
+      // 兜底表条目名里不应出现 ` · x`。
+      for (const model of models) {
+        expect(model.name, model.id).not.toMatch(/ · x\d/)
+      }
+    })
+  })
+
+  /**
    * 「仅可见但不可调用」的自定义模型必须被挡在目录外。
    *
    * 实测（2026-09-19）：`display_config.is_custom_model === true` 的模型

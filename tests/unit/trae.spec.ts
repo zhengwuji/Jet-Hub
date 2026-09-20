@@ -45,7 +45,9 @@ import {
   parseTraeModelList,
   parseTraeSSELine,
   parseTraeUserInfoResponse,
+  readActivityDiscount,
   readBooleanField,
+  readConsumptionRate,
   readNumberField,
   readStringField,
   traeCredentialExpiresAtMs,
@@ -335,11 +337,15 @@ describe('模型列表解析', () => {
    * `display_config.is_custom_model` —— 「仅可见但不可调用」的权威判据。
    *
    * 实测（2026-09-19，遍历 45 个远端模型）：该标志为 `true` 的 5 个模型
-   * （`deepseek-v4-flash` / `glm-5.3-flash` / `qwen3.8-flash` /
-   * `agnes-2.5-flash` / `silk-gpt-5.6-luna`）**全部**被上游以流内
-   * `event:error code=4001 param is invalid` 拒绝；其余（含名字带
-   * `custom_model_` 前缀但该标志为 `false` 的）均正常。适配器据此把它们
-   * 挡在模型目录外。
+   * **全部**被上游以流内 `event:error code=4001 param is invalid` 拒绝；
+   * 其余（含名字带 `custom_model_` 前缀但该标志为 `false` 的）均正常。
+   * 适配器据此把它们挡在模型目录外。
+   *
+   * ⚠️ **那 5 个条目的名单已过期**（复测 2026-09-20）：`deepseek-v4-flash` /
+   * `agnes-2.5-flash` / `silk-gpt-5.6-luna` 已下架，`glm-5.3-flash` /
+   * `qwen3.8-flash` 已转为 `false`（已可调用），全目录 custom 条目数为 0。
+   * 故用例**只用合成条目**（`bad` / `good`），不写真实模型名 ——
+   * 把某一刻的快照当判据，会让后人误删合法模型（`qwen3.8-flash` 就被误记过）。
    */
   describe('is_custom_model 标志（4001 真实缺陷回归）', () => {
     it('true / false 都被如实读出', () => {
@@ -1000,6 +1006,166 @@ describe('OpenAI chunk 构造', () => {
 
   it('[DONE] 信号格式正确', () => {
     expect(OPENAI_DONE).toBe('data: [DONE]\n\n')
+  })
+})
+
+/**
+ * 计费字段解析：`display_contact_config` 是一个 **JSON 字符串**，必须二次解析。
+ *
+ * 实测形态（2026-09-20，真实账号）：
+ * ```json
+ * "{\"consumption_rate\":{\"enable\":true,\"data\":{\"rate\":0.08}},
+ *   \"activity_discount\":{\"enable\":true,\"subKey\":\"limited_discount\",
+ *     \"data\":{\"current\":{\"discount_type\":\"limited\",
+ *       \"before_consumption_rate\":0.8,\"consumption_rate\":0.08,\"discount\":10},
+ *       \"limited\":{...,\"end_at\":1790265540}}}}"
+ * ```
+ */
+describe('TRAE 计费字段解析（display_contact_config）', () => {
+  const dc = (obj: unknown): Record<string, unknown> => ({ display_contact_config: JSON.stringify(obj) })
+
+  describe('readConsumptionRate', () => {
+    it('读出裸数字倍率（实测形态不是字符串 "x0.08"）', () => {
+      expect(readConsumptionRate(dc({ consumption_rate: { enable: true, data: { rate: 0.08 } } }))).toBe(0.08)
+    })
+
+    it('倍率为 0 是合法值（免费），不能被当成「无倍率」', () => {
+      // 与 Qoder 的 price_factor: 0 同类：用 > 0 过滤会恰好漏掉免费模型。
+      expect(readConsumptionRate(dc({ consumption_rate: { enable: true, data: { rate: 0 } } }))).toBe(0)
+    })
+
+    it('enable=false 视为无倍率（而不是当成 0）', () => {
+      expect(readConsumptionRate(dc({ consumption_rate: { enable: false, data: { rate: 0.5 } } }))).toBeUndefined()
+    })
+
+    it('字段缺失 / 非法 JSON / 非对象 一律 undefined（不编造倍率）', () => {
+      expect(readConsumptionRate({})).toBeUndefined()
+      expect(readConsumptionRate({ display_contact_config: '' })).toBeUndefined()
+      expect(readConsumptionRate({ display_contact_config: 'not json' })).toBeUndefined()
+      expect(readConsumptionRate({ display_contact_config: '[1,2]' })).toBeUndefined()
+      expect(readConsumptionRate(dc({}))).toBeUndefined()
+      expect(readConsumptionRate(dc({ consumption_rate: { enable: true } }))).toBeUndefined()
+    })
+
+    it('负数与噪声不被采信', () => {
+      expect(readConsumptionRate(dc({ consumption_rate: { enable: true, data: { rate: -1 } } }))).toBeUndefined()
+      expect(readConsumptionRate(dc({ consumption_rate: { enable: true, data: { rate: 'abc' } } }))).toBeUndefined()
+    })
+  })
+
+  describe('readActivityDiscount', () => {
+    const NOW = 1_789_905_263
+    const limited = {
+      activity_discount: {
+        enable: true, subKey: 'limited_discount',
+        data: {
+          current: { discount_type: 'limited', before_consumption_rate: 0.8, consumption_rate: 0.08, discount: 10 },
+          limited: { before_consumption_rate: 0.8, after_consumption_rate: 0.08, discount: 10, end_at: 1_790_265_540 },
+        },
+      },
+    }
+
+    it('limited 型：给出原价与截止时间', () => {
+      expect(readActivityDiscount(dc(limited), NOW)).toEqual({ originalRate: 0.8, endsAtSec: 1_790_265_540 })
+    })
+
+    it('⚠️ discount_type="none" 时不算活动（实测 off_peak 陷阱）', () => {
+      // 实测 `enable: true` 但 current 是 {type:"none", before:0.13, after:0.13, discount:100}
+      // —— 照显会得到 `x0.13→x0.13`，让用户以为有活动。与 Qoder 的
+      // promotion.active === false 同类语义，必须不展示。
+      const offPeak = {
+        activity_discount: {
+          enable: true, subKey: 'off_peak_member_discount',
+          data: {
+            current: { discount_type: 'none', before_consumption_rate: 0.13, consumption_rate: 0.13, discount: 100 },
+            member: { before_consumption_rate: 0.13, after_consumption_rate: 0.13, discount: 100 },
+            off_peak: { before_consumption_rate: 0.13, after_consumption_rate: 0.13, discount: 100 },
+          },
+        },
+      }
+      expect(readActivityDiscount(dc(offPeak), NOW)).toBeUndefined()
+    })
+
+    it('原价不高于折后价时不算活动', () => {
+      const noop = {
+        activity_discount: {
+          enable: true,
+          data: { current: { discount_type: 'limited', before_consumption_rate: 0.5, consumption_rate: 0.5 } },
+        },
+      }
+      expect(readActivityDiscount(dc(noop), NOW)).toBeUndefined()
+    })
+
+    it('⚠️ 已过期的活动不展示（否则用户按折扣价预期、实际按原价计费）', () => {
+      const expired = {
+        activity_discount: {
+          enable: true,
+          data: {
+            current: { discount_type: 'limited', before_consumption_rate: 0.8, consumption_rate: 0.08 },
+            limited: { end_at: NOW - 10 },
+          },
+        },
+      }
+      expect(readActivityDiscount(dc(expired), NOW)).toBeUndefined()
+    })
+
+    it('无截止时间的活动（subsidy 型）照常返回原价', () => {
+      const subsidy = {
+        activity_discount: {
+          enable: true, subKey: 'subsidy_member_discount',
+          data: { current: { discount_type: 'subsidy', before_consumption_rate: 0.4, consumption_rate: 0.2 } },
+        },
+      }
+      expect(readActivityDiscount(dc(subsidy), NOW)).toEqual({ originalRate: 0.4 })
+    })
+
+    it('enable=false / 字段缺失 / 非法 JSON 一律 undefined', () => {
+      expect(readActivityDiscount({}, NOW)).toBeUndefined()
+      expect(readActivityDiscount({ display_contact_config: 'x' }, NOW)).toBeUndefined()
+      expect(readActivityDiscount(dc({ activity_discount: { enable: false, data: {} } }), NOW)).toBeUndefined()
+      expect(readActivityDiscount(dc({ activity_discount: { enable: true } }), NOW)).toBeUndefined()
+    })
+  })
+
+  describe('parseTraeBatchModelList 接线', () => {
+    it('倍率与活动折扣被写进模型条目', () => {
+      const models = parseTraeBatchModelList({
+        function_configs: [{
+          function: 'solo_agent',
+          config_info_list: [{
+            config_name: 'qwen3.8-flash',
+            usage: 'chat_completion',
+            config_switch: true,
+            display_config: { display_name: 'Qwen3.8-Flash', is_custom_model: false },
+            display_contact_config: JSON.stringify({
+              consumption_rate: { enable: true, data: { rate: 0.08 } },
+              activity_discount: {
+                enable: true,
+                data: {
+                  current: { discount_type: 'limited', before_consumption_rate: 0.8, consumption_rate: 0.08 },
+                  limited: { end_at: 1_790_265_540 },
+                },
+              },
+            }),
+          }],
+        }],
+      })
+      expect(models).toHaveLength(1)
+      expect(models[0]!.creditsRate).toBe(0.08)
+      expect(models[0]!.originalCreditsRate).toBe(0.8)
+      expect(models[0]!.discountEndsAtSec).toBe(1_790_265_540)
+    })
+
+    it('无计费字段时不产生倍率键（保持 undefined，不填 0）', () => {
+      const models = parseTraeBatchModelList({
+        function_configs: [{
+          function: 'solo_agent',
+          config_info_list: [{ config_name: 'x', usage: 'chat_completion', config_switch: true }],
+        }],
+      })
+      expect(models[0]).not.toHaveProperty('creditsRate')
+      expect(models[0]).not.toHaveProperty('originalCreditsRate')
+    })
   })
 })
 

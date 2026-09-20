@@ -583,6 +583,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       makeAuth('codearts') as never,
       {} as never, {} as never,
       makeAuth('lobsterai') as never,
+      makeAuth('qoder') as never,
       makeAuth('trae') as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -610,7 +611,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
    */
   const FAST_BUDGET_MS = 2000
 
-  it.each(['codearts', 'lobsterai', 'trae'])(
+  it.each(['codearts', 'lobsterai', 'qoder', 'trae'])(
     '%s 在用户完成授权之前就返回 loginUrl（不阻塞）',
     async (provider) => {
       const { call, calls } = registerCreateEndpoints({ twoPhase: true })
@@ -714,7 +715,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     }
     registerJetHubRpc(
       ctx as never, pool as never,
-      {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
       failingAuth as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -1175,6 +1176,41 @@ describe('积分端点的 provider 能力边界', () => {
     expect((result.value as { summary: unknown }).summary).toEqual({
       claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
     })
+  })
+
+  /**
+   * TRAE 的 claim 分支**必须开启状态预检**。
+   *
+   * 真实缺陷（用户报障：「领取积分显示成功但是加 0 积分」的成因之二）：
+   * TRAE 的 claim 对「今天已签到」是**幂等**的 —— 实测重复领取同样返回
+   * `{code:0, message:"success"}`，与真正领取成功**无法区分**。早期照抄
+   * LobsterAI 传了 `precheckStatus: false`（那是「LobsterAI 的领取流程内部
+   * 已做 slot/context 预检」的理由，TRAE 没有这回事），于是已签到的账号被
+   * 报成「领取成功」。判据只能是 status 端点的 `checked_in`。
+   *
+   * 用源码级断言而非行为断言：本用例要锁的是「这一行配置别被改回去」，
+   * 与仓库里 `qoder-wiring.spec.ts` 守卫接线的方式一致。
+   */
+  it('TRAE 的 claim 分支开启状态预检并注入 fetchStatus（源码级守卫）', () => {
+    // 注意 `here` 是同级另一个 describe 内的局部常量，此处不可见，故就地算路径。
+    const srcPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/jet-hub-rpc.ts')
+    const source = readFileSync(srcPath, 'utf8')
+    // 从 claimAll 的 TRAE 分支起算（前面 credits.status 分支里也有同名判断，
+    // 用 `collectClaimResults<TraeCredential` 定位更准）。
+    const start = source.indexOf('collectClaimResults<TraeCredential')
+    expect(start).toBeGreaterThan(-1)
+    // 截到该分支的收尾 `return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }`
+    // 之后，避免扫到后续其它 provider 分支。
+    const rest = source.slice(start)
+    const end = rest.indexOf('RpcCreditsClaimAllResponse }')
+    const branch = end > -1 ? rest.slice(0, end) : rest.slice(0, 2000)
+    // 剔除注释行：本文件在注释里叙述了这条缺陷的成因（含 precheckStatus 字样）。
+    const code = branch
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(code, 'TRAE 分支不得关闭状态预检').not.toContain('precheckStatus: false')
+    expect(code, 'TRAE 分支必须注入 fetchStatus').toContain('fetchStatus:')
   })
 })
 

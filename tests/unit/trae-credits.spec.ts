@@ -53,16 +53,44 @@ function failedWith(outcome: unknown): { errorType?: string; cooldownSecs?: numb
 }
 
 describe('claimTraeDailyCheckin · 对齐 trae-mate', () => {
-  it('成功时返回 credit 与 streakDays', async () => {
-    const { fetcher } = stubFetcher([{ code: 0, credits: 100, streak_days: 3 }])
+  /**
+   * ⚠️ **claim 响应不含积分数**（真实缺陷回归）。
+   *
+   * 实测（2026-09-20）claim 的完整响应就是 `{"code":0,"message":"success"}` ——
+   * 没有任何 credits 字段。早期实现读 `body.credits`，于是**恒为 0**，界面显示
+   * 「1 个账号领取成功（+0 积分）」而 IDE 里明明写着 150（用户报障）。
+   *
+   * 真实数值只在 **status 端点**的 `credits` 字段里（实测 `credits:150`，与积分
+   * 余额中「签到奖励」包的 `credits_limit:150` 完全吻合）。故领取成功后补查一次
+   * 状态。桩按调用次序返回：第 1 次 claim、第 2 次 status。
+   */
+  it('成功时从 status 补查真实所得（claim 响应本身没有数量）', async () => {
+    const { fetcher } = stubFetcher([
+      { code: 0, message: 'success' },                        // claim
+      { code: 0, checked_in: true, credits: 150, streak_days: 3, enable: true }, // status
+    ])
     const outcome = await claimTraeDailyCheckin(makeCredential(), TRAE, fetcher)
-    expect(outcome).toMatchObject({ kind: 'claimed', credit: 100, streakDays: 3 })
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150, streakDays: 3 })
   })
 
-  it('成功时 credit 缺失返回 0（不崩溃）', async () => {
-    const { fetcher } = stubFetcher([{ code: 0 }])
+  it('补查失败时 credit 为 0，但仍是 claimed（不因补查而判失败）', async () => {
+    // status 返回非 0 业务码 → fetchTraeCheckinStatus 返回 null → credit 兜底 0。
+    const { fetcher } = stubFetcher([
+      { code: 0, message: 'success' },
+      { code: 500, message: 'oops' },
+    ])
     const outcome = await claimTraeDailyCheckin(makeCredential(), TRAE, fetcher)
     expect(outcome).toMatchObject({ kind: 'claimed', credit: 0 })
+  })
+
+  it('⚠️ 不再从 claim 响应读 credits（那是恒 0 的旧缺陷）', async () => {
+    // 即便 claim 响应**伪造**一个 credits，也不该采信 —— 真实协议里没有该字段。
+    const { fetcher } = stubFetcher([
+      { code: 0, message: 'success', credits: 999 },
+      { code: 0, checked_in: true, credits: 150, enable: true },
+    ])
+    const outcome = await claimTraeDailyCheckin(makeCredential(), TRAE, fetcher)
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150 })
   })
 
   it('9074 不再重试（基于 user_id 确定性派生设备身份，天然独立）', async () => {

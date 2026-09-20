@@ -225,7 +225,7 @@ export async function fetchTraeCheckinStatus(
  */
 export async function claimTraeDailyCheckin(
   credential: TraeCredential,
-  _product: TraeProduct,
+  product: TraeProduct,
   fetcher: typeof fetch = fetch,
   generation = 0,
   onRotate?: (nextGeneration: number) => void | Promise<void>,
@@ -278,11 +278,19 @@ export async function claimTraeDailyCheckin(
   const msg = readString(body, 'message') || readString(body, 'msg') || ''
 
   if (code === 0) {
-    const credits = readNumber(body, 'credits') || 0
+    // ⚠️ **claim 响应不含积分数**：实测（2026-09-20）它的完整响应就是
+    // `{"code":0,"message":"success"}`，没有 credits 字段。早期实现读
+    // `body.credits` 因此恒为 0，界面显示「领取成功 +0 积分」（用户报障），
+    // 而 IDE 里明明写着 150。
+    //
+    // 真实数值只在 **status 端点**的 `credits` 字段里（实测 `credits:150`，
+    // 与积分余额中「签到奖励」包的 `credits_limit:150` 完全吻合）。
+    // 故领取成功后补查一次状态 —— 多一次往返，换取如实报告所得。
+    const status = await fetchTraeCheckinStatus(credential, product, fetcher)
     return {
       kind: 'claimed',
-      credit: credits,
-      streakDays: readNumber(body, 'streak_days') || 0,
+      credit: status?.dailyCredit ?? 0,
+      streakDays: status?.streakDays ?? 0,
       isStreakDay: false,
     }
   }

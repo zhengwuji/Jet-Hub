@@ -52,6 +52,7 @@ import {
 } from './codearts-credits.js'
 import {
   claimTraeDailyCheckin,
+  fetchTraeCheckinStatus,
   fetchTraeCreditBalance,
 } from './trae-credits.js'
 import {
@@ -948,8 +949,16 @@ function registerJetHubEndpoints(
         if (req.provider === TRAE.id) {
           const value = await collectClaimResults<TraeCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            // 9074 的限流范围是 device_id 而非账号：命中后换一个派生设备号重试
-            // 一次，并把新代次持久化到账号条目（见 trae-credits.ts）。
+            // ⚠️ **必须开启状态预检**（`precheckStatus` 默认为 true，不要传 false）。
+            //
+            // TRAE 的 claim 对「今天已签到」是**幂等**的：实测重复领取同样返回
+            // `{code:0, message:"success"}`，与真正领取成功**无法区分**。
+            // 早期照抄 LobsterAI 传了 `precheckStatus: false`（那是「领取流程内部
+            // 已做 slot/context 预检」的理由，TRAE 没有这回事），于是已签到的账号
+            // 被报成「领取成功」（用户报障：显示成功但 +0 积分）。
+            // 判据只能是 status 端点的 `checked_in`。
+            fetchStatus: (credential) =>
+              fetchTraeCheckinStatus(credential as TraeCredential, TRAE, fetch),
             claim: (credential, _product, entry) =>
               claimTraeDailyCheckin(
                 credential as TraeCredential,
@@ -958,7 +967,6 @@ function registerJetHubEndpoints(
                 pool.traeCheckinDeviceGenerationFor(entry.id),
                 (next) => pool.updateTraeCheckinDeviceGeneration(entry.id, next),
               ),
-            precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }

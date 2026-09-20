@@ -37,7 +37,7 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
   })
 
   it('Jet Hub RPC 传入 qoder 实例', () => {
-    expect(index).toContain('registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder)')
+    expect(index).toContain('registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae)')
   })
 
   it('续期调度只看 refreshable，不看 enabled（AGENTS.md 强制约定）', () => {

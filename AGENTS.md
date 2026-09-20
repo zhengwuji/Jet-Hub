@@ -249,6 +249,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 | `buddy` / `workbuddy` | `modelPromotions[].discount.discountedCredits` | **字符串 `"0.50x"`（x 在后！）**，已结束占位为 `"0x"` | `normalizeDiscountedRate` |
 | `lobsterai` | `data[].costMultiplier` | **裸数字 `0.05`** | `displayNameFor` 里拼 `x${n}` |
 | `qoder` | 目录 `chat[].price_factor` | **裸数字**，`0` = **免费**，另有 `original_price_factor` + `promotion` | `qoderDisplayName` |
+| `trae` | `display_contact_config.consumption_rate.data.rate`（**该字段本身是 JSON 字符串，须二次 `JSON.parse`**） | **裸数字** `0.08`；`0` = 免费；`enable:false` = 无倍率 | `traeDisplayName`（活动期拼 `x原价→x折后价`） |
 | `codearts` | 无 | 两个目录端点都不含计费字段 | — |
 
 要点与坑：
@@ -264,6 +265,58 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
   否则出现「x0.05 · …x0.05…」重复
 - `reconcileWithFallback` 是**白名单式重建**：新增的远端字段不在此显式搬运就会
   被静默丢弃（`creditsRate` / `discountedCreditsRate` 已加）
+
+### TRAE 倍率（藏在 `display_contact_config` 里，且该字段是** JSON 字符串**）
+
+⚠️ **最大的坑**：`display_contact_config` 的值是**一个字符串**，里面才是 JSON。
+直接读 `entry.display_contact_config.consumption_rate` 永远得到 `undefined` ——
+必须 `JSON.parse` 两次（外层响应一次、这个字段再一次）。解析函数
+`readConsumptionRate` / `readActivityDiscount`（`src/trae.ts`）。
+
+```json
+{ "consumption_rate": { "enable": true, "data": { "rate": 0.08 } },
+  "activity_discount": { "enable": true, "subKey": "limited_discount",
+    "data": { "current": { "discount_type": "limited",
+                          "before_consumption_rate": 0.8,
+                          "consumption_rate": 0.08, "discount": 10 },
+              "limited": { "end_at": 1790265540 } } } }
+```
+
+- 倍率是 **裸数字**（`0.08`），既不是 buddy 的字符串 `"x0.29"`，也不是
+  LobsterAI 的 `costMultiplier`
+- ⚠️ **`rate: 0` 是「免费」，是合法值** —— 与 Qoder 的 `price_factor: 0` 同类，
+  用 `> 0` 过滤会恰好漏掉免费模型；展示为「免费」而非 `x0`
+- ⚠️ **`consumption_rate.enable === false` 视为「无倍率」**，不是「倍率 0」
+
+#### ⚠️ `activity_discount.enable === true` **不等于**当前有折扣
+
+**实测陷阱**（2026-09-20，与 Qoder 的 `promotion.active === false` 同类）：
+`off_peak` 型条目形如
+
+```json
+{ "type": "none", "before_consumption_rate": 0.13,
+  "after_consumption_rate": 0.13, "discount": 100 }
+```
+
+`enable` 是 `true`，但 `discount_type` 为 **`"none"`**、`before === after`
+（`discount: 100` 是百分比制下的「无折扣」）。**照显会得到 `x0.13→x0.13`**，
+让用户以为有活动。三条判据缺一不可（`readActivityDiscount`）：
+
+1. `enable !== false`；
+2. `data.current.discount_type` 存在且**不是 `"none"`**；
+3. `before_consumption_rate` 为正，且**严格大于** `consumption_rate`。
+
+另外 ⚠️ **`end_at`（Unix 秒）仅 `limited` 型带**（`subsidy` / `off_peak` 没有）。
+**已过期必须整个不展示折扣** —— 否则用户按折扣价预期、实际被按原价计费。
+
+展示形态由 `traeDisplayName`（`src/trae-adapter.ts`）拼装：
+常态 `Qwen3.8-Flash · x0.08`；活动期 `Seed-2.1-Pro · x0.8→x0.08`。
+`resolveModel` 的 `name` **不带**倍率（与 Qoder 一致）。兜底表路径**不显示倍率**
+（兜底表无该字段，不猜价格）。
+
+实测参考值（2026-09-20，`solo_agent` 可见集）：`glm-5.3-flash` x0.06、
+`qwen3.8-flash` x0.08、`deepseek-v4.1-flash` x0.13、`glm-5.2` x0.78、
+`qwen3.8-max` x1.5、`kimi-k3` x1.83；同一模型在三个通道的 `rate` **一致**。
 
 ### Qoder 倍率（`price_factor`，与腾讯系语义不同）
 
@@ -425,8 +478,14 @@ Please try with a valid param. (code=4001)`」）。
 | ② **发错了通道** | 该模型不在所发 `function` 的目录里 | 见下路由矩阵 |
 | ③ 请求头 `content-type` 被叠成重复值 | 实际发出 `"application/json, application/json"` | HTTP 400 + `code=4001 binding: … missing required parameter` |
 
-**①** 的 5 个条目：`deepseek-v4-flash` / `glm-5.3-flash` / `qwen3.8-flash` /
-`agnes-2.5-flash` / `silk-gpt-5.6-luna`。
+**①** 的 5 个条目（2026-09-19 快照）：`deepseek-v4-flash` / `glm-5.3-flash` /
+`qwen3.8-flash` / `agnes-2.5-flash` / `silk-gpt-5.6-luna`。
+
+> ⚠️ **该名单已过期，不要再据此删模型**（复测 2026-09-20）：`deepseek-v4-flash` /
+> `agnes-2.5-flash` / `silk-gpt-5.6-luna` 已**下架**；`glm-5.3-flash` /
+> `qwen3.8-flash` 已转为 `is_custom_model: false`，**是正常可调用的合法模型**；
+> 全目录 custom 条目数为 **0**。判据是**标志的值**，不是模型名 —— 曾把
+> `qwen3.8-flash` 误记为「应被剔除」，差点误删一个可用模型。
 
 **② 是本节重点**。实测路由矩阵（2026-09-19，逐模型 × 逐通道）：
 
@@ -761,6 +820,20 @@ res.writeHead(400, ...); res.end(...); return   // ← 没有 resolve 也没有 
 - **9074 不再换设备号重试**：设备身份已由 `uid` 确定性决定、每账号独立，
   「换个派生 id 立刻成功」的旧前提不成立。命中 9074 时归为 `BusinessError`（300s 冷却）
   并如实上报。
+- ⚠️ **claim 响应不含积分数，必须补查 status**：`checkin_credits/claim` 的完整响应
+  就是 `{"code":0,"message":"success"}`。**真实用户报障**：「领取积分显示成功但是加
+  0 积分」—— 早期实现读 claim 响应的 `credits`，而该字段根本不存在，故**恒为 0**。
+  所得数值只在 **status 端点**的 `credits` 字段里（实测 `150`，与积分余额中
+  「签到奖励」包的 `credits_limit:150` 吻合）。现在 `claimTraeDailyCheckin` 在
+  `code === 0` 后补查一次 status；补查失败时 `credit` 为 0 但**仍是 claimed**
+  （不因补查失败而把成功判成失败）。
+- ⚠️ **claim 对「今天已签到」是幂等的**：实测重复领取同样返回
+  `{code:0, message:"success"}`，与真正成功**无法区分**。因此 `credits.claimAll`
+  的 TRAE 分支**必须开启状态预检**（`collectClaimResults` 的 `precheckStatus` 保持
+  默认 true 并注入 `fetchStatus`）—— 早期照抄 LobsterAI 传了 `precheckStatus: false`
+  （那是「LobsterAI 领取流程内部已做 slot/context 预检」的理由，TRAE 没有这回事），
+  于是已签到的账号被报成「领取成功」。判据只能是 status 的 `checked_in`。
+  已有源码级守卫（`tests/unit/jet-hub-rpc.spec.ts` 的「TRAE 的 claim 分支开启状态预检」）。
 - **错误分类**（`classifyTraeCheckinError`，对齐 `cooldown.rs`）：
   `200+1005 → PlanLimit(12h)` / `429 → SoftRate(60s)` / `401 → SessionDead(永久)` /
   `404 → NotFound(60s)` / `5xx → Server(600s)` / `4xx → Client(600s)` /

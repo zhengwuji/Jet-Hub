@@ -140,6 +140,26 @@ export class TraeAuth extends Service {
   /** 登录会话是否仍处于活跃状态；logout()/stop() 置 false，防止在途刷新回写已登出凭据。 */
   private active = true
 
+  /**
+   * 模型目录缓存（含**空结果**）与拉取时刻。
+   *
+   * ⚠️ 为什么需要它：适配器的 `ensureRemoteModels` 是**只缓存非空结果**的
+   * （全仓库四个适配器同一模式）—— 拉到空数组时 `remoteModels` 保持 undefined，
+   * 于是**下一次** `listModels` / `resolveModel` 会再拉一次。
+   *
+   * 「未登录 TRAE」恰好就是恒空的情形：用户每打开一次模型选择器、每次
+   * 解析模型都发起一次真实 HTTP 请求。用户报障的日志刷屏
+   * （同一行 `fetchModels: calling …` 重复数十次）正是这么来的。
+   *
+   * 故这里**连同空结果一起缓存**，并给一个短 TTL（登录后 30s 内即可自愈，
+   * 不需要用户重启宿主）。缓存的是「这次拉取的结果」，与是否有凭据无关 ——
+   * 无凭据时直接返回空并缓存，避免重复走一遍凭据解析。
+   */
+  private modelsCache: { models: TraeRemoteModel[]; at: number } | undefined
+
+  /** 模型目录缓存有效期（毫秒）。短 TTL：新登录的账号最多 30s 后可见。 */
+  private static readonly MODELS_CACHE_TTL_MS = 30_000
+
   constructor(ctx: Context, private readonly options: TraeAuthOptions = {}) {
     const product = options.product ?? TRAE
     super(ctx, options.serviceName ?? `${product.id}Auth`)
@@ -201,6 +221,9 @@ export class TraeAuth extends Service {
     await this.ctx.credentials.set(ref, flow.access)
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined
+    // 新凭据落地 → 作废模型缓存，让新登录的账号立刻能列出模型
+    // （否则未登录期间缓存的空结果会挡住最长 30s）。
+    this.modelsCache = undefined
     this.scheduleRefresh()
     const credential = parseCredential(flow.access)
     if (flowOptions.accountId !== undefined && flowOptions.pool !== undefined) {
@@ -401,6 +424,8 @@ export class TraeAuth extends Service {
     this.active = false
     this.scheduler.stop()
     await this.ctx.credentials.unset(credentialRef(this.credentialRefName))
+    // 凭据已清除 → 作废模型缓存，避免登出后仍短暂列出上一个账号的模型。
+    this.modelsCache = undefined
   }
 
   /** 停止刷新调度（不清理凭据）。 */
@@ -429,9 +454,34 @@ export class TraeAuth extends Service {
   }
 
   /**
-   * 获取 TRAE 模型列表（`get_detail_param`）。
+   * 获取 TRAE 模型列表（`batch_get_detail_param`）。
+   *
+   * ## 日志约定（与其它 provider 对齐）
+   *
+   * **成功路径一律不打印**。早期这里用 `console.warn` 打了「calling / got N
+   * models」，而本方法在冷启动阶段会被调用多次（每次 `listModels` /
+   * `resolveModel` 都可能触发，见 `TraeAdapter.ensureRemoteModels`），
+   * 于是整个日志被同一行刷屏 —— 用户报障「fetch 的 log 似乎太多了」。
+   *
+   * **「没有凭据」不是异常**：未登录 TRAE 的用户每次列模型都会走到这条分支，
+   * 打日志只会制造噪声（用户报障「没有账号不需要显示 no credential
+   * resolved from store」）。真正需要关注的失败（HTTP 非 2xx、网络异常）
+   * 才记录。
    */
   async fetchModels(pool?: AccountPool): Promise<TraeRemoteModel[]> {
+    // 命中缓存直接返回（**含空结果**）—— 见 `modelsCache` 的字段注释：
+    // 适配器不缓存空结果，没有这一层就会在未登录时反复发真实请求。
+    const cached = this.modelsCache
+    if (cached !== undefined && Date.now() - cached.at < TraeAuth.MODELS_CACHE_TTL_MS) {
+      return cached.models
+    }
+    const models = await this.fetchModelsUncached(pool)
+    this.modelsCache = { models, at: Date.now() }
+    return models
+  }
+
+  /** 真正发起一次拉取；日志与错误处理见 `fetchModels` 的注释。 */
+  private async fetchModelsUncached(pool?: AccountPool): Promise<TraeRemoteModel[]> {
     let credential: TraeCredential | undefined
     if (pool) {
       const available = await pool.getAvailableAccount(this.product.id, '').catch(() => undefined)
@@ -439,20 +489,11 @@ export class TraeAuth extends Service {
     }
     if (credential === undefined) {
       const resolved = await this.ctx.credentials.resolve(credentialRef(this.credentialRefName))
-      if (!resolved) {
-        console.warn('[trae-auth] fetchModels: no credential resolved from store')
-        return []
-      }
+      if (!resolved) return []
       credential = parseCredential(resolved.value)
-      if (credential === undefined) {
-        console.warn('[trae-auth] fetchModels: failed to parse stored credential')
-        return []
-      }
+      if (credential === undefined) return []
     }
-    if (credential.access_token.length === 0) {
-      console.warn('[trae-auth] fetchModels: empty access_token')
-      return []
-    }
+    if (credential.access_token.length === 0) return []
 
     try {
       // ⚠️ 与 `get_detail_param`（单通道）不同，`batch_get_detail_param`
@@ -480,7 +521,6 @@ export class TraeAuth extends Service {
         show_custom_model: true,
       }
       const url = `${this.product.agentHost}${TRAE_BATCH_MODELS_PATH}`
-      console.warn(`[trae-auth] fetchModels: calling ${url} with channels=${JSON.stringify(this.product.channels)}`)
       const response = await this.fetchImpl(url, {
         method: 'POST',
         headers: traeSOLOHeaders(credential, this.product, false),
@@ -488,15 +528,19 @@ export class TraeAuth extends Service {
         signal: AbortSignal.timeout(TRAE_REQUEST_TIMEOUT_MS),
       })
       if (!response.ok) {
-        console.warn(`[trae-auth] fetchModels: HTTP ${response.status} ${response.statusText}`)
+        // 非 2xx 是真实故障（凭据失效 / 上游异常），如实记录一次。
+        this.warn(`fetchModels: HTTP ${response.status} ${response.statusText}`)
         return []
       }
-      const models = parseTraeBatchModelList(await response.json() as unknown)
-      console.warn(`[trae-auth] fetchModels: got ${models.length} models`)
-      return models
+      return parseTraeBatchModelList(await response.json() as unknown)
     } catch (e) {
-      console.warn(`[trae-auth] fetchModels: error ${e instanceof Error ? e.message : String(e)}`)
+      this.warn(`fetchModels: ${e instanceof Error ? e.message : String(e)}`)
       return []
     }
+  }
+
+  /** 记录一条警告（经 `ctx.logger`，**仅失败路径**调用）。 */
+  private warn(message: string): void {
+    this.ctx.logger?.warn?.(`[trae-auth] ${message}`)
   }
 }

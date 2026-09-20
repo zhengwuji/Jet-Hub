@@ -302,6 +302,10 @@ function httpErrorCode(status: number): string {
  * 全部报 4001，而同批次的其余模型全部正常。也就是说它与「提示词/参数格式有误」
  * 毫无关系，原文会把排查方向**完全带偏**（去查 message 结构、tools 序列化…）。
  *
+ * ⚠️ **那 5 个条目的名单已过期**（复测 2026-09-20）：其中 3 个下架、2 个转为
+ * `is_custom_model: false`（已可调用），全目录 custom 条目数为 0。故这里**不列
+ * 具体模型名** —— 把某一刻的快照写成判据，会让后人误删合法模型。
+ *
  * 故对 4001 追加一句指向真实成因的可操作提示。其余错误码保持原样，
  * 不做无依据的解释。
  */
@@ -321,6 +325,38 @@ function isTransportError(error: unknown): boolean {
   if (message.includes('fetch failed')) return true
   if (message.includes('econnreset') || message.includes('epipe') || message.includes('socket hang up')) return true
   return false
+}
+
+/**
+ * 组装模型选择器里展示的名字：`模型名 · 倍率`。
+ *
+ * ## 为什么倍率必须拼进 `name`
+ *
+ * composer 的模型切换菜单**只渲染 `name`**（`dsh-client-ui-model-selection` 的
+ * ModelSelect 里只有 `title: model.name` 与 `children: model.name`），
+ * `description` **完全不读**。用户报障「消耗倍率没有显示在切换模型列表的后面」
+ * 正是因为早期版本放进了 `description`。
+ *
+ * 安全性：`name` **纯属展示** —— DSH 的选择与持久化只用 `id`，故附加价格不会
+ * 污染会话历史。`resolveModel` 的 `name` **不带**倍率（价格只属于选择列表语境，
+ * 与 Qoder 的处理一致）。
+ *
+ * 形态：
+ * - 常态 `Qwen3.8-Flash · x0.08`
+ * - 活动期 `Doubao-Seed-2.1-Pro · x0.80→x0.08`（箭头比「（促销 …）」短，适合窄菜单）
+ * - 无倍率信息时只显示模型名（**不编造** `x1`）
+ */
+export function traeDisplayName(model: TraeRemoteModel): string {
+  const rate = model.creditsRate
+  if (rate === undefined) return model.name
+  // `0` 是**合法**倍率（免费），必须与「没有倍率」区分开。
+  const current = rate === 0 ? '免费' : `x${rate}`
+  // 活动折扣：只在解析层已判定「当前生效」时才有 originalCreditsRate。
+  const original = model.originalCreditsRate
+  if (original !== undefined && original > rate) {
+    return `${model.name} · x${original}→${current}`
+  }
+  return `${model.name} · ${current}`
 }
 
 /**
@@ -517,7 +553,7 @@ export class TraeAdapter extends LlmAdapter {
     return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
-      name: model.name,
+      name: traeDisplayName(model),
       inputModalities: ['text'],
     }))
   }
