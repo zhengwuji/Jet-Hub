@@ -320,27 +320,57 @@ composer 的模型切换菜单**只渲染 `name`**，`description` 仅用于 `/m
 | provider | 远端字段 | 真实形态 |
 |---|---|---|
 | `buddy` / `workbuddy` | `data.models[].credits` | 字符串 `"x0.29"`（可为空串） |
-| `buddy` / `workbuddy` | `modelPromotions[].discount.discountedCredits` | 字符串 `"0.50x"`（**x 在后**） |
+| `buddy` / `workbuddy` | `modelPromotions[].discount.discountedCredits` | 字符串 `"0.50x"`（**x 在后**）；`factor: 0` = 免费。⚠️ **只由 `/v3/config` 下发**，企业模型端点没有；且须按 `schedule` 判时段 |
 | `lobsterai` | `data[].costMultiplier` | 裸数字 `0.05` |
 | `qoder` | 目录 `chat[].price_factor` | 裸数字，**`0` = 免费** |
 | `trae` | `display_contact_config.consumption_rate.data.rate` | **裸数字** `0.08`；`0` = 免费（⚠️ `display_contact_config` 本身是 **JSON 字符串**，须二次解析） |
 | `codearts` | 无 | 两个目录端点都不含计费字段 |
 
-已结束的促销占位值 `"0x"` 被当作无促销（否则用户会误以为免费）。
+腾讯系的促销值带 `schedule`（每日时段 + 有效期 + 时区），**必须按当前时间本地
+推算此刻是否生效**，不能只看 `enabled`；`factor: 0` 表示**免费**（如
+`hy4-preview` 的夜间免费），只有**没有时间窗口**的 `"0x"` 才当作「已结束」占位。
 
 TRAE 的活动折扣只用**当前确实生效**的那一档：`activity_discount.enable` 为
 `true` 也可能是「无折扣」（`discount_type: "none"`、原价==折后价，实测 `off_peak`
 型即如此），照显会得到 `x0.13→x0.13`；已过 `end_at` 的活动同样不展示。
 
-Qoder 的免费模型（`price_factor: 0`）显示为「免费」而不是 `x0`：
+Qoder 的免费模型（`price_factor: 0`）显示为「免费」而不是 `x0`；有错峰折扣的
+模型在**折扣时段内**显示「原价→折后价」，时段外只显示原价：
 
 ```
 Qwen3.8-Flash · 免费
-DeepSeek-V4-Pro · x0.8
+Qwen3.8-Max · x0.5→x0.2          ← 22:00–08:00（UTC+8）内
+Qwen3.8-Max · x0.5               ← 时段外
+DeepSeek-V4-Pro · x0.5
 ```
+
+> ⚠️ **折扣形态三个 provider 统一为「原价→折后价」**（TRAE `x0.4→x0.2`、
+> buddy `x0.79→x0.50`、Qoder `x0.5→x0.2`）。Qoder 早期是「只有折后价 +
+> 中文角标」（`x0.2 错峰 4 折`），问题有二：① 看不出原价与折扣幅度；
+> ② 角标与数字**冗余**（0.2/0.5 本就是 4 折）。
 
 > ⚠️ `credits` 与 `discountedCredits` 的 `x` **位置相反**（`"x0.29"` vs
 > `"0.50x"`）。早期版本只认前缀写法，导致促销价被静默丢弃。
+>
+> ⚠️ **腾讯系两个端点下发的模型 id 集合不同，必须取并集** —— 促销可能只挂在
+> 其中一个端点独有的 id 上。实测 `hy4-preview-f`（新用户限时免费）**只由
+> `/v3/config` 下发**且被 agent 引用，而 scoped 端点给的是 `hy4-preview`
+> （无促销）。只采信 scoped 就会显示 `x0.29` 而 IDE 显示免费（用户报障
+> 「hy4 preview 现在 ide 是免费我们还是 0.29」）。**不同账号下发的变体 id
+> 也不同**，排查时须多账号对照。
+>
+> ⚠️ **腾讯系的促销只在 `/v3/config` 下发，企业模型端点没有** —— 而后者被优先
+> 返回，所以早期实现**永远不显示促销**（用户报障「codebuddy 的倍率显示也是
+> 没折扣的，GLM-5.2 是 0.5，现在显示 0.79」）。现补取促销表并合并。
+> 且**必须按 `schedule` 判此刻是否生效**（`glm-5.2` 夜间/白天是两条互补活动，
+> 不看时段会全天显示折扣价）；**`factor: 0` 是「免费」而非「已结束」**
+> （`hy4-preview` 夜间免费，用户报障「夜间 0，现在显示 0.29」）。
+> ⚠️ `/v3/config` **有 UA 校验**，UA 不对返回 HTTP 200 + `code:12403`，
+> 极易误判为「该端点没有促销数据」。
+>
+> ⚠️ 产品兜底表是**白名单**（不在表里的 id 会被丢弃），但**被 agent 引用的
+> 模型例外保留**（服务端自己的「可选」信号）—— 否则 `hy4-preview-f` 会被丢掉。
+> 判据**不是**猜 id 后缀（`-f`/`-x`/`-sg` 含义各异，猜错会放进不可用的模型）。
 >
 > ⚠️ Qoder 的字段是 `price_factor`，**不是** `cost_multiplier`（后者是
 > LobsterAI 的）。而 `price_factor: 0` 是**合法的免费值**，不能用 `> 0`
@@ -349,8 +379,13 @@ DeepSeek-V4-Pro · x0.8
 > ⚠️ 倍率**不能**放进 `description`：那在切换模型列表里根本不可见
 > （用户报障「消耗倍率没有显示在切换模型列表的后面」）。
 >
-> 错峰折扣只在**当前生效**时显示：Qoder 目录的 `promotion.active` 为 `false`
-> 表示还没到折扣时段，此时按原价计费，显示折扣价会误导用户。
+> ⚠️ **Qoder 的错峰时段按 `windowStart`/`windowEnd` 本地推算，不采信目录的
+> `promotion.active`** —— 后者是目录下发那一刻的快照，客户端长时间不重启
+> 就会与真实时段脱节（用户在时段外看到折后价、或时段内看不到折扣）。
+> 生效价由 `beforePromotionPriceFactor × discountFactor` 推出（实测三条全部吻合）。
+> **真实缺陷**：早期表里存的是「采集时刻的生效价」却当成恒定值展示，
+> 且 14 个模型的数值本身也是过期估值（`smodel` 写 3.2 实际 8），
+> 用户报障「qwen3.8-max 是 0.5 打折到 0.2，界面显示的是 0.5」。
 
 #### 同名模型会自动区分
 

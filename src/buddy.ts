@@ -447,6 +447,18 @@ export interface BuddyRemoteModel {
   reasoningEfforts?: string[]
   /** 默认思考等级（data.models[].reasoning.defaultEffort）。 */
   defaultReasoningEffort?: string
+  /**
+   * 是否被**某个 agent 引用**（即服务端声明「该模型可在对话里选择」）。
+   *
+   * ⚠️ 用途：`reconcileWithFallback` 是**白名单式重建**，不在产品兜底表里的
+   * id 会被丢弃。而两个端点下发的 id 集合不同 —— 实测 `hy4-preview-f`
+   * （新用户限时免费变体）**只由 `/v3/config` 下发**且**被 craft/ask/plan 引用**，
+   * 却不在兜底表里，于是被丢弃，用户看不到那个免费变体。
+   *
+   * 故用本标志把「服务端说可选」的模型保留下来；未声明的内部别名
+   * （如 `default`）不会被误留。
+   */
+  agentReferenced?: boolean
 }
 
 /**
@@ -493,23 +505,119 @@ function normalizeRate(value: unknown, prefixed: RegExp, suffixed: RegExp): stri
   return match?.[1] !== undefined ? `x${match[1]}` : undefined
 }
 
+/** `modelPromotions[].schedule`（活动时段）。 */
+interface PromotionSchedule {
+  /** 每日时段（可多条），`HH:MM` 形式（实测小时**可能不补零**，如 `7:50`）。 */
+  daily?: readonly { start?: unknown; end?: unknown }[]
+  /** IANA 时区（实测 `Asia/Shanghai`）。 */
+  timezone?: unknown
+  /** 生效起点（ISO 字符串，仅部分活动带）。 */
+  validFrom?: unknown
+  /** 生效终点（ISO 字符串，仅部分活动带）。 */
+  validUntil?: unknown
+}
+
+/** 解析 `HH:MM`（容忍不补零）为当日分钟数；非法返回 undefined。 */
+function parseHHMM(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined
+  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim())
+  if (m === null) return undefined
+  const h = Number(m[1])
+  const min = Number(m[2])
+  return h < 24 && min < 60 ? h * 60 + min : undefined
+}
+
 /**
- * 从 `data.modelPromotions` 提取「模型 id → 促销价」映射。
+ * 取指定时区「当前墙上时间」的当日分钟数。
+ *
+ * 用 `Intl` 而非手算 UTC 偏移：活动时区由服务端下发（实测 `Asia/Shanghai`），
+ * 硬编码 +8 在其它时区的活动上会算错。
+ */
+function zonedMinutes(now: Date, timeZone: unknown): number | undefined {
+  const zone = typeof timeZone === 'string' && timeZone.length > 0 ? timeZone : 'Asia/Shanghai'
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: zone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).formatToParts(now)
+    const h = Number(parts.find((p) => p.type === 'hour')?.value)
+    const m = Number(parts.find((p) => p.type === 'minute')?.value)
+    return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : undefined
+  } catch {
+    // 时区字符串非法（上游改了格式）时返回 undefined，由调用方按「不误杀」处理。
+    return undefined
+  }
+}
+
+/** 活动是否带任何时间窗口（每日时段或有效期）。 */
+function hasTimeWindow(schedule: PromotionSchedule): boolean {
+  return (Array.isArray(schedule.daily) && schedule.daily.length > 0)
+    || schedule.validFrom !== undefined || schedule.validUntil !== undefined
+}
+
+/**
+ * 活动在 `now` 是否生效。
+ *
+ * ⚠️ **必须本地推算，不能只看 `enabled`**：`enabled: true` 只表示活动启用，
+ * 是否**此刻**打折由 `schedule` 决定。实测 `glm-5.2` 有两条互补活动
+ * （夜间 `23:00–7:50` 带 `0.50x` 折扣、白天 `7:50–23:00` 只带角标），
+ * 不看时段就会**全天**显示夜间折扣价（用户按折扣价预期、实际被按原价计费）。
+ */
+function promotionActiveNow(item: Record<string, unknown>, now: Date): boolean {
+  const raw = item.schedule
+  if (typeof raw !== 'object' || raw === null) return true
+  const schedule = raw as PromotionSchedule
+
+  const from = typeof schedule.validFrom === 'string' ? Date.parse(schedule.validFrom) : Number.NaN
+  const until = typeof schedule.validUntil === 'string' ? Date.parse(schedule.validUntil) : Number.NaN
+  if (Number.isFinite(from) && now.getTime() < from) return false
+  if (Number.isFinite(until) && now.getTime() >= until) return false
+
+  if (!Array.isArray(schedule.daily) || schedule.daily.length === 0) return true
+  const minutes = zonedMinutes(now, schedule.timezone)
+  // 时区不可解析时不误杀：宁可多显示一次折扣，也不要让活动凭空消失。
+  if (minutes === undefined) return true
+  return schedule.daily.some((slot) => {
+    if (typeof slot !== 'object' || slot === null) return false
+    const start = parseHHMM(slot.start)
+    const end = parseHHMM(slot.end)
+    if (start === undefined || end === undefined) return false
+    // 支持跨零点（如 23:00–7:50）。
+    return start <= end ? minutes >= start && minutes < end : minutes >= start || minutes < end
+  })
+}
+
+/**
+ * 从 `data.modelPromotions` 提取「模型 id → **此刻生效的**促销价」映射。
  *
  * 真实结构（**数组**，不是对象；每项按 `modelIds` 关联，不是全局）：
  * ```json
- * [{ "kind": "discount", "enabled": true,
- *    "discount": { "discountedCredits": "0.50x", "displayMode": "strikethrough" },
- *    "modelIds": ["deepseek-v4-flash", "deepseek-v4-flash-ioa"] }]
+ * [{ "kind": "discount", "enabled": true, "priority": 100,
+ *    "discount": { "discountedCredits": "0.50x", "displayMode": "strikethrough", "factor": 0.5 },
+ *    "badge": { "color": "#1E90FF", "label": "夜间折扣" },
+ *    "schedule": { "daily": [{ "start": "23:00", "end": "7:50" }], "timezone": "Asia/Shanghai" },
+ *    "modelIds": ["glm-5.2"] }]
  * ```
  *
- * 三个必须处理的退化情形：
- * - `"0x"` —— 活动已结束占位，**视为无促销**（照显会误导用户以为免费）；
+ * 四个必须处理的退化情形：
+ * - **时段未到 / 已过**（`schedule`）—— 跳过，见 {@link promotionActiveNow}；
+ * - **有效期已过**（`validFrom`/`validUntil`，如 `hy3` 的限时免费）—— 跳过；
  * - `enabled: false` —— 已停用，跳过；
- * - 同一模型命中多个活动 —— 取 `priority` 最高者（服务端用该字段表达优先级）。
+ * - 同一模型命中多条 —— 取 `priority` 最高者。
+ *
+ * ⚠️ **`factor: 0` 是「免费」而非「活动已结束」**：实测 `hy4-preview` 的夜间活动
+ * 是 `{discountedCredits: "0x", displayMode: "replace", factor: 0}` —— 它**真的免费**。
+ * 早期实现把 `0x` 当哨兵丢弃，于是「夜间免费」永远不显示（用户报障
+ * 「hy4 preview 夜间 0，现在显示 0.29」）。**真正的「已结束」由有效期表达**。
+ * 作为防御：**无任何时间窗口**的 `factor: 0` 仍按「已结束占位」跳过 ——
+ * 免费额度必然是限时的，没有窗口的 `0x` 更可能是遗留占位。
  */
-export function parsePromotions(record: Record<string, unknown>): Map<string, string> {
+export function parsePromotions(
+  record: Record<string, unknown>,
+  now: Date = new Date(),
+): Map<string, string> {
   const result = new Map<string, string>()
+  /** id → 已写入的 priority（同 id 多活动时高优先级覆盖）。 */
+  const chosen = new Map<string, number>()
   const promotions = record.modelPromotions
   if (!Array.isArray(promotions)) return result
   // 按 priority 升序排序后依次写入，使高 priority 覆盖低 priority。
@@ -518,15 +626,36 @@ export function parsePromotions(record: Record<string, unknown>): Map<string, st
     if (typeof item !== 'object' || item === null) continue
     const promotion = item as Record<string, unknown>
     if (promotion.enabled === false) continue
+    if (!promotionActiveNow(promotion, now)) continue
     const discount = promotion.discount
     if (typeof discount !== 'object' || discount === null) continue
-    const rate = normalizeDiscountedRate((discount as Record<string, unknown>).discountedCredits)
-    // "0x" 表示活动已结束：normalizeCreditsRate 会得到 "x0"，此处显式排除。
-    if (rate === undefined || rate === 'x0') continue
+    const detail = discount as Record<string, unknown>
+    const factor = typeof detail.factor === 'number' ? detail.factor : undefined
+    const rawSchedule = promotion.schedule
+    const windowed = typeof rawSchedule === 'object' && rawSchedule !== null
+      && hasTimeWindow(rawSchedule as PromotionSchedule)
+
+    let rate: string | undefined
+    if (factor === 0) {
+      // 免费额度必须限时；无窗口的 `0x` 视为「已结束」占位（保持旧行为）。
+      if (!windowed) continue
+      rate = '免费'
+    } else {
+      rate = normalizeDiscountedRate(detail.discountedCredits)
+      // 归一化后仍是 `x0` 说明是无 factor 的 `0x` 占位，同样跳过。
+      if (rate === 'x0') continue
+    }
+    if (rate === undefined) continue
+
     const modelIds = promotion.modelIds
     if (!Array.isArray(modelIds)) continue
+    const priority = priorityOf(promotion)
     for (const id of modelIds) {
-      if (typeof id === 'string' && id.length > 0) result.set(id, rate)
+      if (typeof id !== 'string' || id.length === 0) continue
+      const previous = chosen.get(id)
+      if (previous !== undefined && previous > priority) continue
+      chosen.set(id, priority)
+      result.set(id, rate)
     }
   }
   return result
@@ -597,10 +726,25 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
   // 再在 push 时按 id 关联（见 parsePromotions 的注释）。
   const promotions = parsePromotions(record)
 
+  // 收集**全部** agent 引用的 id（含 craft/ask/plan/cli）。
+  // 用于给模型打 `agentReferenced` 标记 —— 适配器的 `reconcileWithFallback`
+  // 是白名单式重建，不在产品兜底表里的 id 会被丢弃，而两个端点下发的 id
+  // 集合不同（实测 `hy4-preview-f` 只在 /v3/config 里且被 agent 引用），
+  // 该标记让「服务端说可选」的模型得以保留。
+  const agentReferencedIds = new Set<string>()
+  if (Array.isArray(record.agents)) {
+    for (const agent of record.agents as unknown[]) {
+      if (typeof agent !== 'object' || agent === null) continue
+      const models = (agent as Record<string, unknown>).models
+      if (!Array.isArray(models)) continue
+      for (const model of models) if (typeof model === 'string') agentReferencedIds.add(model)
+    }
+  }
+
   const parsed: BuddyRemoteModel[] = []
   const seen = new Set<string>()
   const push = (id: string): void => {
-    if (id === 'auto' || seen.has(id) || !isChatModel(id, metaById.get(id))) return
+    if (isAutoSelectAlias(id) || seen.has(id) || !isChatModel(id, metaById.get(id))) return
     seen.add(id)
     const meta = metaById.get(id)
     // 显示名优先用服务端下发的 name（如 `GPT-5.6-Sol`、`GLM-5.3`）；
@@ -615,6 +759,7 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
       ...parseModelMeta(meta),
       ...rate !== undefined ? { creditsRate: rate } : {},
       ...discounted !== undefined ? { discountedCreditsRate: discounted } : {},
+      ...agentReferencedIds.has(id) ? { agentReferenced: true } : {},
     })
   }
 
@@ -648,7 +793,7 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
 
   // 3. 追加试用模型（试用横幅下发的 targetModelId）
   for (const id of trialModelIds(record)) {
-    if (id === 'auto' || seen.has(id)) continue
+    if (isAutoSelectAlias(id) || seen.has(id)) continue
     seen.add(id)
     const meta = metaById.get(id)
     const rate = normalizeCreditsRate(meta?.credits)
@@ -659,6 +804,8 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
       ...parseModelMeta(meta),
       ...rate !== undefined ? { creditsRate: rate } : {},
       ...discounted !== undefined ? { discountedCreditsRate: discounted } : {},
+      // 试用横幅本身就是「服务端推荐可用」的信号，与 agent 引用同义。
+      agentReferenced: true,
     })
   }
 
@@ -703,8 +850,23 @@ function trialModelIds(data: Record<string, unknown>): string[] {
  *
  * 这些模型列进选择器会让用户选了之后报错，故一律过滤。
  */
-function isChatModel(id: string, meta: Record<string, unknown> | undefined): boolean {
-  if (id.startsWith('nes-') || id.startsWith('completion-') || id.startsWith('codewise-')) return false
+/**
+ * 是否为「自动选择」类的内部别名，不应出现在模型选择器里。
+ *
+ * 实测（2026-09-21）企业模型端点同时下发两个：
+ * - `auto`（展示名 `Auto`）—— 老牌别名，早期只过滤了它；
+ * - **`default`（展示名 `Default`）** —— 同类别名，**未被任何 agent 引用**。
+ *
+ * 两者都不是真实模型（服务端自行挑一个后端），列出来会让用户误以为可选。
+ * 国际版还有 `default-model` / `fast-model` 等抽象别名，但那些**被 craft agent
+ * 引用**（是官方推荐的入口），故只按这两个字面量过滤，不做前缀匹配 ——
+ * 前缀匹配会误伤 `default-model`。
+ */
+function isAutoSelectAlias(id: string): boolean {
+  return id === 'auto' || id === 'default'
+}
+
+function isChatModel(id: string, meta: Record<string, unknown> | undefined): boolean {  if (id.startsWith('nes-') || id.startsWith('completion-') || id.startsWith('codewise-')) return false
   if (meta?.supportsExtra === true) return false
   const maxOutput = meta?.maxOutputTokens
   if (typeof maxOutput === 'number' && maxOutput > 0 && maxOutput <= 256) return false

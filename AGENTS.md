@@ -257,9 +257,48 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - ⚠️ **`credits` 与 `discountedCredits` 的 x 位置相反**（`"x0.29"` vs `"0.50x"`）。
   早期版本只认前缀写法，导致**促销价全部静默丢失** —— 单测直接暴露了它。
   两个 `normalize*` 函数各自接受两种写法（对上游格式变更更鲁棒）
-- ⚠️ **`"0x"` 是「活动已结束」占位**，必须当成无促销，否则用户会误以为免费
+- ⚠️ **两个端点下发的模型 id 集合不同，必须取并集**（实测 2026-09-21，
+  账号 `3C656A62`）：
+  ```
+  scoped     → hy4-preview, hy4-preview-x   （30 个模型）
+  /v3/config → hy4-preview-f                （22 个模型）
+  促销 modelIds → ["hy4-preview-f"]         ← 只挂在 v3/config 独有的那个 id 上
+  ```
+  而 `hy4-preview-f`（新用户限时免费变体）**被 craft/ask/plan 三个 agent 引用**
+  —— 服务端明确说它可选。早期只返回 scoped，于是该促销永远对不上，
+  界面显示 `x0.29` 而 IDE 显示免费（用户报障「hy4 preview 现在 ide 是免费
+  我们还是 0.29」）。**不同账号下发的变体 id 也不同**（另一账号两端都是
+  `hy4-preview`，所以它没暴露这个问题）—— 排查时**必须多账号对照**
+- ⚠️ **`reconcileWithFallback` 是白名单式重建，会丢弃不在兜底表的 id** ——
+  上面那个 `hy4-preview-f` 正因此被丢掉。判据用 **`agentReferenced`**
+  （服务端自己的「可选」信号，由 `parseModelsFromConfig` 收集**全部** agent
+  的引用），**不要猜 id 后缀**：`-f` / `-x` / `-sg` / `-ioa` 含义各异，
+  猜错会放进不可用的模型。追加时放在**末尾**，不打乱兜底表顺序。
+  ⚠️ `auto` 与 **`default`** 是同类内部别名（都不被 agent 引用），
+  由 `isAutoSelectAlias` 过滤；但**不要前缀匹配** —— 会误伤国际版
+  被 craft 引用的 `default-model` / `fast-model` 等抽象别名
+- ⚠️ **促销只由 `/v3/config` 下发，企业模型端点（scoped）没有**（实测 2026-09-21：
+  scoped 的 25948 字符响应里 `discount` / `promo` / `0.50x` 出现 **0 次**）。
+  而 scoped 被**优先返回** → 早期实现直接 `return scoped`，于是**促销永远不显示**
+  （用户报障「codebuddy 的倍率显示也是没折扣的，GLM-5.2 是 0.5，现在显示 0.79」）。
+  现补一次 `/v3/config` 并**同时取它的模型与促销表**（失败不影响列表）
+- ⚠️ **必须按 `schedule` 本地推算此刻是否生效，不能只看 `enabled`**：
+  实测 `glm-5.2` 有两条**互补**活动（夜间 `23:00–7:50` 带 `0.50x`、
+  白天 `7:50–23:00` 只带角标）。不看时段就按 priority 恒定取夜间那条 →
+  **白天也显示折扣价**，用户按折扣价预期却被按原价计费。
+  时段字段是 `schedule.daily[].{start,end}`（`HH:MM`，**小时可能不补零**如 `7:50`）
+  + `schedule.timezone`（用 `Intl` 换算，别硬编码 +8）+ `validFrom`/`validUntil`。
+  时区不可解析时**不误杀**（宁可多显示一次折扣）
+- ⚠️ **`factor: 0` 是「免费」，不是「活动已结束」**：实测 `hy4-preview` 的夜间活动
+  是 `{discountedCredits: "0x", displayMode: "replace", factor: 0}` —— 它**真的免费**。
+  早期把 `0x` 一律当哨兵丢弃，于是「夜间免费」永远不显示
+  （用户报障「hy4 preview 夜间 0，现在显示 0.29」）。**「已结束」由有效期表达**。
+  防御：**无任何时间窗口**的 `factor: 0` 仍按占位跳过（免费额度必然限时）
 - ⚠️ `modelPromotions` 是**数组**（不是对象），且用 `modelIds[]` **按模型关联**
   （不是全局折扣）；同模型命中多个活动时取 `priority` 最高者
+- ⚠️ **`/v3/config` 有 UA 校验**：UA 不对返回 `{"code":12403,"msg":"check ua,
+  get coding copilot version error"}`（**HTTP 200**，极易误判为「该端点没有促销」）。
+  必须带产品的 `userAgent`（CodeBuddy 实测 `CodeBuddyIDE/1.106.1`）
 - ⚠️ **LobsterAI 的 `description` 可能已自带倍率文案**（实测 DeepSeek-V4.1-Flash
   写着「分时计价：当前空闲时段 x0.05…」）。前置倍率前必须 `includes` 判重，
   否则出现「x0.05 · …x0.05…」重复
@@ -290,7 +329,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 #### ⚠️ `activity_discount.enable === true` **不等于**当前有折扣
 
-**实测陷阱**（2026-09-20，与 Qoder 的 `promotion.active === false` 同类）：
+**实测陷阱**（2026-09-20，与 Qoder 的 `promotion` 同类：**标志为真不等于当前生效**）：
 `off_peak` 型条目形如
 
 ```json
@@ -328,9 +367,25 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
   **0 是合法值**，不能用 `> 0` 过滤，否则恰好漏掉用户最关心的免费模型。
   展示为「免费」而非 `x0`
 - 另有 `original_price_factor`（如 `qfmodel` 的 0.1 = 免费前的原价）
-- **错峰折扣只在 `promotion.active === true` 时展示**：`active: false` 表示
-  当前不在折扣时段，显示折扣价会让用户按折扣价预期、实际被按原价计费。
-  实测三个 `promotion` 全部是 `active: false`，窗口统一 22:00–08:00
+- ⚠️ **`price_factor` 是「采集时刻的生效价」，不是恒定原价** ——
+  错峰窗口内它是折后价、窗口外是原价。故展示时**必须结合窗口本地推算**，
+  不能直接照搬（照搬的后果：窗口一切换，界面价格就与真实计费不符）
+- ⚠️ **错峰判据用 `windowStart`/`windowEnd` 本地推算（`promotionActiveNow`），
+  *不*采信 `promotion.active`** —— 后者是目录下发那一刻的快照，
+  客户端长时间不重启就会与真实时段脱节。窗口字段缺失时才回退到 `active`。
+  生效价 = `beforePromotionPriceFactor × discountFactor`（实测三条全部吻合），
+  窗口外则用原价。窗口统一 22:00–08:00（UTC+8），支持跨零点
+- ⚠️ **折扣形态三个 provider 必须统一为「原价→折后价」**（TRAE `x0.4→x0.2`、
+  buddy `x0.79→x0.50`、Qoder `x0.5→x0.2`）。Qoder 早期是「只有折后价 +
+  中文角标」（`x0.2 错峰 4 折`），两个问题：① 看不出原价与折扣幅度；
+  ② 角标与数字**冗余**（0.2/0.5 本就是 4 折）。用户要求对齐 TRAE。
+  `promotion.badgeZh` 因此**不再参与展示**（字段保留，目录原始数据仍可对照）
+- ⚠️ **本表的倍率数值必须逐条对照 catalog，不要凭印象填**：
+  早期版本多处是手工估值，与真实值大范围不符（**14 个模型有偏差**：
+  `smodel` 写 3.2 实际 8、`qmodel_38max` 写 0.5 实际 0.2、`auto` 写 1 实际 0.5 …），
+  用户报障「qwen3.8-max 是 0.5 打折到 0.2，界面显示的是 0.5」。
+  ⚠️ 而当时的单测**只断言了 id 列表**，所以价格漂移长期未被发现 ——
+  改这张表时必须同步更新数值断言（`qoder-product.spec.ts`）
 - `resolveModel` 的 `name` **不带**倍率后缀（价格只属于选择列表语境）
 
 **解密该缓存**（`decryptModelCatalog`，`src/qoder-wasm.ts`）：
@@ -1011,6 +1066,36 @@ CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控�
   断言锁死这条（剔除注释行后匹配，因注释里保留了该缺陷的叙述）
 
 ## 积分领取（每日签到）
+
+### ⚠️ 默认实现的签名必须**显式适配**，不能用 `as unknown as` 硬转
+
+**真实缺陷**（用户报障）：CodeBuddy 一键领取 4 个账号**全部失败**，错误是
+**`fetcher is not a function`**。
+
+根因：`claimDailyCheckin` / `fetchCheckinStatus` / `fetchCreditBalance` 的真实
+签名是 **`(credential, product, fetcher)`**，而 `CreditsEndpointDeps` 把 `claim`
+声明为 `(credential, product, entry)`（TRAE 需要 `entry.id` 取签到设备代次）。
+`collectClaimResults` 里历史写法是
+
+```ts
+const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
+```
+
+那个 `as unknown as` 把签名不匹配**压了过去** —— TypeScript 不再报错，但调用点
+`claim(credential, product, entry)` 的第三个实参是 `entry`，它落进 **`fetcher`
+的位置**，运行时 `fetcher(...)` 就抛 `TypeError: fetcher is not a function`。
+
+修法：**显式包装**默认实现，把 `deps.fetcher`（或全局 `fetch`）送进第三参
+（`CreditsEndpointDeps.fetcher`）。**加新的默认实现时必须照此办理** ——
+一旦用 `as unknown as` 掩盖签名差异，就会重演这个 bug。
+
+⚠️ **为什么长期没被发现**：`makeDeps()` **总是注入 `claim` / `fetchStatus`**，
+于是真实的默认实现路径**从未被任何用例覆盖**。回归用例
+（`jet-hub-rpc.spec.ts` 的「第三参必须是 fetcher」）刻意**不注入** deps，
+走真实默认实现并断言请求真的发出去了。
+
+⚠️ 只有 **buddy / workbuddy** 走这条默认路径（其余三个 provider 都在自己的分支里
+显式注入 `claim`），所以故障面恰好是 CodeBuddy 系。
 
 **四套协议完全不同**的实现，各自独立：
 

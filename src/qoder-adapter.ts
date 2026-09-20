@@ -31,7 +31,7 @@ import { AccountPool } from './account-pool.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { QoderEncryptedInfer, type QoderInferRequest } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
-import { QODER, type QoderFallbackModel, type QoderProduct } from './qoder-product.js'
+import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import {
   collectImages,
   consumeOpenAiSse,
@@ -382,30 +382,82 @@ export class QoderAdapter extends LlmAdapter {
 }
 
 /**
- * 生成模型选择器里显示的名字：`Qwen3.8-Flash · 免费` / `GLM-5.3 · x0.6`。
+ * 判断当前是否落在错峰折扣窗口内（本地推算）。
+ *
+ * ⚠️ **为什么不直接用目录的 `promotion.active`**：那是**目录下发那一刻**的
+ * 快照，客户端长时间不重启就会过期 —— 用它会让用户在窗口外看到折后价
+ * （按折扣价预期、实际按原价计费），或窗口内看不到折扣。
+ * 窗口本身（`windowStart`/`windowEnd`）稳定，故按当前时间**本地推算**。
+ *
+ * 窗口按 **UTC+8** 计（目录 `timezone: Asia/Singapore`，与用户所在时区一致）；
+ * 支持跨零点（如 22:00–08:00）。窗口字段缺失时回退到目录的 `active`。
+ */
+export function promotionActiveNow(promotion: QoderModelPromotion, now: Date): boolean {
+  const { windowStart, windowEnd } = promotion
+  if (windowStart === undefined || windowEnd === undefined) return promotion.active
+  const toMinutes = (hhmm: string): number | undefined => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim())
+    if (m === null) return undefined
+    const h = Number(m[1]); const min = Number(m[2])
+    return h < 24 && min < 60 ? h * 60 + min : undefined
+  }
+  const start = toMinutes(windowStart)
+  const end = toMinutes(windowEnd)
+  if (start === undefined || end === undefined) return promotion.active
+
+  // 取 UTC+8 的「墙上时间」（目录时区与用户一致，故无需真实时区换算）
+  const utc8 = new Date(now.getTime() + 8 * 3_600_000)
+  const minutes = utc8.getUTCHours() * 60 + utc8.getUTCMinutes()
+  return start <= end
+    ? minutes >= start && minutes < end
+    : minutes >= start || minutes < end
+}
+
+/**
+ * 生成模型选择器里显示的名字。
+ *
+ * 形态（**与 TRAE / buddy 三 provider 统一**）：
+ *
+ * ```
+ * Qwen3.8-Flash · 免费            ← priceFactor = 0
+ * Qwen3.8-Max · x0.5→x0.2        ← 折扣窗口内：原价→折后价
+ * Qwen3.8-Max · x0.5             ← 窗口外：只有原价
+ * Sonus · x8                     ← 无促销
+ * ```
  *
  * ⚠️ **倍率必须写进 `name` 而不是 `description`**：composer 的模型切换菜单
  * 只渲染 `name`（见 dsh-client-ui-model-selection 的 ModelSelect：
  * `children: model.name`），`description` 仅用于 `/model` 弹窗。
  *
- * 展示规则（Qoder 目录的 `price_factor` 语义与腾讯系不同，故单独实现）：
- * - `priceFactor === 0` → **「免费」**，不显示 `x0`（用户关心的是"不要钱"）；
- * - 其余 → `x<值>`（如 `x0.6`）；
- * - 仅在**促销生效中**（`promotion.active === true`）才附折扣角标 ——
- *   `active: false` 表示当前不在错峰时段，显示折扣价会让用户按折扣价预期、
- *   实际被按原价计费。
+ * ⚠️ **折扣统一用「原价→折后价」箭头**，不再附中文角标（如「错峰 4 折」）：
+ * ① 旧形态只有折后价，看不出原价与折扣幅度；② 角标与数字**冗余**
+ * （0.2/0.5 本就是 4 折）。TRAE（`x0.4→x0.2`）与 buddy（`x0.79→x0.50`）
+ * 早就是这个形态，本次把 Qoder 对齐过去。
+ *
+ * ⚠️ 折后价**不直接采信目录的 `priceFactor`**：它是采集时刻的生效价，
+ * 窗口切换后即失真。改为按 `beforePromotionPriceFactor × discountFactor`
+ * 本地推算（实测三条全部吻合），窗口外则用原价。
  */
-function qoderDisplayName(model: QoderFallbackModel): string {
-  const parts: string[] = []
-  if (model.priceFactor === 0) {
-    parts.push('免费')
-  } else if (model.priceFactor !== undefined) {
-    parts.push(`x${model.priceFactor}`)
+export function qoderDisplayName(model: QoderFallbackModel, now: Date = new Date()): string {
+  const promo = model.promotion
+  const before = promo?.beforePromotionPriceFactor
+  const discount = promo?.discountFactor
+  const hasPromo = promo !== undefined && before !== undefined && discount !== undefined
+  const active = hasPromo && promotionActiveNow(promo, now)
+
+  // 免费优先于一切（`0` 是合法倍率，不能显示成 `x0`）。
+  if (model.priceFactor === 0) return `${model.name} · 免费`
+
+  if (hasPromo && active) {
+    // 折扣生效中：`原价→折后价`（与 TRAE / buddy 同形态）
+    const effective = Number((before * discount).toFixed(4))
+    return `${model.name} · x${before}→x${effective}`
   }
-  if (model.promotion?.active === true && model.promotion.badgeZh !== undefined) {
-    parts.push(model.promotion.badgeZh)
-  }
-  return parts.length > 0 ? `${model.name} · ${parts.join(' ')}` : model.name
+
+  // 窗口外用**原价**（有 promotion 时原价就是 before，而非采集到的折后价）；
+  // 窗口外显示折后价会让用户按折扣价预期、实际被按原价计费。
+  const price = hasPromo ? before : model.priceFactor
+  return price !== undefined ? `${model.name} · x${price}` : model.name
 }
 
 /**

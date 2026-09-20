@@ -284,8 +284,8 @@ describe('BuddyAuth silent refresh', () => {
     }), { status: 200 })) as unknown as typeof fetch
     const service = newService(ctx, { fetcher })
     expect(await service.fetchModels()).toEqual([
-      { id: 'glm-5.3', name: 'GLM-5.3' },
-      { id: 'kimi-k3-1', name: 'Kimi K3-1' },
+      { id: 'glm-5.3', name: 'GLM-5.3', agentReferenced: true },
+      { id: 'kimi-k3-1', name: 'Kimi K3-1', agentReferenced: true },
     ])
   })
 })

@@ -207,9 +207,13 @@ describe('buddy model config parsing', () => {
       },
     })
     expect(models).toEqual([
-      { id: 'default-model', name: 'Auto', contextWindow: 176_000 },
-      { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', contextWindow: 1_000_000 },
-      { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000 },
+      // ⚠️ `agentReferenced: true` 标记「服务端声明该模型可在对话里选择」。
+      // 适配器的 `reconcileWithFallback` 是白名单式重建，用它把「不在产品兜底表
+      // 但服务端说可选」的模型保留下来（实测 `hy4-preview-f` 只在 /v3/config
+      // 下发且被 agent 引用，否则会被丢弃、用户看不到那个免费变体）。
+      { id: 'default-model', name: 'Auto', contextWindow: 176_000, agentReferenced: true },
+      { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', contextWindow: 1_000_000, agentReferenced: true },
+      { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, agentReferenced: true },
     ])
   })
 
@@ -254,8 +258,8 @@ describe('buddy model config parsing', () => {
       },
     })
     expect(models).toEqual([
-      { id: 'hy4-preview', name: 'Hy4 Preview' },
-      { id: 'glm-5.3', name: 'GLM-5.3' },
+      { id: 'hy4-preview', name: 'Hy4 Preview', agentReferenced: true },
+      { id: 'glm-5.3', name: 'GLM-5.3', agentReferenced: true },
     ])
   })
 
@@ -275,8 +279,10 @@ describe('buddy model config parsing', () => {
       },
     })
     expect(models).toEqual([
-      { id: 'glm-5.3-flash', name: 'GLM-5.3 Flash', contextWindow: 1_048_576 },
-      { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262_144 },
+      { id: 'glm-5.3-flash', name: 'GLM-5.3 Flash', contextWindow: 1_048_576, agentReferenced: true },
+      { id: 'kimi-k2.6', name: 'Kimi K2.6', contextWindow: 262_144, agentReferenced: true },
+      // data.models 里的其余可对话模型也会被补进列表，但它们**不在 agent 清单**里
+      // → 不带 `agentReferenced`（reconcile 时不会被特殊保留）。
       { id: 'unknown-model', name: 'unknown-model', contextWindow: 8192 },
       { id: 'bad-entry', name: 'bad-entry' },
     ])
@@ -370,8 +376,9 @@ describe('buddy model config parsing', () => {
         supportsImages: true,
         reasoningEfforts: ['low', 'high', 'max'],
         defaultReasoningEffort: 'high',
+        agentReferenced: true,
       },
-      { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true },
+      { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, agentReferenced: true },
     ])
   })
 
@@ -383,7 +390,7 @@ describe('buddy model config parsing', () => {
       },
     })
     expect(models[0]?.supportsImages).toBe(false)
-    expect(models[1]).toEqual({ id: 'bare', name: 'bare' })
+    expect(models[1]).toEqual({ id: 'bare', name: 'bare', agentReferenced: true })
   })
 
   it('returns an empty list for malformed payloads', () => {
@@ -495,6 +502,92 @@ describe('buddy model config parsing', () => {
       expect(formatCreditsRate('x0.17', 'x0.50')).toBe('x0.17→x0.50')
       expect(formatCreditsRate(undefined, 'x0.50')).toBe('x0.50')
       expect(formatCreditsRate(undefined, undefined)).toBeUndefined()
+    })
+
+    /**
+     * ⚠️ 真实缺陷（用户报障）：「codebuddy 的倍率显示也是没折扣的，
+     * GLM-5.2 是 0.5，现在好像显示 0.79；hy4 preview 夜间 0，现在显示 0.29」。
+     *
+     * 三个独立根因：
+     * ① scoped 端点**不下发** `modelPromotions`，而它被优先返回 →
+     *    促销永远不显示（见 buddy-oauth.ts 的合并逻辑）；
+     * ② `discountedCredits: "0x"` 被当成「活动已结束」丢弃 ——
+     *    实际它是**夜间免费**（`factor: 0`）；
+     * ③ 完全没读 `schedule`，同一模型有夜间/白天两条互补活动时
+     *    按 priority 恒定取夜间那条 → 白天也显示折扣价。
+     */
+    it('促销必须按 schedule 判定此刻是否生效（真实缺陷回归）', () => {
+      // 真实 /v3/config 的 glm-5.2 两条活动（互补时段，夜间带折扣、白天只带角标）
+      const record = {
+        modelPromotions: [
+          {
+            id: 'glm-52-night', enabled: true, priority: 100, modelIds: ['glm-5.2'],
+            discount: { discountedCredits: '0.50x', factor: 0.5 },
+            schedule: { daily: [{ start: '23:00', end: '7:50' }], timezone: 'Asia/Shanghai' },
+          },
+          {
+            id: 'glm-52-day', enabled: true, priority: 50, modelIds: ['glm-5.2'],
+            schedule: { daily: [{ start: '7:50', end: '23:00' }], timezone: 'Asia/Shanghai' },
+          },
+        ],
+      }
+      // 夜间（跨零点窗口内）→ 有折扣
+      expect(parsePromotions(record, new Date('2026-09-21T00:43:00+08:00')).get('glm-5.2')).toBe('x0.50')
+      expect(parsePromotions(record, new Date('2026-09-21T07:49:00+08:00')).get('glm-5.2')).toBe('x0.50')
+      expect(parsePromotions(record, new Date('2026-09-21T23:30:00+08:00')).get('glm-5.2')).toBe('x0.50')
+      // 白天 → **不应**显示夜间折扣价（否则用户按折扣价预期却被按原价计费）
+      expect(parsePromotions(record, new Date('2026-09-21T08:00:00+08:00')).has('glm-5.2')).toBe(false)
+      expect(parsePromotions(record, new Date('2026-09-21T12:00:00+08:00')).has('glm-5.2')).toBe(false)
+    })
+
+    it('factor: 0 且有窗口 = 免费（不是「已结束」，真实缺陷回归）', () => {
+      // 真实 hy4-preview：夜间免费（用户报障「夜间 0，现在显示 0.29」）
+      const record = {
+        modelPromotions: [{
+          enabled: true, priority: 100, modelIds: ['hy4-preview'],
+          discount: { discountedCredits: '0x', displayMode: 'replace', factor: 0 },
+          schedule: { daily: [{ start: '23:00', end: '08:00' }], timezone: 'Asia/Shanghai' },
+        }],
+      }
+      expect(parsePromotions(record, new Date('2026-09-21T00:43:00+08:00')).get('hy4-preview')).toBe('免费')
+      expect(parsePromotions(record, new Date('2026-09-21T12:00:00+08:00')).has('hy4-preview')).toBe(false)
+    })
+
+    it('无时间窗口的 0x 仍视为「已结束」占位', () => {
+      // 免费额度必然限时；没有窗口的 0x 更可能是遗留占位，照显会让用户误以为免费。
+      const promotions = parsePromotions({
+        modelPromotions: [{
+          enabled: true, priority: 100, modelIds: ['m'],
+          discount: { discountedCredits: '0x', factor: 0 },
+        }],
+      })
+      expect(promotions.has('m')).toBe(false)
+    })
+
+    it('有效期已过的活动不展示（hy3 限时免费）', () => {
+      const record = {
+        modelPromotions: [{
+          enabled: true, priority: 200, modelIds: ['hy3'],
+          discount: { discountedCredits: '0x', factor: 0 },
+          schedule: { timezone: 'Asia/Shanghai', validFrom: '2026-07-06T00:00:00+08:00', validUntil: '2026-08-06T00:00:00+08:00' },
+        }],
+      }
+      // 活动期内
+      expect(parsePromotions(record, new Date('2026-07-20T12:00:00+08:00')).get('hy3')).toBe('免费')
+      // 已过期 → 必须不展示，否则用户按免费预期却被计费
+      expect(parsePromotions(record, new Date('2026-09-21T12:00:00+08:00')).has('hy3')).toBe(false)
+    })
+
+    it('时区不可解析时不误杀活动（宁可多显示一次）', () => {
+      const record = {
+        modelPromotions: [{
+          enabled: true, priority: 100, modelIds: ['m'],
+          discount: { discountedCredits: '0.50x', factor: 0.5 },
+          schedule: { daily: [{ start: '23:00', end: '08:00' }], timezone: 'Not/AZone' },
+        }],
+      }
+      // 时区非法 → 回退「视为生效」，而不是让活动凭空消失
+      expect(parsePromotions(record, new Date('2026-09-21T12:00:00+08:00')).get('m')).toBe('x0.50')
     })
   })
 })

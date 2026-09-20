@@ -289,8 +289,10 @@ describe('buddy fetchModels', () => {
       }), { status: 200 }),
     }])
     expect(await fetchModels(makeCredential(), fetcher)).toEqual([
-      { id: 'hy4-preview', name: 'Hy4 Preview' },
-      { id: 'glm-5.3', name: 'GLM-5.3' },
+      // `agentReferenced: true` = 服务端声明该模型可在对话里选择
+      // （供 reconcileWithFallback 保留「不在兜底表但可选」的变体）。
+      { id: 'hy4-preview', name: 'Hy4 Preview', agentReferenced: true },
+      { id: 'glm-5.3', name: 'GLM-5.3', agentReferenced: true },
     ])
   })
 
@@ -356,9 +358,126 @@ describe('buddy fetchModels', () => {
     }])
     const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
     expect(models.map((m) => m.id)).toEqual(['gpt-5.6-sol', 'glm-5.2'])
-    // 命中企业端点后不应再请求 /v3/config
+    // ⚠️ 企业端点命中后**仍会**请求 /v3/config —— 但**只为取促销表**。
+    //
+    // 原因（真实缺陷，用户报障「codebuddy 的倍率显示也是没折扣的，
+    // GLM-5.2 是 0.5，现在好像显示 0.79」）：企业端点**不下发**
+    // `modelPromotions`，而它被优先返回，于是促销永远不显示。
+    // 故这里补一次 /v3/config 取促销并与 scoped 结果合并。
     const urls = (fetcher as unknown as { mock: { calls: Array<[string]> } }).mock.calls.map((c) => c[0])
-    expect(urls.some((u) => u.includes('/v3/config'))).toBe(false)
+    expect(urls.some((u) => u.includes('/v3/config'))).toBe(true)
+    // 模型列表**仍以企业端点为准**（不因补取促销而换成 /v3/config 的目录）
+    expect(urls.filter((u) => u.includes('/console/enterprises/personal/models'))).toHaveLength(1)
+  })
+
+  it('合并两个端点的模型 id 集合（真实缺陷回归：hy4-preview-f 被丢弃）', async () => {
+    // ⚠️ 真实缺陷（用户报障「hy4 preview 现在 ide 是免费我们还是 0.29」）：
+    // 两个端点下发的 **id 集合不同**，而「限时免费」促销只挂在
+    // `/v3/config` 独有的那个 id 上：
+    //   scoped    → hy4-preview
+    //   /v3/config→ hy4-preview-f（促销 modelIds 只写它）
+    // 早期只返回 scoped，于是该促销永远对不上。
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response(JSON.stringify({
+          data: {
+            agents: [{ name: 'cli', models: ['hy4-preview', 'glm-5.2'] }],
+            models: [
+              { id: 'hy4-preview', name: 'Hy4 preview', credits: 'x0.29' },
+              { id: 'glm-5.2', name: 'GLM-5.2', credits: 'x0.79' },
+            ],
+          },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/v3/config'),
+        respond: () => new Response(JSON.stringify({
+          data: {
+            agents: [{ name: 'craft', models: ['hy4-preview-f'] }],
+            models: [{ id: 'hy4-preview-f', name: 'Hy4 preview', credits: 'x0.29' }],
+            modelPromotions: [{
+              enabled: true, priority: 200, modelIds: ['hy4-preview-f'],
+              discount: { discountedCredits: '0x', factor: 0 },
+              schedule: { timezone: 'Asia/Shanghai', validFrom: '2026-09-11T00:00:00+08:00', validUntil: '2026-10-11T00:00:00+08:00' },
+            }],
+          },
+        }), { status: 200 }),
+      },
+    ])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    const ids = models.map((m) => m.id)
+    // scoped 的模型在前（更权威），/v3/config 独有的追加在后
+    expect(ids).toEqual(['hy4-preview', 'glm-5.2', 'hy4-preview-f'])
+    const f = models.find((m) => m.id === 'hy4-preview-f')
+    expect(f?.discountedCreditsRate).toBe('免费')
+    // 被 agent 引用 → 标记保留，供 reconcileWithFallback 不丢弃它
+    expect(f?.agentReferenced).toBe(true)
+  })
+
+  it('两个端点都不存在的 id 不会被凭空造出', async () => {
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response(JSON.stringify({
+          data: { agents: [{ name: 'cli', models: ['glm-5.2'] }], models: [{ id: 'glm-5.2' }] },
+        }), { status: 200 }),
+      },
+      { when: (url) => url.includes('/v3/config'), respond: () => new Response('{}', { status: 200 }) },
+    ])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    expect(models.map((m) => m.id)).toEqual(['glm-5.2'])
+  })
+
+  it('企业端点命中时，促销表从 /v3/config 合并进来（真实缺陷回归）', async () => {
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response(JSON.stringify({
+          data: {
+            agents: [{ name: 'cli', models: ['glm-5.2'] }],
+            // ⚠️ 企业端点**没有** modelPromotions —— 促销只由 /v3/config 下发
+            models: [{ id: 'glm-5.2', name: 'GLM-5.2', credits: 'x0.79 credits' }],
+          },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/v3/config'),
+        respond: () => new Response(JSON.stringify({
+          data: {
+            modelPromotions: [{
+              enabled: true, priority: 100, modelIds: ['glm-5.2'],
+              discount: { discountedCredits: '0.50x', factor: 0.5 },
+              schedule: { daily: [{ start: '23:00', end: '7:50' }], timezone: 'Asia/Shanghai' },
+            }],
+          },
+        }), { status: 200 }),
+      },
+    ])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    const glm = models.find((m) => m.id === 'glm-5.2')
+    expect(glm?.creditsRate).toBe('x0.79')
+    // 夜间窗口内 → 促销价应被合并（用户要看的 0.5）
+    expect(glm?.discountedCreditsRate).toBe('x0.50')
+  })
+
+  it('/v3/config 促销请求失败时不影响模型列表', async () => {
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/console/enterprises/personal/models'),
+        respond: () => new Response(JSON.stringify({
+          data: { agents: [{ name: 'cli', models: ['glm-5.2'] }], models: [{ id: 'glm-5.2', name: 'GLM-5.2' }] },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/v3/config'),
+        respond: () => new Response('<html>500</html>', { status: 500 }),
+      },
+    ])
+    const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
+    // 促销是展示增强，取不到不该让整个列表失败
+    expect(models.map((m) => m.id)).toEqual(['glm-5.2'])
+    expect(models[0]?.discountedCreditsRate).toBeUndefined()
   })
 
   it('企业模型端点返回非 200 时回退到 /v3/config', async () => {

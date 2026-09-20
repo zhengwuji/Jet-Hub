@@ -106,32 +106,49 @@ describe('QoderAdapter 模型目录', () => {
       expect(flash?.name).toBe('Qwen3.8-Flash · 免费')
     })
 
-    it('其余模型显示 x 倍率', async () => {
+    it('其余模型显示 x 倍率（数值对照真实 catalog）', async () => {
       const models = await makeAdapter().listModels('qoder')
-      expect(models.find((m) => m.id === 'dmodel')?.name).toBe('DeepSeek-V4-Pro · x0.8')
+      // ⚠️ 早期用例断言的是 `x0.8` / `x3.2` —— 那是兜底表的**过期估值**，
+      // 真实 catalog 为 0.5 / 8（用户报障后逐条校正，见 qoder-product.spec.ts）。
+      expect(models.find((m) => m.id === 'dmodel')?.name).toBe('DeepSeek-V4-Pro · x0.5')
       expect(models.find((m) => m.id === 'gfmodel')?.name).toBe('GLM-5.3-Flash · x0.1')
-      expect(models.find((m) => m.id === 'smodel')?.name).toBe('Sonus · x3.2')
+      expect(models.find((m) => m.id === 'smodel')?.name).toBe('Sonus · x8')
     })
 
-    // 错峰折扣只在**当前生效**（active=true）时显示：
-    // active=false 表示还没到折扣时段，显示折扣价会让用户按折扣价预期、
-    // 实际被按原价计费。兜底表里的三个 promotion 实测都是 active:false。
-    it('promotion.active=false 时不显示折扣角标', async () => {
-      const models = await makeAdapter().listModels('qoder')
-      for (const m of models) expect(m.name).not.toContain('折')
-    })
-
-    it('promotion.active=true 时显示折扣角标', async () => {
+    // ⚠️ 角标**不再**由目录快照 `promotion.active` 决定 —— 那是采集时刻的值，
+    // 会随错峰窗口切换而失真。真实判据是 `windowStart`/`windowEnd` 的本地推算
+    // （边界用例见 qoder-product.spec.ts 的「错峰时段判定」）。
+    // 这里只验证**无窗口字段时的回退行为**，与当前钟点无关、恒定可复现。
+    it('无窗口字段时回退到 active：false 不显示角标、用原价', async () => {
       const product = {
         ...QODER,
         fallbackModels: [{
-          id: 'promo', name: 'Promo', contextWindow: 1000, priceFactor: 0.5,
-          promotion: { active: true, discountFactor: 0.4, badgeZh: '错峰 4 折' },
+          id: 'promo', name: 'Promo', contextWindow: 1000,
+          priceFactor: 0.2,
+          promotion: { active: false, discountFactor: 0.4, beforePromotionPriceFactor: 0.5, badgeZh: '错峰 4 折' },
         }],
       }
       const adapter = makeAdapter({ product: product as never })
       const models = await adapter.listModels('qoder')
-      expect(models[0]?.name).toBe('Promo · x0.5 错峰 4 折')
+      // 窗口外 → 原价、无角标（避免用户按折扣价预期却被按原价计费）
+      expect(models[0]?.name).toBe('Promo · x0.5')
+      expect(models[0]?.name).not.toContain('折')
+    })
+
+    it('无窗口字段时回退到 active：true 显示 原价→折后价', async () => {
+      const product = {
+        ...QODER,
+        fallbackModels: [{
+          id: 'promo', name: 'Promo', contextWindow: 1000,
+          priceFactor: 0.2,
+          promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.5, badgeZh: '错峰 4 折' },
+        }],
+      }
+      const adapter = makeAdapter({ product: product as never })
+      const models = await adapter.listModels('qoder')
+      // 窗口内 → `原价→折后价`（0.5→0.2），与 TRAE / buddy 同形态。
+      // ⚠️ 旧形态是 `x0.2 错峰 4 折`（只有折后价 + 角标），用户要求对齐 TRAE。
+      expect(models[0]?.name).toBe('Promo · x0.5→x0.2')
     })
 
     it('无 priceFactor 时 name 保持原样（不编造倍率）', async () => {

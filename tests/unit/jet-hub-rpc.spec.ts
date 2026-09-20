@@ -362,6 +362,63 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(order).toEqual(['entry-0', 'entry-1', 'entry-2'])
     expect(response.results.map(r => r.accountId)).toEqual(['a', 'b', 'c'])
   })
+
+  /**
+   * ⚠️ 真实缺陷（用户报障）：4 个 CodeBuddy 账号一键领取全部失败，
+   * 错误是 **`fetcher is not a function`**。
+   *
+   * 根因：`claimDailyCheckin` / `fetchCheckinStatus` 的真实签名是
+   * `(credential, product, fetcher)`，而 `collectClaimResults` 在**未注入
+   * deps 时**调用的是 `claim(credential, product, entry)` —— 把 `entry`
+   * 塞进了 `fetcher` 的位置，于是 `fetcher(...)` 抛
+   * `TypeError: fetcher is not a function`。
+   *
+   * 为什么长期没被发现：`makeDeps` **总是注入 `claim` / `fetchStatus`**，
+   * 于是真实的默认实现路径**从未被任何用例覆盖**；而
+   * `deps.claim ?? (claimDailyCheckin as unknown as …)` 这个
+   * `as unknown as` 强转**掩盖了签名不匹配**，TypeScript 也帮不上忙。
+   *
+   * 本用例刻意**不注入 claim / fetchStatus**，走真实默认实现，用注入的
+   * fetcher 断言「被当成函数调用的那个参数确实是 fetcher」。
+   */
+  it('未注入 deps 时走真实默认实现，第三参必须是 fetcher（真实缺陷回归）', async () => {
+    const calls: string[] = []
+    const fakeFetch = (async (url: string | URL | Request) => {
+      calls.push(String(url))
+      // 状态端点返回「活动开启且今天没领」，让流程走到 claim。
+      // ⚠️ 字段名必须是真实的 `active` / `today_checked_in`（见 fetchCheckinStatus），
+      // 用错名字会被 readBool 读成 false → 落到 inactive 短路。
+      if (String(url).includes('checkin-activity-status')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { active: true, today_checked_in: false },
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({
+        code: 0,
+        data: { credit: 100, streak_days: 1, is_streak_day: false },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+
+    const accounts = [makeEntry({ id: 'cb-1', credentialRef: 'BUDDY_ACCOUNT_A70DB211' })]
+    // ⚠️ 关键：**不传** claim / fetchStatus，走真实的 claimDailyCheckin，
+    // 只注入 fetcher。
+    const response = await collectClaimResults(accounts, WORKBUDDY, {
+      resolve: async () => ({ value: VALID_CREDENTIAL_JSON }),
+      fetcher: fakeFetch,
+    })
+
+    // 不得是 `fetcher is not a function`
+    const outcome = response.results[0]?.outcome
+    if (outcome?.kind === 'failed') {
+      expect(outcome.message).not.toContain('fetcher is not a function')
+    }
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 100 })
+    // 确认确实发出了两次真实请求（状态 + 领取）
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toContain('checkin-activity-status')
+    expect(calls[1]).toContain('daily-checkin')
+  })
 })
 
 /**

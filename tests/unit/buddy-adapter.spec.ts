@@ -142,6 +142,35 @@ describe('BuddyAdapter', () => {
     expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
   })
 
+  it('兜底表白名单保留「被 agent 引用」的模型（真实缺陷回归：hy4-preview-f）', async () => {
+    // ⚠️ 真实缺陷（用户报障「hy4 preview 现在 ide 是免费我们还是 0.29」）：
+    // 两个端点下发的 id 集合不同，而「限时免费」促销只挂在
+    // `/v3/config` 独有的 `hy4-preview-f` 上，它**不在产品兜底表**里。
+    // 白名单式重建会把它丢弃 → 用户看不到那个免费变体，而 IDE 里能看到。
+    //
+    // 判据用 `agentReferenced`（服务端自己的「可选」信号），
+    // 而不是猜 id 后缀（`-f`/`-x`/`-sg` 含义各异，猜错会放进不可用的模型）。
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        // 不在兜底表、但服务端说可选 → 必须保留
+        { id: 'hy4-preview-f', name: 'Hy4 preview', creditsRate: 'x0.29', discountedCreditsRate: '免费', agentReferenced: true },
+        // 不在兜底表、服务端也没说可选（内部别名）→ 仍应丢弃
+        { id: 'internal-alias', name: 'Internal' },
+      ],
+    })
+    const ids = (await adapter.listModels('buddy')).map((m) => m.id)
+    expect(ids).toContain('hy4-preview-f')
+    expect(ids).not.toContain('internal-alias')
+    // 追加在末尾，不打乱兜底表原有顺序
+    expect(ids.slice(0, CODEBUDDY.fallbackModels!.length))
+      .toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+    expect(ids.at(-1)).toBe('hy4-preview-f')
+    // 展示名带促销价与变体标记（与既有 hy3/hy3-x 同款消歧）
+    const name = (await adapter.listModels('buddy')).find((m) => m.id === 'hy4-preview-f')?.name
+    expect(name).toContain('免费')
+    expect(name).toContain('F')
+  })
+
   // ── 计费倍率与同名区分（写进 name）──
   //
   // ⚠️ **必须写进 `name`，不是 `description`**：composer 的模型切换菜单只渲染

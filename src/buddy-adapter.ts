@@ -625,15 +625,25 @@ export class BuddyAdapter extends LlmAdapter {
    *
    * 有产品兜底表时以它为准：
    * - 只保留兜底表里声明的 id（远端多出来的别名/内部模型被丢弃）；
-   * - 兜底表声明但远端缺失的模型补进来（用兜底表的元数据）。
+   * - 兜底表声明但远端缺失的模型补进来（用兜底表的元数据）；
+   * - ⚠️ **例外：被 agent 引用的模型即使不在兜底表也保留**（见下）。
    *
-   * 没有产品兜底表（如 CodeBuddy）时原样返回远端结果，保持既有行为。
+   * ⚠️ **为什么需要那个例外**：两个端点下发的 id 集合**不同**，而兜底表是
+   * 编译期快照、只覆盖其中一套。实测（2026-09-21）`hy4-preview-f`
+   * —— 新用户限时免费变体 —— **只由 `/v3/config` 下发**，且被
+   * `craft`/`ask`/`plan` 三个 agent 引用（即服务端声明「对话里可选」），
+   * 但**不在兜底表**里。白名单重建会把它丢掉，于是用户看不到那个免费变体，
+   * 而 IDE 里能看到（用户报障「hy4 preview 现在 ide 是免费我们还是 0.29」）。
+   *
+   * 判据用 `agentReferenced`（服务端自己的「可选」信号）而非猜测 id 后缀 ——
+   * 后缀规则不统一（`-f` / `-x` / `-sg` / `-ioa` 含义各异），猜错会放进
+   * 不可用的模型。未标记的内部别名（如 `default`）不会被误留。
    */
   private reconcileWithFallback(models: readonly BuddyRemoteModel[]): BuddyRemoteModel[] {
     const fallback = this.product.fallbackModels
     if (fallback === undefined || fallback.length === 0) return [...models]
     const remoteById = new Map(models.map((model) => [model.id, model]))
-    return fallback.map((entry) => {
+    const reconciled = fallback.map((entry) => {
       const remote = remoteById.get(entry.id)
       // 远端元数据优先（更权威），缺失的字段用兜底表补齐
       return {
@@ -665,6 +675,17 @@ export class BuddyAdapter extends LlmAdapter {
           : {},
       }
     })
+    // ⚠️ 追加「被 agent 引用但不在兜底表」的模型（见本方法注释的例外说明）。
+    //
+    // 放在**末尾**：兜底表里的模型保持原有顺序与权威性，补充的变体排在后面，
+    // 不打乱用户已熟悉的列表顺序。
+    const known = new Set(reconciled.map((model) => model.id))
+    for (const model of models) {
+      if (model.agentReferenced !== true || known.has(model.id)) continue
+      known.add(model.id)
+      reconciled.push({ ...model })
+    }
+    return reconciled
   }
 
   /**

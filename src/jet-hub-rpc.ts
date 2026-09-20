@@ -257,6 +257,23 @@ export interface CreditsEndpointDeps<
    * 故它传 `false` 跳过预检，直接交给 `claim`。
    */
   precheckStatus?: boolean
+  /**
+   * 默认实现（`fetchCheckinStatus` / `claimDailyCheckin` / `fetchCreditBalance`）
+   * 使用的 fetch。
+   *
+   * ⚠️ **必须经此注入，不要在调用点直接 `fetch(...)`**：这些默认实现的真实签名是
+   * `(credential, product, fetcher)`，而本模块的历史写法是
+   * `deps.claim ?? (claimDailyCheckin as unknown as …)`，把三参函数硬转成
+   * 「只传两个参数」的类型 —— 于是调用点写 `claim(credential, product, entry)`
+   * 时，`entry` 落进了 `fetcher` 位置，运行时抛
+   * **`TypeError: fetcher is not a function`**（真实缺陷：用户一键领取 4 个
+   * CodeBuddy 账号全部失败）。
+   *
+   * 现改为**显式包装**默认实现（见下面的 `resolveClaim` 等），既保留 `entry`
+   * 给需要它的 provider（TRAE 用 `entry.id` 取签到设备代次），又把 fetcher
+   * 正确送进第三参。未提供时用全局 `fetch`。
+   */
+  fetcher?: typeof fetch
 }
 
 /**
@@ -275,7 +292,16 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsStatusResponse['accounts']> {
-  const fetchStatus = deps.fetchStatus ?? (fetchCheckinStatus as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchStatus']>)
+  // 与 collectClaimResults 同款：显式包装默认实现把 fetcher 送进第三参，
+  // 不用 `as unknown as` 掩盖签名差异（见 CreditsEndpointDeps.fetcher 的说明）。
+  const fetcher = deps.fetcher ?? fetch
+  const fetchStatus = deps.fetchStatus
+    ?? (async (credential: TCredential, product: TProduct): Promise<CheckinStatus | null> =>
+      fetchCheckinStatus(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
   const results: RpcCreditsStatusResponse['accounts'] = []
   // 顺序查询，避免并发触发风控
   for (const entry of accounts) {
@@ -311,8 +337,32 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsClaimAllResponse> {
-  const fetchStatus = deps.fetchStatus ?? (fetchCheckinStatus as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchStatus']>)
-  const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['claim']>)
+  // ⚠️ **默认实现必须显式适配，不能 `as unknown as` 硬转。**
+  //
+  // 真实签名是 `(credential, product, fetcher)`，而本接口把 `claim` 声明为
+  // `(credential, product, entry)`（TRAE 需要 `entry.id` 取签到设备代次）。
+  // 历史写法用 `as unknown as` 把这个不匹配「压」过去 —— TypeScript 于是不再
+  // 报错，但调用点传的第三个实参是 `entry`，它落进 `fetcher` 位置，运行时抛
+  // **`TypeError: fetcher is not a function`**。
+  // **真实缺陷**：用户一键领取 4 个 CodeBuddy 账号全部失败，报错就是这句。
+  //
+  // 修法：显式包装 —— 把 `deps.fetcher`（或全局 `fetch`）送进第三参，
+  // `entry` 只交给真正需要它的 provider（它们在自己的分支里注入 `claim`）。
+  const fetcher = deps.fetcher ?? fetch
+  const fetchStatus = deps.fetchStatus
+    ?? (async (credential: TCredential, product: TProduct): Promise<CheckinStatus | null> =>
+      fetchCheckinStatus(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
+  const claim = deps.claim
+    ?? (async (credential: TCredential, product: TProduct): Promise<ClaimOutcome> =>
+      claimDailyCheckin(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
   // 默认保留预检（CodeBuddy 系需要）；LobsterAI 显式传 false 跳过。
   const precheck = deps.precheckStatus !== false
   const results: RpcCreditsClaimAllResponse['results'] = []
@@ -373,7 +423,15 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsBalancesResponse['accounts']> {
-  const fetchBalance = deps.fetchBalance ?? (fetchCreditBalance as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchBalance']>)
+  // 同 collectClaimResults：显式包装，避免 `as unknown as` 掩盖签名差异。
+  const fetcher = deps.fetcher ?? fetch
+  const fetchBalance = deps.fetchBalance
+    ?? (async (credential: TCredential, product: TProduct): Promise<CreditBalance | null> =>
+      fetchCreditBalance(
+        credential as unknown as BuddyCredential,
+        product as unknown as BuddyProduct,
+        fetcher,
+      ))
   const fetchDetailed = deps.fetchBalanceDetailed
   const results: RpcCreditsBalancesResponse['accounts'] = []
   // 顺序查询，避免并发触发风控

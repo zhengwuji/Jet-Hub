@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { QODER, ALL_QODER_PRODUCTS, qoderProductById } from '../../src/qoder-product.js'
+import { promotionActiveNow, qoderDisplayName } from '../../src/qoder-adapter.js'
 
 describe('Qoder 产品配置', () => {
   it('端点常量与逆向结果一致（国际版）', () => {
@@ -110,5 +111,126 @@ describe('Qoder 产品配置', () => {
     expect(qoderProductById('qoder')).toBe(QODER)
     expect(qoderProductById('nope')).toBeUndefined()
     expect(ALL_QODER_PRODUCTS).toHaveLength(1)
+  })
+
+  /**
+   * ⚠️ 真实缺陷（用户报障）：「qwen3.8-max 是 0.5 原价打折到 0.2，
+   * 现在界面显示的是 0.5 不是 0.2」。
+   *
+   * 根因**不是展示逻辑**，而是兜底表的数值大范围过期 —— 早期表里多处是
+   * 手工估值，与真实 catalog 有 14 个模型对不上（`smodel` 写 3.2 实际 8、
+   * `qmodel_38max` 写 0.5 实际 0.2 …）。而旧用例**只断言了 id 列表**，
+   * 所以价格漂移一直没被发现。这里锁死真实数值。
+   */
+  it('倍率与真实 catalog 一致（用户报障：显示 0.5 而非折后 0.2）', () => {
+    const byId = new Map(QODER.fallbackModels.map((m) => [m.id, m]))
+    // 实测 2026-09-21 的 catalog-v6 `price_factor`（采集时刻的生效价）
+    const expected: Record<string, number> = {
+      auto: 0.5, ultimate: 2, performance: 1.1, efficient: 0.3,
+      smodel: 8, cmodel: 4,
+      qmodel_38max: 0.2, qfmodel: 0, qmodel_latest: 0.1, qmodel: 0.04,
+      kmodel_latest: 1.4, kmodel: 0.8,
+      gmodel: 0.8, gfmodel: 0.1,
+      dmodel: 0.5, dfmodel: 0.1,
+      mmodel: 0.2,
+    }
+    for (const [id, price] of Object.entries(expected)) {
+      expect(byId.get(id)?.priceFactor, `${id} 的 priceFactor`).toBe(price)
+    }
+  })
+
+  it('错峰促销：原价 × 折扣 = 折后价（三条实测全部吻合）', () => {
+    const byId = new Map(QODER.fallbackModels.map((m) => [m.id, m]))
+    for (const id of ['qmodel_38max', 'qmodel_latest', 'qmodel']) {
+      const m = byId.get(id)
+      const p = m?.promotion
+      expect(p, `${id} 应有 promotion`).toBeDefined()
+      const computed = p!.beforePromotionPriceFactor! * p!.discountFactor!
+      // priceFactor 是采集时刻的生效价（当时在窗口内 → 等于折后价）
+      expect(Number(computed.toFixed(4)), `${id} 折后价`).toBe(m!.priceFactor)
+      // 且折扣确实更便宜
+      expect(m!.priceFactor!).toBeLessThan(p!.beforePromotionPriceFactor!)
+    }
+  })
+
+  it('窗口字段齐备（展示层据此本地推算，不依赖会过期的 active 快照）', () => {
+    for (const m of QODER.fallbackModels) {
+      if (m.promotion === undefined) continue
+      expect(m.promotion.windowStart, m.id).toMatch(/^\d{1,2}:\d{2}$/)
+      expect(m.promotion.windowEnd, m.id).toMatch(/^\d{1,2}:\d{2}$/)
+    }
+  })
+})
+
+describe('Qoder 错峰时段判定（本地推算）', () => {
+  const promo = {
+    active: false, // ⚠️ 故意写错：快照不可信，必须以窗口为准
+    discountFactor: 0.4,
+    beforePromotionPriceFactor: 0.5,
+    windowStart: '22:00',
+    windowEnd: '08:00',
+  }
+  const at = (iso: string): Date => new Date(iso)
+
+  it('跨零点窗口：22:00–08:00 的各边界', () => {
+    expect(promotionActiveNow(promo, at('2026-09-21T00:18:00+08:00'))).toBe(true)
+    expect(promotionActiveNow(promo, at('2026-09-21T03:00:00+08:00'))).toBe(true)
+    expect(promotionActiveNow(promo, at('2026-09-21T07:59:00+08:00'))).toBe(true)
+    expect(promotionActiveNow(promo, at('2026-09-21T08:00:00+08:00'))).toBe(false)
+    expect(promotionActiveNow(promo, at('2026-09-21T12:00:00+08:00'))).toBe(false)
+    expect(promotionActiveNow(promo, at('2026-09-21T21:59:00+08:00'))).toBe(false)
+    expect(promotionActiveNow(promo, at('2026-09-21T22:00:00+08:00'))).toBe(true)
+  })
+
+  it('窗口字段缺失时回退到目录的 active', () => {
+    const noWindow = { active: true, discountFactor: 0.4 }
+    expect(promotionActiveNow(noWindow, at('2026-09-21T12:00:00+08:00'))).toBe(true)
+    expect(promotionActiveNow({ ...noWindow, active: false }, at('2026-09-21T00:00:00+08:00'))).toBe(false)
+  })
+
+  it('非法窗口值也回退到 active（不抛错）', () => {
+    const bad = { active: true, windowStart: 'xx', windowEnd: 'yy' }
+    expect(promotionActiveNow(bad, at('2026-09-21T12:00:00+08:00'))).toBe(true)
+  })
+})
+
+describe('Qoder 展示名', () => {
+  const byId = new Map(QODER.fallbackModels.map((m) => [m.id, m]))
+  const inWindow = new Date('2026-09-21T00:18:00+08:00')
+  const outWindow = new Date('2026-09-21T12:00:00+08:00')
+
+  // ⚠️ **折扣显示形态与 TRAE / buddy 对齐**（用户要求）：
+  //   TRAE   `Seed-2.1-Turbo · x0.4→x0.2`
+  //   buddy  `GLM-5.2 · x0.79→x0.50`
+  //   Qoder  `Qwen3.8-Max · x0.5→x0.2`   ← 本次统一
+  //
+  // 旧形态是「只有折后价 + 中文角标」（`x0.2 错峰 4 折`），两条信息：
+  // ① 看不到原价与折扣幅度；② 角标与数字**冗余**（0.2/0.5 本就是 4 折）。
+  it('窗口内显示 原价→折后价（与 TRAE/buddy 形态一致）', () => {
+    const name = qoderDisplayName(byId.get('qmodel_38max')!, inWindow)
+    expect(name).toBe('Qwen3.8-Max · x0.5→x0.2')
+  })
+
+  it('窗口外显示原价，且**不带箭头**（避免误导为有折扣）', () => {
+    const name = qoderDisplayName(byId.get('qmodel_38max')!, outWindow)
+    expect(name).toBe('Qwen3.8-Max · x0.5')
+    expect(name).not.toContain('→')
+    expect(name).not.toContain('错峰')
+  })
+
+  it('折扣幅度不同的模型也走箭头形态', () => {
+    // qmodel_latest：原价 0.5、2 折 → 0.1
+    expect(qoderDisplayName(byId.get('qmodel_latest')!, inWindow)).toBe('Qwen3.7-Max · x0.5→x0.1')
+    // qmodel：原价 0.1、4 折 → 0.04
+    expect(qoderDisplayName(byId.get('qmodel')!, inWindow)).toBe('Qwen3.7-Plus · x0.1→x0.04')
+  })
+
+  it('免费模型显示「免费」而不是 x0', () => {
+    expect(qoderDisplayName(byId.get('qfmodel')!, inWindow)).toBe('Qwen3.8-Flash · 免费')
+  })
+
+  it('无促销的模型直接用 priceFactor（无箭头）', () => {
+    expect(qoderDisplayName(byId.get('smodel')!, inWindow)).toBe('Sonus · x8')
+    expect(qoderDisplayName(byId.get('dmodel')!, inWindow)).toBe('DeepSeek-V4-Pro · x0.5')
   })
 })

@@ -49,16 +49,21 @@ export interface QoderFallbackModel {
    * ⚠️ 字段名是 **`price_factor`**，不是 `cost_multiplier`（后者不存在于
    * Qoder 目录；`cost_multiplier` 是有道 LobsterAI 的字段，别混淆）。
    *
-   * 实测本机 catalog（2026-09-21，17 个 chat 模型）分布：
-   * `qfmodel`（Qwen3.8-Flash）= **0**、`qmodel`/`gfmodel` = 0.1、
-   * `mmodel`/`dfmodel` = 0.2、`efficient` = 0.3 …… `smodel`/`cmodel` = 3.2。
+   * ⚠️ **它是「目录下发那一刻」的生效价，会随错峰窗口变化** ——
+   * 窗口内是折后价、窗口外是原价。因此本表存的是**采集时刻的值**，
+   * 展示时须结合 {@link QoderModelPromotion} 的窗口**本地推算**当前价
+   * （见 `qoderDisplayName`），不要把它当成恒定原价。
+   *
+   * 实测本机 catalog（2026-09-21，17 个 chat 模型）：
+   * `qfmodel`（Qwen3.8-Flash）= **0**、`qmodel` = 0.04、`qmodel_latest`/
+   * `dfmodel`/`gfmodel` = 0.1 …… `smodel`（Sonus）= 8。
    *
    * **0 是合法值**（免费），故不能用 `!== undefined && > 0` 过滤 ——
    * 那会把用户最关心的免费模型漏掉。
    */
   priceFactor?: number
   /**
-   * 促销前的原价倍率（目录 `original_price_factor`）。
+   * 促销前的原价倍率（目录 `original_price_factor` / `before_promotion_price_factor`）。
    *
    * 与 {@link priceFactor} 是**两个独立字段**：实测 `qfmodel` 的
    * `price_factor=0` 而 `original_price_factor=0.1`，即免费额度是在原价
@@ -66,12 +71,19 @@ export interface QoderFallbackModel {
    */
   originalPriceFactor?: number
   /**
-   * 错峰折扣（目录 `promotion`）—— 仅在 `active: true` 时展示。
+   * 错峰折扣（目录 `promotion`）。
    *
-   * 实测三档（`qfmodel` 无 promotion；`qmodel_38max`/`qmodel` 是 4 折、
+   * ⚠️ **`active` 是「目录下发那一刻」的快照，不可作为长期判据**：
+   * 用户长时间不重启客户端时它会过期。真实窗口由 `windowStart`/`windowEnd`
+   * 描述且稳定，故展示时**按当前时间本地推算**是否在窗口内
+   * （见 `qoderDisplayName` 的 `promotionActiveNow`），`active` 仅作回退。
+   *
+   * 实测三档（`qfmodel` 无 promotion；`qmodel_38max` 是 4 折、
    * `qmodel_latest` 是 2 折），窗口统一为 22:00–08:00（Asia/Singapore）。
-   * `active: false` 表示当前不在折扣时段内 —— 此时**不应**展示折扣价，
-   * 否则用户会按错峰价预期、实际按原价计费。
+   *
+   * 关系式（实测三条全部吻合）：
+   * `priceFactor === beforePromotionPriceFactor × discountFactor`
+   * —— 故可据原价与折扣推算任意时刻的生效价。
    */
   promotion?: QoderModelPromotion
   /** 可用思考档位（远端 `thinking_config.enabled.efforts` 的键）。 */
@@ -80,7 +92,12 @@ export interface QoderFallbackModel {
 
 /** 目录 `promotion` 字段（错峰折扣）。 */
 export interface QoderModelPromotion {
-  /** 当前是否处于折扣时段内（远端 `active`）。 */
+  /**
+   * 目录下发时是否处于折扣时段内（远端 `active`）—— **快照值，会过期**。
+   *
+   * 长期运行的会话里它会与真实时段脱节，故只作回退：
+   * `windowStart`/`windowEnd` 齐备时以**本地时间推算**为准。
+   */
   active: boolean
   /** 折扣后倍率（远端 `discount_factor`），如 0.4 = 4 折。 */
   discountFactor?: number
@@ -90,7 +107,14 @@ export interface QoderModelPromotion {
   windowStart?: string
   /** 时段终点（远端 `window_end`，如 `08:00`）。 */
   windowEnd?: string
-  /** 中文角标文案（远端 `badge.zh`，如「错峰 4 折」）。 */
+  /**
+   * 中文角标文案（远端 `badge.zh`，如「错峰 4 折」）。
+   *
+   * ⚠️ **当前不参与展示**：Qoder 的折扣已统一为「原价→折后价」箭头形态
+   * （与 TRAE / buddy 一致），角标与箭头信息**冗余**（0.2/0.5 本就是 4 折）。
+   * 字段保留是因为它是目录下发的原始数据，重新采集时仍可对照；
+   * 若将来要恢复角标，改 `qoderDisplayName` 即可。
+   */
   badgeZh?: string
 }
 
@@ -235,18 +259,27 @@ export interface QoderProduct {
  * - `efforts`：目录 `thinking_config.enabled.efforts` 的键。
  */
 const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
-  // id,             展示名,               上下文,        vl,    reason, free, 思考档位
-  { id: 'auto', name: 'Auto', contextWindow: 200_000, supportsImage: true, supportsThinking: false, priceFactor: 1 },
-  { id: 'ultimate', name: 'Ultimate', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 1.6, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
-  { id: 'performance', name: 'Performance', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 1.1, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
+  // ⚠️ 全部数值逐条对照本机 catalog-v6 实测（2026-09-21）。早期版本多处为
+  // 手工估值，与真实值**大范围不符**（14 个模型有偏差，如 `smodel` 写 3.2
+  // 实际 8、`qmodel_38max` 写 0.5 实际 0.2），用户据此报障。
+  // 改动本表时必须重新对照 catalog，不要凭印象填。
+  //
+  // 字段顺序：id, 展示名, 上下文, vl, reasoning, free, 倍率
+  { id: 'auto', name: 'Auto', contextWindow: 200_000, supportsImage: true, supportsThinking: false, priceFactor: 0.5 },
+  { id: 'ultimate', name: 'Ultimate', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 2, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
+  // ⚠️ `is_reasoning: false` 但 `thinking_config.enabled` 为真 —— 上游确实
+  // 提供档位选择，故 `efforts` 保留；而请求体的 `isReasoning` 取 `is_reasoning`。
+  { id: 'performance', name: 'Performance', contextWindow: 1_000_000, supportsImage: true, supportsThinking: false, priceFactor: 1.1, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
   { id: 'efficient', name: 'Efficient', contextWindow: 200_000, supportsImage: true, supportsThinking: false, priceFactor: 0.3 },
-  { id: 'smodel', name: 'Sonus', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 3.2, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
-  { id: 'cmodel', name: 'Cantus', contextWindow: 200_000, supportsImage: true, supportsThinking: true, priceFactor: 3.2, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
-  // 免费额度模型（is_free=true）：e2e 探针默认用它们以免消耗积分
+  { id: 'smodel', name: 'Sonus', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 8, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
+  { id: 'cmodel', name: 'Cantus', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 4, efforts: ['xhigh', 'high', 'low', 'max', 'medium'] },
+  // 免费额度模型（is_free=true）：e2e 探针默认用它们以免消耗积分。
+  // ⚠️ `priceFactor` 是**采集时刻的生效价**（窗口内为折后价），原价在
+  // `promotion.beforePromotionPriceFactor`；展示时本地推算当前价。
   {
     id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 180_000, supportsImage: true, supportsThinking: true,
-    isFree: true, priceFactor: 0.5, efforts: ['xhigh', 'low', 'medium'],
-    promotion: { active: false, discountFactor: 0.4, beforePromotionPriceFactor: 0.5, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰 4 折' },
+    isFree: true, priceFactor: 0.2, efforts: ['xhigh', 'low', 'medium'],
+    promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.5, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰 4 折' },
   },
   {
     // ⚠️ `priceFactor: 0` 是**免费**（实测），不是缺失 —— 见接口注释。
@@ -255,21 +288,23 @@ const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   },
   {
     id: 'qmodel_latest', name: 'Qwen3.7-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: false,
-    priceFactor: 0.5, originalPriceFactor: 0.5,
-    promotion: { active: false, discountFactor: 0.2, beforePromotionPriceFactor: 0.5, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰 2 折' },
+    priceFactor: 0.1, originalPriceFactor: 0.5,
+    promotion: { active: true, discountFactor: 0.2, beforePromotionPriceFactor: 0.5, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰 2 折' },
   },
   {
     id: 'qmodel', name: 'Qwen3.7-Plus', contextWindow: 1_000_000, supportsImage: true, supportsThinking: false,
-    priceFactor: 0.1,
-    promotion: { active: false, discountFactor: 0.4, beforePromotionPriceFactor: 0.1, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰 4 折' },
+    priceFactor: 0.04,
+    promotion: { active: true, discountFactor: 0.4, beforePromotionPriceFactor: 0.1, windowStart: '22:00', windowEnd: '08:00', badgeZh: '错峰 4 折' },
   },
-  { id: 'kmodel_latest', name: 'Kimi-K3', contextWindow: 180_000, supportsImage: true, supportsThinking: false, priceFactor: 0.8, efforts: ['high', 'low', 'max'] },
-  { id: 'kmodel', name: 'Kimi-K2.8-Preview', contextWindow: 200_000, supportsImage: true, supportsThinking: false, priceFactor: 0.3, efforts: ['high', 'low', 'max'] },
-  { id: 'gmodel', name: 'GLM-5.3', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 0.6, efforts: ['high', 'low', 'max'] },
+  { id: 'kmodel_latest', name: 'Kimi-K3', contextWindow: 180_000, supportsImage: true, supportsThinking: false, priceFactor: 1.4, efforts: ['high', 'low', 'max'] },
+  // ⚠️ 该模型**未下发 `max_input_tokens`**，此处取 `context_config` 里
+  // `is_default: true` 的那档（200K）。
+  { id: 'kmodel', name: 'Kimi-K2.8-Preview', contextWindow: 200_000, supportsImage: true, supportsThinking: false, priceFactor: 0.8, efforts: ['high', 'low', 'max'] },
+  { id: 'gmodel', name: 'GLM-5.3', contextWindow: 180_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ['high', 'low', 'max'] },
   { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['high', 'max'] },
-  { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ['high', 'max'] },
-  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.2, efforts: ['high', 'max', 'low'] },
-  { id: 'mmodel', name: 'MiniMax-M3', contextWindow: 1_000_000, supportsImage: true, supportsThinking: false, priceFactor: 0.2 },
+  { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ['high', 'max'] },
+  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['high', 'max', 'low'] },
+  { id: 'mmodel', name: 'MiniMax-M3', contextWindow: 180_000, supportsImage: true, supportsThinking: false, priceFactor: 0.2 },
 ]
 
 /** Qoder provider 配置（国际版）。 */
