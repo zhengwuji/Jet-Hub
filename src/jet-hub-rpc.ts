@@ -418,10 +418,20 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
  *
  * 用 `ctx.get` 而不是 `inject`：Jet Hub 的账号管理是主要职责，模型开关只是
  * 附加能力；llm 服务缺失时账号面板仍应可用，只是「显示列表」按钮报错。
+ *
+ * `listAllModels` 是本插件适配器额外提供的**不受用户黑名单影响**的完整目录
+ * （见各适配器的同名方法）。DSH 的 `llm` 服务只保证 `listModels`，故这里把它
+ * 声明为可选：缺失时退化为「用 listModels 的结果 + 黑名单补回裸 id」。
  */
-function llmServiceOf(ctx: Context): { listModels(provider: string): Promise<Array<{ id: string; name: string }>> } | undefined {
+function llmServiceOf(ctx: Context): {
+  listModels(provider: string): Promise<Array<{ id: string; name: string }>>
+  listAllModels?(provider: string): readonly { id: string; name: string }[]
+} | undefined {
   return ctx.get('llm') as
-    | { listModels(provider: string): Promise<Array<{ id: string; name: string }>> }
+    | {
+      listModels(provider: string): Promise<Array<{ id: string; name: string }>>
+      listAllModels?(provider: string): readonly { id: string; name: string }[]
+    }
     | undefined
 }
 
@@ -441,10 +451,29 @@ export function registerJetHubRpc(
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   trae: TraeAuth,
+  /**
+   * provider → 适配器实例（可选）。
+   *
+   * 用于「显示列表」拿到**不受用户黑名单影响**的全量目录（`listAllModels`），
+   * 使被关闭的模型也能显示正确的展示名（含倍率），而不是退化成裸 id。
+   * 省略时退化为只用 `ctx.llm.listModels()` 的历史行为。
+   */
+  modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, qoder, trae)
+    registerJetHubEndpoints(
+      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters,
+    )
   })
+}
+
+/**
+ * 「显示列表」所需的最小适配器接口：能给出**不套用户黑名单**的完整目录。
+ *
+ * 只声明用到的方法（结构化类型），避免让本模块依赖五个具体适配器类。
+ */
+export interface ModelCatalogSource {
+  listAllModels(): readonly { id: string; name: string }[]
 }
 
 /** 注册 Jet Hub 管理 API 端点。使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。 */
@@ -457,6 +486,7 @@ function registerJetHubEndpoints(
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   trae: TraeAuth,
+  modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -1106,31 +1136,50 @@ function registerJetHubEndpoints(
         // 黑名单直接读账号池的进程内副本：开关写入后无需重建适配器，
         // 下一次 listModels 就会应用新的过滤结果。
         const disabledMap = pool.listDisabledModels(req.provider)
-        // ⚠️ `llm.listModels()` 返回的目录**已被适配器过滤掉黑名单**：两个适配器
-        // （llm-adapter.ts / buddy-adapter.ts）的 listModels 内部都会实时
-        // `filter(m => !disabledModelsFor(provider).has(m.id))`。若直接对这个
-        // 结果回填 disabled，就形成闭环矛盾——`disabledMap` 里的键恰好是
+        // ⚠️ `llm.listModels()` 返回的目录**已被适配器过滤掉黑名单**：所有适配器
+        // 的 listModels 内部都会实时 `filter(m => !disabledModelsFor(provider).has(m.id))`。
+        // 若直接对这个结果回填 disabled，就形成闭环矛盾——`disabledMap` 里的键恰好是
         // `models` 中已被移除的那些元素，`.map()` 永远匹配不到它们，被关闭的
         // 模型连同它的开关一起从设置页消失，用户**再也无法重新打开**（只能手工
         // 编辑 settings.yaml）。这正是「关掉后彻底找不到该模型」的根因。
         //
-        // 因此这里以黑名单为准做并集：凡是「黑名单里为 true、却已不在
-        // listModels 结果中」的模型，补回列表并标记为已关闭。设置页据此始终能
-        // 渲染出全部开关；而对话框模型选择器读的仍是过滤后的 listModels，
-        // 可见性行为完全不变。
-        const listedIds = new Set(models.map((model) => model.id))
-        const filteredOut = Object.keys(disabledMap)
-          .filter((id) => disabledMap[id] === true && !listedIds.has(id))
-        const value: RpcModelListResponse = {
-          models: [
-            ...models.map((model) => ({
-              id: model.id,
-              name: model.name,
-              disabled: disabledMap[model.id] === true,
-            })),
+        // 因此设置页的目录必须以**未过滤**的全量为准：
+        // - 优先用适配器提供的 `listAllModels()`（不套黑名单，且带**最终展示名**，
+        //   含倍率与同名消歧）；
+        // - 它不存在时（外部/旧适配器）退化为「listModels 结果 + 黑名单补回裸 id」，
+        //   此时关闭项只能显示 id（历史行为）。
+        //
+        // ⚠️ 展示名必须来自**不套黑名单**的全量目录而非裸 id：用户报障
+        // 「关闭的就没有显示倍率，关闭的应该也显示倍率」—— 根因正是补回时只有
+        // id 可用。适配器实例由 `registerJetHubRpc` 的 `modelAdapters` 传入
+        // （DSH 的 `ctx.llm` 只保证 `listModels`，不透传自定义方法）。
+        // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
+        const catalogSource = modelAdapters?.[req.provider]
+        const all = catalogSource?.listAllModels()
+        let catalog: Array<{ id: string; name: string }>
+        if (all !== undefined) {
+          catalog = [...all]
+          // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
+          const known = new Set(catalog.map((model) => model.id))
+          for (const id of Object.keys(disabledMap)) {
+            if (disabledMap[id] === true && !known.has(id)) catalog.push({ id, name: id })
+          }
+        } else {
+          const listedIds = new Set(models.map((model) => model.id))
+          const filteredOut = Object.keys(disabledMap)
+            .filter((id) => disabledMap[id] === true && !listedIds.has(id))
+          catalog = [
+            ...models.map((model) => ({ id: model.id, name: model.name })),
             // 这些模型已被适配器过滤掉，拿不到原始 name，回退为 id。
-            ...filteredOut.map((id) => ({ id, name: id, disabled: true })),
-          ],
+            ...filteredOut.map((id) => ({ id, name: id })),
+          ]
+        }
+        const value: RpcModelListResponse = {
+          models: catalog.map((model) => ({
+            id: model.id,
+            name: model.name,
+            disabled: disabledMap[model.id] === true,
+          })),
         }
         return { ok: true, value }
       }

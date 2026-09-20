@@ -195,7 +195,7 @@ export function apply(ctx: Context): void {
       }
     },
   })
-  registerCodeArtsLlm(ctx, {
+  const codearts = registerCodeArtsLlm(ctx, {
     credentialRef: credentialRef(CODEARTS_CREDENTIAL_REF),
     resolveCredential: async () => {
       // 优先使用账号池获取可用账号，回退到单凭据解析
@@ -220,7 +220,7 @@ export function apply(ctx: Context): void {
   // 不注册斜杠命令：登录/状态/续期都在 Jet Hub 设置页完成（多账号 + 账号池），
   // 命令式的单凭据入口已无必要。
   const buddy = new BuddyAuth(ctx)
-  registerBuddyLlm(ctx, {
+  const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
     resolveCredential: async () => {
       // 优先使用账号池获取可用账号，回退到单凭据解析
@@ -249,7 +249,7 @@ export function apply(ctx: Context): void {
   // ctx.buddyAuth / ctx.workbuddyAuth，互不覆盖。
   // 同样不注册斜杠命令：入口在 Jet Hub 的 WorkBuddy 面板。
   const workbuddy = new BuddyAuth(ctx, { product: WORKBUDDY })
-  registerBuddyLlm(ctx, {
+  const workbuddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(WORKBUDDY.defaultCredentialRef),
     resolveCredential: async () => {
       // 只从 workbuddy 的账号池取账号，回退到 WorkBuddy 自己的单凭据 ref，
@@ -277,7 +277,7 @@ export function apply(ctx: Context): void {
   // 服务名由 LobsteraiAuth 依 product.id 派生，注册为 ctx.lobsteraiAuth。
   // 与其他 provider 一样不注册斜杠命令：入口在 Jet Hub 的 LobsterAI 面板。
   const lobsterai = new LobsteraiAuth(ctx)
-  registerLobsteraiLlm(ctx, {
+  const lobsteraiAdapter = registerLobsteraiLlm(ctx, {
     credentialRef: credentialRef(LOBSTERAI.defaultCredentialRef),
     resolveCredential: async () => {
       // 只从 LobsterAI 自己的账号池取账号，回退到自己的单凭据 ref，
@@ -324,7 +324,7 @@ export function apply(ctx: Context): void {
   // 服务名由产品 id 派生，注册为 ctx.qoderAuth。
   // 与其它 provider 一样不注册斜杠命令：入口在 Jet Hub 的 Qoder 面板。
   const qoder = new QoderAuth(ctx)
-  registerQoderLlm(ctx, {
+  const qoderAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER.defaultCredentialRef),
     resolveCredential: async () => {
       // 只从 Qoder 自己的账号池取账号，回退到自己的单凭据 ref，
@@ -367,7 +367,7 @@ export function apply(ctx: Context): void {
   // 服务名由 TraeAuth 依 product.id 派生，注册为 ctx.traeAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 TRAE 面板。
   const trae = new TraeAuth(ctx)
-  registerTraeLlm(ctx, {
+  const traeAdapter = registerTraeLlm(ctx, {
     credentialRef: credentialRef(TRAE.defaultCredentialRef),
     resolveCredential: async () => {
       const available = await pool.getAvailableAccount(TRAE.id, '')
@@ -449,6 +449,20 @@ export function apply(ctx: Context): void {
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae)
+  // provider → 适配器实例：Jet Hub「显示列表」需要 `listAllModels()`（不受用户
+  // 黑名单影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 只保证
+  // `listModels`，不透传自定义方法，故这里显式把实例传下去。
+  const modelAdapters: Record<string, { listAllModels(): readonly { id: string; name: string }[] }> = {
+    // `codearts` 是 registerCodeArtsLlm 返回的**适配器实例**（与 CodeArtsAuth
+    // 服务实例 `service` 不同名，故这里可以简写）。
+    codearts,
+    buddy: buddyAdapter,
+    workbuddy: workbuddyAdapter,
+    lobsterai: lobsteraiAdapter,
+    qoder: qoderAdapter,
+    trae: traeAdapter,
+  }
+
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters)
   ctx.provide('accountPool', pool)
 }

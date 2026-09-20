@@ -384,6 +384,27 @@ IDE 按 name 归并，我们按 id 列出。二者是**不同区域的独立计�
 - `CodeArtsAdapter.listModels` 必须 `await this.ensureRemoteModels()`：早期用 `void` 丢弃 Promise，冷缓存时会误用静态兜底表
 - RPC：`model.list` / `model.setDisabled`（`src/jet-hub-rpc.ts`），前端在 `plugin-src/client/jet-hub.js` 的 `ModelListPanel`
 
+### ⚠️ 设置页目录必须走 `listAllModels`，不能复用 `listModels`
+
+**真实缺陷**（用户报障「打开的显示了倍率，关闭的就没有显示倍率」）：
+
+`listModels` 会**按黑名单过滤**，于是被关闭的模型**不在其返回值里**。设置页必须
+把它们渲染出来（否则用户无法重新打开），端点只能凭 `disabledMap` 的 key（裸 id）
+补回 —— 那条路径拿不到展示名，只能退化成裸 id，**倍率与模型名随之丢失**。
+
+故每个适配器都额外提供 **`listAllModels()`**：返回**不套黑名单**的完整目录，
+且带**最终展示名**（含倍率、同名消歧）。`model.list` 优先用它，再自行回填
+`disabled`；`listAllModels` 缺失时才退化为「listModels + 裸 id 补回」的历史行为。
+
+⚠️ **`ctx.llm` 不透传自定义方法**（DSH 只保证 `listModels`），所以适配器实例必须
+由 `index.ts` 显式收集成 `modelAdapters` 传给 `registerJetHubRpc`。五个
+`register*Llm` 因此都**返回适配器实例**（而非 `void`）。加新 provider 时别忘两处：
+`listAllModels()` + 在 `index.ts` 的 `modelAdapters` 里登记。
+
+⚠️ **同名消歧必须基于未过滤的全量集合**（`displayNameFor(model, source)` 而非
+`listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
+名字随开关跳变。
+
 ## 常见开发任务
 
 ### 新增功能

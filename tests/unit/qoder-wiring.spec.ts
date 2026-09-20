@@ -36,8 +36,13 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
     expect(index).toContain('qoder.stop()')
   })
 
-  it('Jet Hub RPC 传入 qoder 实例', () => {
-    expect(index).toContain('registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae)')
+  it('Jet Hub RPC 传入 qoder 实例与适配器映射', () => {
+    // 末尾的 `modelAdapters` 供「显示列表」取不受黑名单影响的全量目录
+    // （使被关闭的模型也显示正确的展示名/倍率，而不是退化成裸 id）。
+    expect(index).toContain(
+      'registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters)',
+    )
+    expect(index, 'qoder 适配器须登记进映射').toContain('qoder: qoderAdapter')
   })
 
   it('续期调度只看 refreshable，不看 enabled（AGENTS.md 强制约定）', () => {

@@ -796,6 +796,14 @@ describe('model.list / model.setDisabled 端点', () => {
      * 仅当需要验证「适配器未过滤」这一非真实场景时才置为 false。
      */
     adapterFiltersDisabledModels?: boolean
+    /**
+     * 复刻适配器实例映射（`listAllModels` 返回**不套黑名单**的全量目录）。
+     *
+     * 真实链路里 `index.ts` 会把五个适配器实例传给 `registerJetHubRpc`；
+     * `model.list` 据此拿到被关闭模型的**真实展示名**（含倍率），而不是裸 id。
+     * 省略时退化为「listModels + 裸 id 补回」的历史行为。
+     */
+    modelAdapters?: Record<string, { listAllModels(): readonly { id: string; name: string }[] }>
   }) {
     // settings 替身：内存里保存 namespace 的值，语义与真实服务一致的
     // 「整体 replace」。
@@ -862,7 +870,10 @@ describe('model.list / model.setDisabled 端点', () => {
       logger: { warn: () => {}, info: () => {} },
     }
 
-    registerJetHubRpc(ctx as never, pool, {} as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(
+      ctx as never, pool, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      options.modelAdapters as never,
+    )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     /** 调用一个端点方法，返回解包后的 result。 */
@@ -899,9 +910,8 @@ describe('model.list / model.setDisabled 端点', () => {
     const result = await call('model.list', { provider: 'buddy' })
 
     expect(result.ok).toBe(true)
-    // hy3 已被适配器过滤掉（桩复刻了真实过滤），由端点补回列表；
-    // 补回的条目拿不到原始 name，回退为 id —— 这是与契约一致的取舍：
-    // 设置页需要的是「能重新打开它」，而不是它的展示名。
+    // 未提供 modelAdapters 时退化为历史行为：hy3 已被适配器过滤掉（桩复刻了
+    // 真实过滤），由端点补回列表；补回的条目拿不到原始 name，回退为 id。
     expect(result.value).toEqual({
       models: [
         { id: 'glm-5.2', name: 'GLM-5.2', disabled: false },
@@ -909,6 +919,41 @@ describe('model.list / model.setDisabled 端点', () => {
         { id: 'hy3', name: 'hy3', disabled: true },
       ],
     })
+  })
+
+  /**
+   * 回归：**被关闭的模型也要显示倍率**（用户报障）。
+   *
+   * 真实缺陷：适配器的 `listModels` 会按黑名单过滤，于是被关闭的模型不在其中，
+   * 端点只能凭黑名单的 key（裸 id）补回 —— 展示名与倍率随之丢失。用户看到
+   * 「打开的显示倍率、关闭的没有倍率」。
+   *
+   * 修法：`index.ts` 把适配器实例传给 `registerJetHubRpc`，端点用其
+   * `listAllModels()`（不套黑名单、带最终展示名）作为目录来源。
+   */
+  it('关闭的模型仍显示带倍率的展示名（不再退化成裸 id）', async () => {
+    const catalog = [
+      { id: 'glm-5.2', name: 'GLM-5.2 · x0.78' },
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash · x0.13' },
+      { id: 'kimi-k3', name: 'Kimi-K3 · x1.83' },
+    ]
+    const { call } = registerEndpoints({
+      models: catalog,
+      disabledModels: { trae: { 'deepseek-v4.1-flash': true } },
+      modelAdapters: { trae: { listAllModels: () => catalog } },
+    })
+
+    const result = await call('model.list', { provider: 'trae' })
+    expect(result.ok).toBe(true)
+    const models = (result.value as { models: Array<{ id: string; name: string; disabled: boolean }> }).models
+    const closed = models.find((m) => m.id === 'deepseek-v4.1-flash')
+    expect(closed?.disabled, '该项应为已关闭').toBe(true)
+    // 关键断言：关闭项必须仍是**带倍率的展示名**，而不是裸 id。
+    expect(closed?.name).toBe('DeepSeek-V4.1-Flash · x0.13')
+    // 打开项不受影响。
+    expect(models.find((m) => m.id === 'glm-5.2')?.name).toBe('GLM-5.2 · x0.78')
+    // 全部模型都应在列表里（含被关闭的）。
+    expect(models.map((m) => m.id)).toEqual(['glm-5.2', 'deepseek-v4.1-flash', 'kimi-k3'])
   })
 
   /**

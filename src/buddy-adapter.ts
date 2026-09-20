@@ -732,6 +732,23 @@ export class BuddyAdapter extends LlmAdapter {
     return this.productFallbackIndex
   }
 
+  /**
+   * 完整模型目录（**不应用用户黑名单**），含最终展示名（倍率 + 同名消歧）。
+   *
+   * 设置页（Jet Hub「显示列表」）必须把**被关闭的**模型也渲染出来，否则用户
+   * 无法重新打开；而 `listModels` 会按黑名单过滤掉它们，RPC 层只能凭黑名单的
+   * key（裸 id）补回 —— 那条路径拿不到展示名，只能退化成裸 id，**倍率随之丢失**
+   * （用户报障：「关闭的就没有显示倍率」）。
+   *
+   * ⚠️ 同名消歧必须基于**未过滤**的全量集合：`displayNameFor(model, source)`
+   * 而非 `listed`。用过滤后的集合会让「关掉其中一个同名模型」改变另一个的
+   * 变体标记，名字随开关跳变。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const source = this.remoteModels ?? this.staticFallbackModels()
+    return source.map((model) => ({ id: model.id, name: displayNameFor(model, source) }))
+  }
+
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? this.staticFallbackModels()
@@ -1408,10 +1425,14 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
  * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
  * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
  */
-export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): void {
+export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? CODEBUDDY
   ctx.llm.registerConfigurableProviders([
     { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([product.id], new BuddyAdapter(options))
+  const adapter = new BuddyAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
+  // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
+  return adapter
 }

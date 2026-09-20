@@ -765,16 +765,29 @@ export class CodeArtsAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * 完整模型目录（**不应用用户黑名单**）。
+   *
+   * 设置页必须渲染被关闭的模型（否则用户无法重新打开），而 `listModels` 会按
+   * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名随之丢失
+   * （用户报障：「关闭的就没有显示倍率」）。CodeArts 目录虽无倍率，但同样
+   * 需要正确的 `name`（否则关闭项显示 `deepseek-v4-flash` 这类裸 id）。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    // 与 listModels 保持同一套「可见性」过滤（VL 多模态不参与），
+    // 唯一区别是不套用户黑名单。
+    return source
+      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .map((m) => ({ id: m.id, name: m.name }))
+  }
+
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     // 必须 await：ensureRemoteModels 是异步的，早期实现用 `void` 丢弃 Promise，
     // 冷缓存时远端目录尚未落地就走静态兜底表，模型选择器会短暂显示错误的
     // 模型集合（Jet Hub 的模型开关也据此渲染，会造成"关掉的模型又冒出来"）。
     await this.ensureRemoteModels()
-    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
-    // 屏蔽视觉（VL）多模态模型（id 含 -VL- 或以 -VL 结尾，如 Qwen3-VL-235B）：
-    // 这类模型上下文小（32768 tokens）、不支持工具调用（vLLM 未启用
-    // auto-tool-choice，发 tools 会 400），不适合当 agent 主模型，故从列表隐藏。
-    const visible = source.filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+    const visible = this.listAllModels()
     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
     // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
     // ——与 DSH 对 listModels 的约定一致（目录是建议性的，缺省不构成拒绝）。
@@ -1424,11 +1437,15 @@ export class CodeArtsAdapter extends LlmAdapter {
 }
 
 /** 在 ctx.llm 上注册 codearts 提供商路由和适配器。 */
-export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): void {
+export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): CodeArtsAdapter {
   ctx.llm.registerConfigurableProviders([
     { provider: PROVIDER, displayName: 'CodeArts Agent', settingsNs: 'llm-codearts', settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([PROVIDER], new CodeArtsAdapter(options))
+  const adapter = new CodeArtsAdapter(options)
+  ctx.llm.registerAdapter([PROVIDER], adapter)
+  // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
+  // 带最终展示名）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
+  return adapter
 }
 
 /**

@@ -702,6 +702,18 @@ export class LobsteraiAdapter extends LlmAdapter {
     }))
   }
 
+  /**
+   * 完整模型目录（**不应用用户黑名单**），含最终展示名（倍率）。
+   *
+   * 设置页必须渲染被关闭的模型（否则用户无法重新打开），而 `listModels` 会按
+   * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
+   * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const source = this.remoteModels ?? this.staticFallbackModels()
+    return source.map((model) => ({ id: model.id, name: displayNameFor(model) }))
+  }
+
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? this.staticFallbackModels()
@@ -1279,12 +1291,16 @@ function displayNameFor(model: LobsteraiRemoteModel): string {
  * `registerProviderSettings` 注册的 namespace 一致，否则模型设置页会因
  * 未注册 namespace 在 `refFor → deriveKeyRef(provider)` 处崩溃。
  */
-export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): void {
+export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
   ctx.llm.registerConfigurableProviders([
     { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([product.id], new LobsteraiAdapter(options))
+  const adapter = new LobsteraiAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
+  // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
+  return adapter
 }
 
 /** 构造远端模型列表请求的完整 URL（供 auth 服务与测试复用）。 */

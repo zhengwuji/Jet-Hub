@@ -526,6 +526,31 @@ export class TraeAdapter extends LlmAdapter {
       .map((model) => ({ id: model.id, name: model.name }))
   }
 
+  /**
+   * 完整模型目录（**不应用用户黑名单**）。
+   *
+   * ## 为什么需要它
+   *
+   * `listModels` 会按用户黑名单过滤（Jet Hub「显示列表」开关），于是**被关闭的
+   * 模型不在其返回值里**。而设置页必须把关闭的模型也渲染出来（否则用户无法重新
+   * 打开），RPC 层只能凭黑名单的 key（裸 id）补回 —— 那条路径拿不到展示名，
+   * 只能回退成裸 id，**倍率与模型显示名随之丢失**（用户报障：「关闭的就没有显示
+   * 倍率，关闭的应该也显示倍率」）。
+   *
+   * 故这里提供「不过滤黑名单」的目录，由 `model.list` 端点使用：它据此拿到
+   * 每个 id 的**真实展示名（含倍率）**，再自行回填 `disabled` 状态。
+   * 对话框模型选择器读的仍是 `listModels`（已过滤），可见性行为不变。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    // 过滤逻辑与 `listModels` 的第一、二层一致（usage / config_switch /
+    // is_invisible_to_user 已在解析器里剔除；这里再挡 isHidden 与 is_custom_model），
+    // **唯一区别是不套用户黑名单**。
+    const source = this.remoteModels === undefined
+      ? this.staticFallbackModels()
+      : this.remoteModels.filter((model) => isTraeModelCallable(model) && model.isHidden !== true)
+    return source.map((model) => ({ id: model.id, name: traeDisplayName(model) }))
+  }
+
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     await this.ensureRemoteModels()
     // 过滤逻辑分两层：
@@ -535,17 +560,15 @@ export class TraeAdapter extends LlmAdapter {
     // true`。这些条件对 batch 端点（全功能配置表）有意义，避免 summary /
     // custom_model / multimodal 等非对话条目塞满目录。
     //
-    // 第二层（运行时，这里）：硬性过滤 `isHidden === true`（兜底表路径没有
-    // 解析器，在 `staticFallbackModels` 里过滤；远端路径由解析器过滤，但测试
-    // 绕过解析器直接喂 `TraeRemoteModel[]`，故此处再补一刀保持一致性）+
+    // 第二层（运行时，`listAllModels`）：硬性过滤 `isHidden === true`（兜底表
+    // 路径没有解析器，在 `staticFallbackModels` 里过滤；远端路径由解析器过滤，
+    // 但测试绕过解析器直接喂 `TraeRemoteModel[]`，故此处再补一刀保持一致性）+
     // `is_custom_model === true`（自定义模型，需用户在 IDE 内绑定供应商，本
     // 插件调不通，一律 4001）。
     //
     // ⚠️ `is_invisible_to_user` **不再由 `hideInternalModels` 控制**：新设计
     // 要求目录与官方 Auto Mode 选择器一致，隐藏模型不在目录中展示。
-    const source = this.remoteModels === undefined
-      ? this.staticFallbackModels()
-      : this.remoteModels.filter((model) => isTraeModelCallable(model) && model.isHidden !== true)
+    const source = this.listAllModels()
     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
     const listed = disabled === undefined || disabled.size === 0
       ? source
@@ -553,7 +576,7 @@ export class TraeAdapter extends LlmAdapter {
     return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
-      name: traeDisplayName(model),
+      name: model.name,
       inputModalities: ['text'],
     }))
   }
@@ -1199,10 +1222,15 @@ function trimTraeHistory(
 /**
  * 在 `ctx.llm` 上注册 TRAE provider 路由与适配器。
  */
-export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): void {
+export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): TraeAdapter {
   const product = options.product ?? TRAE
   ctx.llm.registerConfigurableProviders([
     { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([product.id], new TraeAdapter(options))
+  const adapter = new TraeAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  // 返回实例：Jet Hub 的「显示列表」需要它的 `listAllModels()`（不受用户黑名单
+  // 影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 不透传自定义方法，
+  // 故必须由调用方持有引用。
+  return adapter
 }
