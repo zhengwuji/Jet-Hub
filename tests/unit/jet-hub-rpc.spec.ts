@@ -583,6 +583,8 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       makeAuth('codearts') as never,
       {} as never, {} as never,
       makeAuth('lobsterai') as never,
+      makeAuth('qoder') as never,
+      makeAuth('trae') as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -609,7 +611,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
    */
   const FAST_BUDGET_MS = 2000
 
-  it.each(['codearts', 'lobsterai'])(
+  it.each(['codearts', 'lobsterai', 'qoder', 'trae'])(
     '%s 在用户完成授权之前就返回 loginUrl（不阻塞）',
     async (provider) => {
       const { call, calls } = registerCreateEndpoints({ twoPhase: true })
@@ -662,7 +664,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         }
       },
     }
-    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never, {} as never)
     const response = await handler!(new Request('http://localhost/api/jet-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -676,6 +678,64 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     expect(added?.provider).toBe('codearts')
     expect(added?.enabled).toBe(true)
     expect(added?.refreshable).toBe(false)
+  })
+
+  /**
+   * `startLogin` 启动失败（最典型：回调端口被占用）必须变成**规范的 RPC 错误响应**。
+   *
+   * 真实缺陷：`startTraeLoginFlow` 早期直接 `server.listen(port)` 且未注册
+   * `'error'` 处理器 —— listen 失败是**事件**异步抛出的，不属于 Promise 链，
+   * 于是逃过 RPC 的 try/catch 成为**进程级 unhandled error**，把整个 DSH 宿主
+   * 崩掉。用户看到的不是可读文案，而是一整堆 `EADDRINUSE` 堆栈 + 进程退出。
+   *
+   * 现在 `startTraeLoginFlow` 会把 listen 失败转成可捕获的 reject；本用例守
+   * 「RPC 层照常返回 `ok:false` + 可读 message」这一契约。
+   */
+  it('startLogin 因端口占用失败时返回可读的 RPC 错误（而非崩进程）', async () => {
+    let handler: Handler | undefined
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: { resolve: async () => undefined, set: async () => {}, unset: async () => {} },
+    }
+    const pool = {
+      addAccount: async () => {},
+      updateAccount: async () => {},
+      removeAccount: async () => {},
+      listAccounts: async () => [],
+    }
+    // 复刻「listen 失败」的服务替身：startLogin 直接抛可读错误。
+    const failingAuth = {
+      async startLogin() {
+        throw new Error('TRAE 回调端口 18080 无法监听（EADDRINUSE）；端口可能已被其它程序占用，请释放后重试。')
+      },
+    }
+    registerJetHubRpc(
+      ctx as never, pool as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+      failingAuth as never,
+    )
+    if (handler === undefined) throw new Error('endpoint handler was not registered')
+
+    const response = await handler(new Request('http://localhost/api/jet-hub', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request', rpcId: 'rpc-1', method: 'jet-hub',
+        payload: { method: 'account.create', payload: { provider: 'trae' } },
+      }),
+    }))
+    const body = await response.json() as {
+      result: { ok: boolean; error?: { code: string; message: string } }
+    }
+
+    // 必须是规范的错误响应（而不是裸 500 / 进程崩溃）。
+    expect(body.result.ok).toBe(false)
+    expect(body.result.error?.message).toContain('18080')
+    expect(body.result.error?.message).toMatch(/端口|占用/)
   })
 
   /**
@@ -802,7 +862,7 @@ describe('model.list / model.setDisabled 端点', () => {
       logger: { warn: () => {}, info: () => {} },
     }
 
-    registerJetHubRpc(ctx as never, pool, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool, {} as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     /** 调用一个端点方法，返回解包后的 result。 */
@@ -1030,7 +1090,7 @@ describe('积分端点的 provider 能力边界', () => {
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
@@ -1117,6 +1177,41 @@ describe('积分端点的 provider 能力边界', () => {
       claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
     })
   })
+
+  /**
+   * TRAE 的 claim 分支**必须开启状态预检**。
+   *
+   * 真实缺陷（用户报障：「领取积分显示成功但是加 0 积分」的成因之二）：
+   * TRAE 的 claim 对「今天已签到」是**幂等**的 —— 实测重复领取同样返回
+   * `{code:0, message:"success"}`，与真正领取成功**无法区分**。早期照抄
+   * LobsterAI 传了 `precheckStatus: false`（那是「LobsterAI 的领取流程内部
+   * 已做 slot/context 预检」的理由，TRAE 没有这回事），于是已签到的账号被
+   * 报成「领取成功」。判据只能是 status 端点的 `checked_in`。
+   *
+   * 用源码级断言而非行为断言：本用例要锁的是「这一行配置别被改回去」，
+   * 与仓库里 `qoder-wiring.spec.ts` 守卫接线的方式一致。
+   */
+  it('TRAE 的 claim 分支开启状态预检并注入 fetchStatus（源码级守卫）', () => {
+    // 注意 `here` 是同级另一个 describe 内的局部常量，此处不可见，故就地算路径。
+    const srcPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/jet-hub-rpc.ts')
+    const source = readFileSync(srcPath, 'utf8')
+    // 从 claimAll 的 TRAE 分支起算（前面 credits.status 分支里也有同名判断，
+    // 用 `collectClaimResults<TraeCredential` 定位更准）。
+    const start = source.indexOf('collectClaimResults<TraeCredential')
+    expect(start).toBeGreaterThan(-1)
+    // 截到该分支的收尾 `return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }`
+    // 之后，避免扫到后续其它 provider 分支。
+    const rest = source.slice(start)
+    const end = rest.indexOf('RpcCreditsClaimAllResponse }')
+    const branch = end > -1 ? rest.slice(0, end) : rest.slice(0, 2000)
+    // 剔除注释行：本文件在注释里叙述了这条缺陷的成因（含 precheckStatus 字样）。
+    const code = branch
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(code, 'TRAE 分支不得关闭状态预检').not.toContain('precheckStatus: false')
+    expect(code, 'TRAE 分支必须注入 fetchStatus').toContain('fetchStatus:')
+  })
 })
 
 /**
@@ -1169,7 +1264,7 @@ describe('account.reorder 端点', () => {
       logger: { warn: () => {}, info: () => {} },
       credentials: { resolve: async () => undefined },
     }
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     const call = async (method: string, payload: unknown) => {

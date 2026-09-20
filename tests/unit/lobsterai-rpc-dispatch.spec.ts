@@ -87,6 +87,8 @@ async function callRefresh(
     makeServiceStub('buddy', calls) as never,
     makeServiceStub('workbuddy', calls) as never,
     makeServiceStub('lobsterai', calls) as never,
+    makeServiceStub('qoder', calls) as never,
+    makeServiceStub('trae', calls) as never,
   )
   const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
     method: 'POST',
@@ -148,6 +150,22 @@ describe('account.refresh 分派（T7 回归）', () => {
     expect(calls).toEqual([{ service: 'lobsterai', credentialRef: 'LOBSTERAI_ACCOUNT_CCCC3333' }])
   })
 
+  it('trae 账号刷新自己的 credentialRef（新增 provider 不得重蹈覆辙）', async () => {
+    const { calls, value } = await callRefresh(
+      [entry('trae', 'TRAE_ACCOUNT_EEEE5555')], 'trae-1',
+    )
+    expect(value.success).toBe(true)
+    expect(calls).toEqual([{ service: 'trae', credentialRef: 'TRAE_ACCOUNT_EEEE5555' }])
+  })
+
+  it('qoder 账号刷新自己的 credentialRef（新增 provider 不得重蹈覆辙）', async () => {
+    const { calls, value } = await callRefresh(
+      [entry('qoder', 'QODER_ACCOUNT_FFFF6666')], 'qoder-1',
+    )
+    expect(value.success).toBe(true)
+    expect(calls).toEqual([{ service: 'qoder', credentialRef: 'QODER_ACCOUNT_FFFF6666' }])
+  })
+
   it('codearts 账号刷新自己的 credentialRef', async () => {
     const { calls, value } = await callRefresh(
       [entry('codearts', 'CODEARTS_ACCOUNT_DDDD4444')], 'codearts-1',
@@ -156,12 +174,14 @@ describe('account.refresh 分派（T7 回归）', () => {
     expect(calls).toEqual([{ service: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_DDDD4444' }])
   })
 
-  it('四个 provider 各自分派到对应服务（互不串用）', async () => {
+  it('六个 provider 各自分派到对应服务（互不串用）', async () => {
     const accounts = [
       entry('codearts', 'CODEARTS_ACCOUNT_1'),
       entry('buddy', 'BUDDY_ACCOUNT_1'),
       entry('workbuddy', 'WORKBUDDY_ACCOUNT_1'),
       entry('lobsterai', 'LOBSTERAI_ACCOUNT_1'),
+      entry('qoder', 'QODER_ACCOUNT_1'),
+      entry('trae', 'TRAE_ACCOUNT_1'),
     ]
     for (const target of accounts) {
       const { calls, value } = await callRefresh(accounts, target.id.replace(`${target.provider}-1`, `${target.provider}-1`))

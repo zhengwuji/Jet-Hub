@@ -8,8 +8,10 @@ import { runBuddyLoginFlow } from '../../src/buddy-oauth.js'
 import { CodeArtsAuth } from '../../src/service.js'
 import { BuddyAuth } from '../../src/buddy-auth.js'
 import { LobsteraiAuth } from '../../src/lobsterai-auth.js'
+import { TraeAuth } from '../../src/trae-auth.js'
 import { WORKBUDDY } from '../../src/product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
+import { TRAE } from '../../src/trae-product.js'
 
 vi.mock('../../src/login.js', () => ({
   runLoginFlow: vi.fn(),
@@ -406,6 +408,77 @@ describe('LobsterAI provider 注册', () => {
     const ctx = createMockContext()
     apply(ctx as never)
     const stop = vi.spyOn(ctx.lobsteraiAuth, 'stop')
+    await ctx.fiber.dispose()
+    expect(stop).toHaveBeenCalled()
+  })
+})
+
+describe('TRAE provider 注册', () => {
+  it('apply 时注册 trae provider 路由与适配器', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.llm.registeredProviders).toContain('trae')
+    expect(ctx.llm.adapters).toContain('trae')
+  })
+
+  it('注册 trae 的可配置 provider 目录项（含展示名）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'trae')
+    expect(entry).toMatchObject({ provider: 'trae', displayName: TRAE.displayName })
+  })
+
+  // 与 workbuddy / lobsterai 同理：settingsNs 未注册时，模型设置页会在
+  // refFor → deriveKeyRef(provider) 处以 `provider.toUpperCase is not a function` 崩溃。
+  it('trae 的 settingsNs 为 llm-trae，且对应 settings namespace 已注册', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'trae')
+    expect(entry?.settingsNs).toBe('llm-trae')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-trae')
+  })
+
+  it('不注册任何 trae 斜杠命令（入口在 Jet Hub 设置页）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const names = ctx.commands.definitions.map((d) => d.name)
+    for (const removed of ['trae-login', 'trae-status', 'trae-refresh']) {
+      expect(names, removed).not.toContain(removed)
+    }
+  })
+
+  it('暴露 traeAuth 服务实例，服务名不与既有 provider 冲突', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.traeAuth).toBeInstanceOf(TraeAuth)
+    expect(ctx.traeAuth.name).toBe('traeAuth')
+    expect(ctx.traeAuth.product.id).toBe('trae')
+    expect(ctx.traeAuth.credentialRefName).toBe('TRAE_ACCESS_TOKEN')
+    // 五个 provider 的服务实例必须两两不同（同名二次注册会抛错）。
+    expect(ctx.traeAuth).not.toBe(ctx.buddyAuth)
+    expect(ctx.traeAuth).not.toBe(ctx.workbuddyAuth)
+    expect(ctx.traeAuth).not.toBe(ctx.lobsteraiAuth)
+  })
+
+  it('traeAuth 只读自己的凭据 ref（不串用其它 provider 凭据）', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 只写入 CodeBuddy 的 ref：TRAE 必须报告未配置。
+    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.traeAuth.status()).configured).toBe(false)
+
+    await ctx.credentials.set('TRAE_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT2', refresh_token: 'RT2', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.traeAuth.status()).configured).toBe(true)
+  })
+
+  it('dispose 时停止 TRAE 的续期调度', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const stop = vi.spyOn(ctx.traeAuth, 'stop')
     await ctx.fiber.dispose()
     expect(stop).toHaveBeenCalled()
   })

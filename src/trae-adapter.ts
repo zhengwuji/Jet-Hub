@@ -1,0 +1,1208 @@
+/**
+ * TRAE（字节跳动 TRAE IDE）LLM 适配器。
+ *
+ * 骨架取自 `src/lobsterai-adapter.ts` / `src/buddy-adapter.ts`，但**载荷转换与 SSE 解析全部重写**。
+ *
+ * ## 与现有适配器的关键差异
+ *
+ * | 项 | TRAE | Buddy / LobsterAI |
+ * |---|---|---|
+ * | 请求体 | OpenAI → SOLO 转换（function/config_name/tools 归一化） | 透传 OpenAI 格式 |
+ * | SSE 格式 | SOLO 自定义事件（output/token_usage/done/error）→ 转 OpenAI | 标准 OpenAI SSE |
+ * | 请求头 | `Cloud-IDE-JWT <token>` + X-* 系列 | Bearer / X-LobsterAI-Client-* |
+ * | 图片 | 不支持 | Buddy / LobsterAI 支持 |
+ * | prompt_cache_key | 不发 | Buddy 发（腾讯前缀缓存） |
+ *
+ * 复用的是 `src/sse.ts` 的三个工具函数（`readWithIdleTimeout` / `resolveToolPairing` /
+ * `normalizeToolArguments` / `isTruncatedArguments`）——它们处理的是 OpenAI 协议层的通用陷阱。
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { AccountPool } from './account-pool.js'
+import {
+  TRAE_DEFAULT_MODEL,
+  TRAE_MAX_CONTEXT_TOKENS,
+  TRAE_REQUEST_TIMEOUT_MS,
+  clampTraeMaxTokens,
+  isTraeExpired,
+  parseTraeSSELine,
+  buildOpenAIChunk,
+  OPENAI_DONE,
+  readStringField,
+  readNumberField,
+  isTraeModelCallable,
+  traeMaxModeFields,
+  traeSOLOHeaders,
+  transformToSOLOBody,
+  type TraeCredential,
+  type TraeSSEEvent,
+  type TraeRemoteModel,
+} from './trae.js'
+import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
+import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
+import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+
+/** 本适配器注册的 provider 路由名。 */
+export const PROVIDER = 'trae'
+
+/**
+ * 推理档位 wire 值 → 展示名。
+ *
+ * ⚠️ 与 LobsterAI 不同，TRAE 的 `reasoning_effort_config.options` 是**单值**
+ * （`light` / `high` / `extra_high` …），该字符串既是产品侧档位名、也是发给
+ * 上游的取值，故本表**只用于展示**，不做 wire 映射。
+ * 未登记的取值回退原样显示，避免远端新增档位时显示空白。
+ */
+const TRAE_EFFORT_NAMES: Readonly<Record<string, string>> = {
+  light: 'Light',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  extra_high: 'Extra High',
+  xhigh: 'XHigh',
+  max: 'Max',
+}
+
+/**
+ * 推理档位强度序（数值越大越强）。
+ *
+ * ⚠️ **只用于挑「默认档」，不参与 wire 取值** —— wire 值就是远端
+ * `reasoning_effort_config.options` 里的字符串本身，本表改了也不会影响下发。
+ *
+ * 覆盖 TRAE 实测出现过的全部档位；上游若新增档位，走
+ * {@link strongestTraeEffort} 的第 3 条退化规则（取数组末项）。
+ */
+const TRAE_EFFORT_RANK: Readonly<Record<string, number>> = {
+  off: 0,
+  none: 0,
+  minimal: 1,
+  light: 2,
+  low: 3,
+  medium: 4,
+  high: 5,
+  extra_high: 6,
+  xhigh: 7,
+  max: 8,
+}
+
+/**
+ * 从 `options` 里挑**最强**的一档作默认值。
+ *
+ * 三条规则逐级退化：
+ * 1. 显式含 `max` → 用它（最直观的「最高档」语义，也覆盖 LobsterAI 那套
+ *    `level: max → openclawLevel: xhigh` 的习惯）；
+ * 2. 否则取**已登记强度序**里排名最高的；
+ * 3. 若全都未登记（上游新增了档位）→ 取数组**最后一项**（远端按强度升序给出）。
+ *
+ * 之所以不直接用「数组最后一项」：远端不保证升序，而规则 2 对已知档位是确定的。
+ */
+function strongestTraeEffort(options: readonly string[]): string | undefined {
+  if (options.length === 0) return undefined
+  if (options.includes('max')) return 'max'
+  let best: string | undefined
+  let bestRank = -1
+  for (const option of options) {
+    const rank = Object.prototype.hasOwnProperty.call(TRAE_EFFORT_RANK, option)
+      ? TRAE_EFFORT_RANK[option]
+      : undefined
+    if (rank !== undefined && rank > bestRank) {
+      best = option
+      bestRank = rank
+    }
+  }
+  return best ?? options[options.length - 1]
+}
+
+/** SSE 空闲超时（分两阶段，环境变量可覆盖）。 */
+function resolveFirstTokenTimeoutMs(): number {
+  return Number.parseInt(process.env.DSH_TRAE_SSE_FIRST_TOKEN_TIMEOUT_MS ?? '', 10) || 120_000
+}
+function resolveChunkTimeoutMs(): number {
+  return Number.parseInt(process.env.DSH_TRAE_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000
+}
+
+/** 限流重置时间的本地兜底（毫秒，1 小时）。 */
+const TRAE_RATE_LIMIT_FALLBACK_MS = 3_600_000
+
+/** 单次请求最多换几个账号（含首次），防雪崩。 */
+const TRAE_MAX_ROTATE = 3
+
+/**
+ * 机器指纹轮换间隔（每 N 次请求换一代，仅在显式启用时生效）。
+ *
+ * 对齐 `Trae2api-cn/src/trae_client.py:220` 的 `max_uses = 3 + rand(0,2)`：
+ * 即每 3~5 次请求换一次。这里取固定 4 次，避免引入随机性导致测试不可复现。
+ */
+const TRAE_MACHINE_ID_ROTATE_EVERY = 4
+
+/**
+ * TRAE 适配器选项。
+ */
+export interface TraeAdapterOptions {
+  credentialRef: CredentialRef
+  /** 从凭据存储解析凭据。 */
+  resolveCredential: () => Promise<TraeCredential | undefined>
+  /** 静默续期凭据。 */
+  refresh: () => Promise<void>
+  /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */
+  fetchRemoteModels?: () => Promise<TraeRemoteModel[]>
+  fetchImpl?: typeof fetch
+  /** 多账号池（用于限流时切换账号）。 */
+  accountPool?: AccountPool
+  /** 产品配置；默认 {@link TRAE}。 */
+  product?: TraeProduct
+}
+
+/** 安全读取 Error.message。 */
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  try { return String(error) } catch { return 'unknown error' }
+}
+
+/** 将消息内容载荷展平为纯文本字符串。 */
+function contentToText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((block): block is { type: string; text: unknown } =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text')
+    .map((block) => String(block.text))
+    .join('')
+}
+
+/**
+ * 将 harness 的 **DSH 原生消息块**序列化为 OpenAI 传输格式。
+ *
+ * ## ⚠️ 为什么必须有这一步（真实缺陷）
+ *
+ * DSH 交给适配器的 `GenerateOptions.messages` 用的是**原生块结构**：
+ * `content: [{type:'tool-call',...}]`、`[{type:'tool-result',...}]`、
+ * `[{type:'reasoning',...}]`。它**不是** OpenAI 的 wire 格式。
+ *
+ * 早期实现把 `options.messages` **原样**塞进 `transformToSOLOBody`，而后者只做
+ * 「字符串 content → `[{type:'text'}]`」这一类改写，**不认识** DSH 的块类型。
+ * 实测证据（把 DSH 原生形状喂给 `transformToSOLOBody`）：
+ *
+ * ```json
+ * { "role": "assistant",
+ *   "content": [ { "type": "reasoning", "text": "…" },
+ *                { "type": "tool-call", "id": "call_1", "name": "read", "…" } ] }
+ * ```
+ *
+ * 后果是**每一轮多步对话都坏掉**，且症状极隐蔽：
+ *
+ * 1. **工具调用对模型不可见**：`tool-call` 块不是 SOLO 认识的字段，
+ *    上游只当它是未知 content 片段 —— 模型看不到自己刚才调用过什么；
+ * 2. **工具结果丢失**：`tool-result` 块同样不被识别，模型**永远看不到
+ *    工具返回值**，于是反复请求同一个工具，或凭空编造结果；
+ * 3. `reasoning` 块被当作正文喂回，污染上下文。
+ *
+ * 三个兄弟适配器（`llm-adapter.ts` / `buddy-adapter.ts` /
+ * `lobsterai-adapter.ts`）**都有**这一步 `serializeMessages`，只有 TRAE
+ * 漏了 —— 本文件顶部甚至 already `import` 了 `resolveToolPairing` 却从未使用，
+ * 说明当初就是打算写、但没接上。
+ *
+ * 序列化后的形状与 Go 端（`payload.go:PrepareBody`）的输入**完全一致**：
+ * assistant 带 `tool_calls`（`function` 形态），工具结果展开为独立
+ * `{role:'tool', tool_call_id}` 消息。随后 `transformToSOLOBody` 再按 SOLO
+ * 规则把 `function` → `function_call`（与 Go 端同一条流水线）。
+ */
+function serializeTraeMessages(
+  messages: readonly { role: string; content: unknown }[],
+): Array<Record<string, unknown>> {
+  const wire: Array<Record<string, unknown>> = []
+  // 剔除无法配对的工具调用/结果：SOLO 上游同样要求 tool_calls 与 tool 结果
+  // 严格配对，孤儿条目会让整条会话被拒（与三个兄弟适配器同款防线）。
+  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      const content = Array.isArray(message.content) ? message.content : []
+      const toolCalls = content
+        .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
+          typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
+        .filter(block => keepCallIds.has(String(block.id)))
+        .map((block) => ({
+          id: String(block.id),
+          type: 'function' as const,
+          function: {
+            name: String(block.name),
+            arguments: normalizeToolArguments(String(block.arguments)),
+          },
+        }))
+      const text = contentToText(content)
+      // 正文为空且有工具调用时 content 必须为 null（对齐 Go 端：纯 tool_calls
+      // 的 assistant 不回写空 content）。
+      wire.push({
+        role: 'assistant',
+        content: text.length === 0 && toolCalls.length > 0 ? null : text,
+        ...toolCalls.length > 0 ? { tool_calls: toolCalls } : {},
+      })
+      continue
+    }
+    if (message.role === 'system') {
+      wire.push({ role: 'system', content: contentToText(message.content) })
+      continue
+    }
+    // user 角色：工具结果搭载在 harness 用户消息中，展开为独立的 role:'tool' 消息。
+    const content = Array.isArray(message.content) ? message.content : []
+    const toolResults = content.filter(
+      (block): block is { type: string; toolCallId: unknown; content: unknown } =>
+        typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result',
+    )
+    const text = contentToText(message.content)
+    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    for (const result of toolResults) {
+      // 丢弃孤儿工具结果：没有对应 tool_call 同样会被上游拒绝。
+      if (!keepResultIds.has(String(result.toolCallId))) continue
+      wire.push({
+        role: 'tool',
+        tool_call_id: String(result.toolCallId),
+        content: contentToText(result.content) || '(no output)',
+      })
+    }
+  }
+  return wire
+}
+
+/** 从错误体提取可读 detail 文本。 */
+function errorDetail(body: string): string {
+  try {
+    const data = JSON.parse(body) as Record<string, unknown>
+    const parts = [
+      typeof data.code === 'number' || typeof data.code === 'string' ? `code=${String(data.code)}` : undefined,
+      typeof data.message === 'string' ? data.message : undefined,
+      typeof data.msg === 'string' ? data.msg : undefined,
+    ].filter((value): value is string => value !== undefined)
+    if (parts.length > 0) return parts.join(' ')
+  } catch { /* 非 JSON 错误体 */ }
+  return body
+}
+
+/** HTTP 状态码映射。 */
+function httpErrorCode(status: number): string {
+  if (status === 401 || status === 403) return 'AUTH'
+  if (status === 429) return 'RATE_LIMIT'
+  if (status === 400) return 'INVALID_REQUEST'
+  if (status >= 500) return 'SERVER'
+  return `HTTP_${status}`
+}
+
+/**
+ * 组合 SOLO **流内** `event:error` 的文案。
+ *
+ * `code=4001` 的上游原文是 *"We're sorry, the param is invalid. Please try with a
+ * valid param."* —— 实测（2026-09-19，遍历 45 个远端模型）该码**只**由
+ * **不可调用的模型**触发：5 个 `display_config.is_custom_model === true` 的条目
+ * 全部报 4001，而同批次的其余模型全部正常。也就是说它与「提示词/参数格式有误」
+ * 毫无关系，原文会把排查方向**完全带偏**（去查 message 结构、tools 序列化…）。
+ *
+ * ⚠️ **那 5 个条目的名单已过期**（复测 2026-09-20）：其中 3 个下架、2 个转为
+ * `is_custom_model: false`（已可调用），全目录 custom 条目数为 0。故这里**不列
+ * 具体模型名** —— 把某一刻的快照写成判据，会让后人误删合法模型。
+ *
+ * 故对 4001 追加一句指向真实成因的可操作提示。其余错误码保持原样，
+ * 不做无依据的解释。
+ */
+function traeStreamErrorMessage(code: number, message: string, model: string): string {
+  const base = `trae: ${message} (code=${code})`
+  if (code !== 4001) return base
+  return `${base} —— 模型「${model}」不被上游接受：它通常是「仅可见但不可调用」的`
+    + '自定义模型（需先在 TRAE IDE 内自行配置供应商），请改用模型列表中的其它模型'
+}
+
+/** 传输级错误判定。 */
+function isTransportError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const message = error.message.toLowerCase()
+  if (message.includes('terminated')) return true
+  if (error.name.startsWith('UND_ERR_')) return true
+  if (message.includes('fetch failed')) return true
+  if (message.includes('econnreset') || message.includes('epipe') || message.includes('socket hang up')) return true
+  return false
+}
+
+/**
+ * 组装模型选择器里展示的名字：`模型名 · 倍率`。
+ *
+ * ## 为什么倍率必须拼进 `name`
+ *
+ * composer 的模型切换菜单**只渲染 `name`**（`dsh-client-ui-model-selection` 的
+ * ModelSelect 里只有 `title: model.name` 与 `children: model.name`），
+ * `description` **完全不读**。用户报障「消耗倍率没有显示在切换模型列表的后面」
+ * 正是因为早期版本放进了 `description`。
+ *
+ * 安全性：`name` **纯属展示** —— DSH 的选择与持久化只用 `id`，故附加价格不会
+ * 污染会话历史。`resolveModel` 的 `name` **不带**倍率（价格只属于选择列表语境，
+ * 与 Qoder 的处理一致）。
+ *
+ * 形态：
+ * - 常态 `Qwen3.8-Flash · x0.08`
+ * - 活动期 `Doubao-Seed-2.1-Pro · x0.80→x0.08`（箭头比「（促销 …）」短，适合窄菜单）
+ * - 无倍率信息时只显示模型名（**不编造** `x1`）
+ */
+export function traeDisplayName(model: TraeRemoteModel): string {
+  const rate = model.creditsRate
+  if (rate === undefined) return model.name
+  // `0` 是**合法**倍率（免费），必须与「没有倍率」区分开。
+  const current = rate === 0 ? '免费' : `x${rate}`
+  // 活动折扣：只在解析层已判定「当前生效」时才有 originalCreditsRate。
+  const original = model.originalCreditsRate
+  if (original !== undefined && original > rate) {
+    return `${model.name} · x${original}→${current}`
+  }
+  return `${model.name} · ${current}`
+}
+
+/**
+ * TRAE 模型适配器。
+ */
+export class TraeAdapter extends LlmAdapter {
+  private readonly product: TraeProduct
+  private readonly fetchImpl: typeof fetch
+  /** 动态模型缓存。 */
+  private remoteModels: TraeRemoteModel[] | undefined
+  /** 远端模型元数据索引。 */
+  private remoteMeta: ReadonlyMap<string, TraeRemoteModel> = new Map()
+  /** 产品级兜底模型索引。 */
+  private readonly fallbackIndex: ReadonlyMap<string, TraeFallbackModel>
+  /**
+   * 已发起的 chat 请求计数（仅在启用机器指纹轮换时使用，见
+   * {@link TraeAdapter.machineIdGeneration}）。
+   */
+  private sendCount = 0
+
+  constructor(private readonly options: TraeAdapterOptions) {
+    super()
+    this.product = options.product ?? TRAE
+    this.fetchImpl = options.fetchImpl ?? fetch
+    this.fallbackIndex = new Map(
+      (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
+    )
+  }
+
+  providerInfo(provider: string): LlmProviderInfo {
+    const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id
+    return { id, name: this.product.displayName }
+  }
+
+  /** 懒加载远端模型目录（仅拉取一次）。 */
+  private async ensureRemoteModels(): Promise<void> {
+    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
+    try {
+      const models = await this.options.fetchRemoteModels()
+      if (models.length > 0) {
+        this.remoteModels = models
+        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      }
+    } catch { /* 远端不可用：回退兜底目录 */ }
+  }
+
+  /**
+   * 模型接受的输入模态。
+   *
+   * TRAE SOLO 通道**目前不支持图片**（上游以纯文本对话为主），
+   * 故恒为 `['text']`。
+   */
+  private inputModalitiesFor(_model: string): readonly ('text' | 'image')[] {
+    return ['text']
+  }
+
+  /**
+   * 该模型所属的聊天通道（`function`）。
+   *
+   * ⚠️ **模型只在列出它的通道里可调用**：发错通道上游会回流内
+   * `code=4001 param is invalid`（实测 `glm-5.1` 在 `solo_work_lite` 报错、
+   * 在 `solo_agent_remote` 正常；`glm-5-turbo` 恰好相反）。
+   * 远端目录里每条模型都带自己的 `function`；查不到时回退默认通道。
+   */
+  private channelFor(model: string): string {
+    const channel = this.remoteMeta.get(model)?.function
+    return channel !== undefined && channel.length > 0 ? channel : this.product.function
+  }
+
+  /**
+   * 模型的上下文窗口：远端优先，兜底表次之。
+   *
+   * ⚠️ 开启 Max 模式时改用 `context_window_tokens.max`（1M）。两者**不能混用**：
+   * 未开 Max 却声明 1M 会让 DSH 把超长上下文直接发出去，而上游按 200K 校验后
+   * 拒绝（输入被截断或 4xx）。
+   */
+  private contextWindowFor(model: string): number | undefined {
+    const meta = this.remoteMeta.get(model)
+    if (this.maxModeFor(model)) {
+      return meta?.maxContextWindow ?? TRAE_MAX_CONTEXT_TOKENS
+    }
+    return meta?.contextWindow ?? this.fallbackIndex.get(model)?.contextWindow
+  }
+
+  /**
+   * 该模型本次是否启用 **Max 模式**（1M 上下文）。
+   *
+   * 三个条件缺一不可（对齐 `Trae2api-cn/trae_remote_client.py:249-277`）：
+   * 1. 产品级开关（`DSH_TRAE_MAX_MODE`）未关 —— **默认开启**，用户要求
+   *    「上下文用最大的那一档」；显式设 `0` / `false` 才关回 200K；
+   * 2. 远端 `display_config.max_mode === true` —— **绝不**给未标记的模型硬套
+   *    Max 参数，上游会拒绝（`_max_mode_requested` 的注释明写
+   *    "Never fabricate max limits for a model the account config does not mark"）；
+   * 3. 若配置了白名单，模型须在其中。
+   */
+  private maxModeFor(model: string): boolean {
+    if (this.product.maxMode !== true) return false
+    const meta = this.remoteMeta.get(model)
+    if (meta === undefined || meta.maxMode !== true) return false
+    const whitelist = this.product.maxModeModels
+    if (whitelist !== undefined && whitelist.length > 0 && !whitelist.includes('*')) {
+      return whitelist.includes(model)
+    }
+    return true
+  }
+
+  /**
+   * 模型可选的推理强度档位（`reasoning_effort_config`）。
+   *
+   * TRAE 的 `options` 是**单值字符串**（既是产品侧档位名、也是 wire 值），
+   * 与 LobsterAI 的 `level` / `openclawLevel` 双字段形态不同，故不需要映射表
+   * 之外的转换（命名仅用于展示）。
+   *
+   * 不声明 `reasoning` 的两种情形：
+   * - 远端没有该配置 → UI 显示「当前模型未提供推理等级」（而不是给个发了没用的档位）
+   * - `support_thinking === false` → 远端明确说不支持思考
+   *
+   * `defaultEffort` 必须落在 `efforts` 内（DSH 会拿它直接发请求），远端数据
+   * 不一致时退化为不声明默认值。
+   */
+  private reasoningFor(model: string): LlmResolvedModelInfo['reasoning'] {
+    const config = this.remoteMeta.get(model)?.reasoningConfig
+    if (config === undefined) return undefined
+    if (config.supportThinking === false) return undefined
+    if (config.options.length === 0) return undefined
+    const efforts = config.options.map((option) => ({
+      id: ReasoningEffortId(option),
+      name: TRAE_EFFORT_NAMES[option] ?? option,
+    }))
+    // ⚠️ 默认档取**最强档**，不采信远端 `default_level`：上游那个是它自己的
+    // 保守默认（实测多为 `high`，而最高档常是 `extra_high`）。本插件按用户
+    // 要求一律默认最强，用户仍可在 DSH 里手动降档。
+    const strongest = strongestTraeEffort(config.options)
+    return {
+      efforts,
+      ...strongest !== undefined ? { defaultEffort: ReasoningEffortId(strongest) } : {},
+    }
+  }
+
+  /**
+   * 模型的输出上限：远端优先 → 兜底表 → 产品级兜底值。
+   *
+   * ⚠️ 实测远端主流模型声明的是 **32000**，而兜底表旧值写的 128000 会让
+   * DSH 索要一个上游不接受的值。远端可用时一律以远端为准。
+   */
+  private maxOutputTokensFor(model: string): number | undefined {
+    const meta = this.remoteMeta.get(model)
+    // Max 模式下 `model_detail_list` 的 `__max` 那条声明的输出上限才是准的
+    // （实测 `custom_model_1M__max` 384000 vs `__dev` 64000）。
+    if (this.maxModeFor(model) && meta?.maxModeOutputTokens !== undefined) {
+      return meta.maxModeOutputTokens
+    }
+    return meta?.maxOutputTokens
+      ?? this.product.fallbackMaxOutputTokens
+  }
+
+  /**
+   * 静态兜底模型目录。
+   *
+   * 始终过滤 `isHidden === true` 的条目（这些是上游内部/隐藏模型，不应出现在
+   * 对话模型目录中）。与远端路径的过滤逻辑一致（`parseTraeBatchModelList` 中也
+   * 硬性过滤 `isHidden === true`）。
+   */
+  private staticFallbackModels(): readonly { id: string; name: string }[] {
+    return this.product.fallbackModels
+      .filter((model) => model.isHidden !== true)
+      .map((model) => ({ id: model.id, name: model.name }))
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    await this.ensureRemoteModels()
+    // 过滤逻辑分两层：
+    //
+    // 第一层（解析时，`parseTraeBatchModelList`）：硬性过滤 `usage !==
+    // chat_completion` / `config_switch === false` / `is_invisible_to_user ===
+    // true`。这些条件对 batch 端点（全功能配置表）有意义，避免 summary /
+    // custom_model / multimodal 等非对话条目塞满目录。
+    //
+    // 第二层（运行时，这里）：硬性过滤 `isHidden === true`（兜底表路径没有
+    // 解析器，在 `staticFallbackModels` 里过滤；远端路径由解析器过滤，但测试
+    // 绕过解析器直接喂 `TraeRemoteModel[]`，故此处再补一刀保持一致性）+
+    // `is_custom_model === true`（自定义模型，需用户在 IDE 内绑定供应商，本
+    // 插件调不通，一律 4001）。
+    //
+    // ⚠️ `is_invisible_to_user` **不再由 `hideInternalModels` 控制**：新设计
+    // 要求目录与官方 Auto Mode 选择器一致，隐藏模型不在目录中展示。
+    const source = this.remoteModels === undefined
+      ? this.staticFallbackModels()
+      : this.remoteModels.filter((model) => isTraeModelCallable(model) && model.isHidden !== true)
+    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+    const listed = disabled === undefined || disabled.size === 0
+      ? source
+      : source.filter((model) => !disabled.has(model.id))
+    return listed.map((model) => ({
+      provider: this.product.id,
+      id: model.id,
+      name: traeDisplayName(model),
+      inputModalities: ['text'],
+    }))
+  }
+
+  async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    await this.ensureRemoteModels()
+    const remoteName = this.remoteMeta.get(model)?.name
+    const resolved: LlmResolvedModelInfo = {
+      provider,
+      id: model,
+      name: remoteName ?? this.fallbackIndex.get(model)?.name ?? model,
+      inputModalities: ['text'],
+    }
+    const contextWindow = this.contextWindowFor(model)
+    if (contextWindow !== undefined) resolved.context = { contextWindow }
+    const maxTokens = this.maxOutputTokensFor(model)
+    if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
+    // 推理强度档位：远端 `reasoning_effort_config` 权威（见 reasoningFor）。
+    const reasoning = this.reasoningFor(model)
+    if (reasoning !== undefined) resolved.reasoning = reasoning
+    return resolved
+  }
+
+  async prepareCall(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: (options: GenerateOptions) => this.stream(options),
+    }
+  }
+
+  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    // 0. 确保远端目录已加载 —— 发送时要用它决定该模型走哪个通道
+    //    （`channelFor`）。`prepareCall` 通常已通过 `resolveModel` 触发过，
+    //    这里只作兜底（已加载时是空操作）。
+    await this.ensureRemoteModels()
+
+    // 1. 获取凭据（过期则先静默续期）
+    let credential = await this.options.resolveCredential()
+    if (credential === undefined || isTraeExpired(credential)) {
+      await this.options.refresh()
+      credential = await this.options.resolveCredential()
+    }
+    if (credential === undefined || credential.access_token.length === 0) {
+      throw new LlmError('trae: no usable credential; log in first', 'MISSING_CREDENTIAL')
+    }
+
+    // 2. 记录当前账号
+    let currentAccountId = ''
+    if (this.options.accountPool) {
+      try {
+        currentAccountId = await this.options.accountPool.findAccountIdByCredential(
+          this.product.id,
+          credential.access_token,
+        )
+      } catch {
+        // 账号不匹配不影响请求
+      }
+    }
+
+    // 3. 构造请求体（OpenAI → SOLO 转换）
+    //
+    // ⚠️ **必须在构造请求体之前拒绝图片**：TRAE SOLO 通道不支持图片输入
+    // （`inputModalities` 恒为 `['text']`，与 CodeBuddy / LobsterAI 不同）。
+    // 只声明不支持却不检查，图片会被 `contentToText` 静默丢掉 —— 用户以为
+    // 模型看到了图片，实际请求里一个字都没有，且没有任何错误提示。
+    // 宁可显式报错（DSH 会据此把图片投影成文本占位符），也不要静默吞掉。
+    for (const message of options.messages) {
+      if (!Array.isArray(message.content)) continue
+      const hasImage = message.content.some((block) => {
+        if (typeof block !== 'object' || block === null) return false
+        const type = (block as { type?: unknown }).type
+        if (type === 'image') return true
+        // 工具结果内嵌的图片（read_image）同样不能被静默丢弃。
+        const nested = (block as { content?: unknown }).content
+        return type === 'tool-result' && Array.isArray(nested)
+          && nested.some((inner) =>
+            typeof inner === 'object' && inner !== null && (inner as { type?: unknown }).type === 'image')
+      })
+      if (hasImage) {
+        throw new LlmError(
+          `trae: model "${options.model}" does not accept image input.`,
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+    }
+
+    // ⚠️ **tools / tool_choice 必须放进源的 OpenAI 对象里再交给
+    // `transformToSOLOBody`**，不能在转换之后再补 —— SOLO 上游要求
+    // `function.parameters` 是 **JSON 字符串**（OpenAI 标准是对象），
+    // 那一步序列化发生在 `normalizeTools` 内部，只对**转换时已存在**的
+    // tools 生效。若在转换后赋值，parameters 会保持对象形态发给上游，
+    // 被反序列化拒绝（且错误信息不会指向这里）。
+    //
+    // ⚠️ 同理，messages 必须**先**经 `serializeTraeMessages` 转成 OpenAI
+    // 传输格式（tool_calls / role:'tool' / 纯文本 content）。DSH 的
+    // 原生 content 块（tool-call / tool-result / reasoning）不是 SOLO 认识的
+    // 结构，原样下发会让模型看不到工具调用与工具结果（详见该函数注释）。
+    const wireMessages = serializeTraeMessages(options.messages)
+
+    const openaiBody: Record<string, unknown> = {
+      model: options.model,
+      messages: wireMessages,
+      stream: true,
+    }
+    if (options.tools !== undefined && options.tools.length > 0) {
+      openaiBody.tools = options.tools.map((tool) => ({
+        type: 'function' as const,
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters,
+        },
+      }))
+    }
+    if (options.temperature !== undefined) openaiBody.temperature = options.temperature
+    // 输出额度收敛到上游安全上限（默认 64000，见 clampTraeMaxTokens）。
+    // 不收敛时客户端索要 131072 会把上游打成 4xx。
+    const maxTokens = clampTraeMaxTokens(options.maxTokens)
+    if (maxTokens !== undefined) openaiBody.max_tokens = maxTokens
+    if (options.stop !== undefined && options.stop.length > 0) openaiBody.stop = options.stop
+
+    // 推理强度：DSH 注入的 `reasoningEffort` 原样透传给上游的 `reasoning_effort`。
+    //
+    // 取值来自 `resolveModel` 声明的 `reasoning.efforts`（即远端
+    // `reasoning_effort_config.options` 的字符串），故这里不做白名单校验 ——
+    // 校验只会把「远端新增档位」变成静默丢弃。
+    if (options.reasoningEffort !== undefined) {
+      openaiBody.reasoning_effort = options.reasoningEffort
+    }
+
+    // Max 模式（1M 上下文）：成套覆盖 `max_tokens` / `prompt_max_tokens` /
+    // `context_window_size` 并注入 `strategy=max`（见 traeMaxModeFields）。
+    //
+    // ⚠️ 必须在 `clampTraeMaxTokens` **之后**执行：Max 会话的输出上限由远端
+    // `__max` 明细声明（可能高于 64K 安全线），被 clamp 覆盖会让 Max 请求
+    // 与常规请求的输出预算相同、失去意义。
+    if (this.maxModeFor(options.model)) {
+      const meta = this.remoteMeta.get(options.model)
+      Object.assign(
+        openaiBody,
+        traeMaxModeFields(
+          meta?.maxContextWindow ?? TRAE_MAX_CONTEXT_TOKENS,
+          meta?.maxModeOutputTokens,
+        ),
+      )
+    }
+
+    // system 提示并入 messages 顶部（同样要在转换之前，以便 content 被规范化）。
+    if (options.system !== undefined && options.system.length > 0) {
+      openaiBody.messages = [
+        { role: 'system', content: options.system },
+        ...wireMessages,
+      ]
+    }
+
+    // 历史裁剪：必须在序列化**之后**做（裁剪的是 wire 消息，不是 DSH 块）。
+    // 超限时从最早的非系统消息开始整轮丢弃，且不切断 tool_call/tool 配对。
+    openaiBody.messages = trimTraeHistory(openaiBody.messages as Array<Record<string, unknown>>)
+
+    // 一次性完成 OpenAI → SOLO 转换（含 messages 规范化、tools 序列化、
+    // tool_choice 归一化、config_name 注入），并**按模型路由通道** ——
+    // 同一模型只在列出它的通道里可调用（发错通道会得到流内 4001）。
+    const bodyObj = transformToSOLOBody(openaiBody, undefined, this.channelFor(options.model))
+
+    const body = JSON.stringify(bodyObj)
+
+    // 4. 发送请求（401/403 时刷新一次凭据后重试）
+    let response = await this.send(credential, body, options)
+    if (!response.ok && (response.status === 401 || response.status === 403)) {
+      await this.options.refresh()
+      const refreshed = await this.options.resolveCredential()
+      if (refreshed === undefined || refreshed.access_token.length === 0) {
+        throw new LlmError('trae: credential expired and refresh failed', 'AUTH', { status: response.status })
+      }
+      credential = refreshed
+      response = await this.send(credential, body, options)
+    }
+    if (!response.ok) {
+      let errorText = await response.text().catch(() => '')
+      let lastStatus = response.status
+      let lastKind = classifyTraeError(response.status, errorText)
+
+      if (this.options.accountPool && shouldRotateTraeAccount(lastKind)) {
+        const tried = new Set<string>()
+        if (currentAccountId) tried.add(currentAccountId)
+
+        const maxRotate = TRAE_MAX_ROTATE - 1
+        for (let round = 0; round < maxRotate; round++) {
+          if (currentAccountId && recordsTraeRateLimit(lastKind)) {
+            await this.options.accountPool.updateModelRateLimit(
+              currentAccountId,
+              options.model,
+              Date.now() + TRAE_RATE_LIMIT_FALLBACK_MS,
+            )
+          }
+          const next = await this.options.accountPool.getAvailableAccount(
+            this.product.id, options.model, tried,
+          )
+          if (!next || tried.has(next.entry.id)) break
+          tried.add(next.entry.id)
+          credential = next.credential as TraeCredential
+          currentAccountId = next.entry.id
+          response = await this.send(credential, body, options)
+          if (response.ok) {
+            yield* this.consumeSse(response, options)
+            return
+          }
+          errorText = await response.text().catch(() => '')
+          lastStatus = response.status
+          lastKind = classifyTraeError(response.status, errorText)
+          if (!shouldRotateTraeAccount(lastKind)) break
+        }
+        throw new LlmError(
+          `trae: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
+          lastKind === 'quota-exceeded' ? 'QUOTA_EXCEEDED' : httpErrorCode(lastStatus),
+          { status: lastStatus },
+        )
+      }
+
+      if (lastKind === 'quota-exceeded') {
+        throw new LlmError(`trae: 积分不足（${errorDetail(errorText)}）`, 'QUOTA_EXCEEDED', { status: lastStatus })
+      }
+      throw new LlmError(`trae: ${errorDetail(errorText)}`, httpErrorCode(lastStatus), { status: lastStatus })
+    }
+
+    // 5. 消费 SSE 流（SOLO → OpenAI 转换）
+    //
+    // 空响应（HTTP 200 但一个事件都没发）**重试一次**。这是安全的：
+    // `consumeSse` 只在「尚未产出任何 chunk」时抛该错误，因此不存在
+    // 「已经吐了一半再重放」的重复计费风险（对齐 CN 项目的
+    // `TRAE_REMOTE_WORK_FALLBACK` 语义：只在首个模型事件之前允许重试）。
+    for (let attempt = 0; ; attempt++) {
+      try {
+        yield* this.consumeSse(response, options)
+        return
+      } catch (error) {
+        const empty = error instanceof LlmError
+          && error.message.includes('upstream returned no events')
+        if (!empty || attempt >= 1) throw error
+        if (options.signal?.aborted) throw error
+        response = await this.send(credential, body, options)
+        if (!response.ok) {
+          const text = await response.text().catch(() => '')
+          throw new LlmError(`trae: ${errorDetail(text)}`, httpErrorCode(response.status), { status: response.status })
+        }
+      }
+    }
+  }
+
+  /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
+  private async send(
+    credential: TraeCredential,
+    body: string,
+    options: GenerateOptions,
+  ): Promise<Response> {
+    this.sendCount += 1
+    const headers = new Headers(
+      traeSOLOHeaders(credential, this.product, true, this.machineIdGeneration()),
+    )
+    try {
+      return await this.fetchImpl(`${this.product.agentHost}/api/agent/v3/llm_utils_chat`, {
+        method: 'POST',
+        headers,
+        body,
+        signal: options.signal,
+      })
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      if (isTransportError(error)) {
+        throw new LlmError(`trae: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
+      }
+      throw error
+    }
+  }
+
+  /**
+   * 当前应使用的机器指纹代次。
+   *
+   * **默认恒为 0（不轮换）** —— 只有显式设置
+   * `DSH_TRAE_ROTATE_MACHINE_ID=1` 时才按每 4 次请求递增一代。
+   *
+   * 默认关闭的原因见 {@link deriveRotatingMachineId}：轮换能降低端点风控，
+   * 但会让设备身份漂移，与「machine_id 登录后绝不变」的既定约束冲突。
+   * 该开关是出现集中 401/风控时的第一个可尝试手段。
+   */
+  private machineIdGeneration(): number {
+    if (process.env.DSH_TRAE_ROTATE_MACHINE_ID !== '1') return 0
+    return Math.floor(this.sendCount / TRAE_MACHINE_ID_ROTATE_EVERY)
+  }
+
+  /**
+   * 消费 SOLO 自定义 SSE 流，转为 OpenAI StreamChunk。
+   *
+   * SOLO 事件格式（solosse.go）：
+   * ```
+   * event:output
+   * data:{"response":"<增量>","reasoning_content":"<思考增量>","tool_calls":<null|数组>}
+   *
+   * event:token_usage
+   * data:{"prompt_tokens":21,"completion_tokens":142,...}
+   *
+   * event:done
+   * data:{"finish_reason":"stop"}
+   *
+   * event:error
+   * data:{"code":4008,"message":"quota exceeded"}
+   * ```
+   */
+  private async *consumeSse(
+    response: Response,
+    options: GenerateOptions,
+  ): AsyncIterable<StreamChunk> {
+    if (!response.body) throw new LlmError('trae: empty model response body', 'EMPTY_RESPONSE')
+
+    const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
+    let nextIndex = 0
+    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    const toolOrder: number[] = []
+    const toolIds = new Map<number, string>()
+    let buffer = ''
+    let streamEnded = false
+    let finishReason: 'stop' | 'tool_calls' | 'length' | undefined
+    // SSE 事件累积状态（跨行累积 event + data）
+    let currentEvent = ''
+    let currentData = ''
+    // 会话 id（从 metadata 事件获取，但非必需）
+    let gotAnyContent = false
+    /**
+     * 是否收到过**任何**可解析的上游事件。
+     *
+     * ## 为什么需要它
+     *
+     * 上游有时会「会话创建成功、HTTP 200、然后一个事件都不发就结束流」
+     * （CN 项目称之为 empty response，见 `main.py:3391-3408`）。这不是
+     * 正常的空回复，而是可重试的瞬时故障。
+     *
+     * 关键是**只在首个模型事件之前**才允许重试：一旦已有 output / usage /
+     * tool_calls 事件，重放请求会让上游**重复计费并可能重复执行工具**。
+     * 因此本标记只在「一个事件都没收到」时才让调用方重试。
+     */
+    let sawAnyUpstreamEvent = false
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let firstTokenReceived = false
+
+    try {
+      for (;;) {
+        if (streamEnded) break
+        let result
+        try {
+          const timeoutMs = firstTokenReceived ? resolveChunkTimeoutMs() : resolveFirstTokenTimeoutMs()
+          const phase = firstTokenReceived ? 'chunk' : 'first-token'
+          result = await readWithIdleTimeout(reader, timeoutMs, 'trae', options.signal, phase)
+          if (!result.done) firstTokenReceived = true
+        } catch (error) {
+          if (options.signal?.aborted) throw error
+          if (error instanceof LlmError) throw error
+          if (isTransportError(error)) {
+            throw new LlmError(`trae: sse transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error })
+          }
+          throw error
+        }
+        if (result.done) break
+        buffer += decoder.decode(result.value, { stream: true })
+        let newline: number
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline)
+          buffer = buffer.slice(newline + 1)
+
+          // 空行 = 事件分隔符 → 解析累积的事件
+          if (line.trim().length === 0) {
+            if (currentEvent.length > 0) {
+              const ev = parseTraeSSELine(currentEvent, currentData)
+              currentEvent = ''
+              currentData = ''
+              if (ev === undefined) continue
+              // 任何**可解析**的上游事件（含 metadata / timing_cost）都算
+              // 「上游确实开工了」——此后绝不重放请求（见 sawAnyUpstreamEvent）。
+              sawAnyUpstreamEvent = true
+
+              // 分发事件
+              switch (ev.event) {
+                case 'output': {
+                  const delta: Record<string, unknown> = {}
+                  if (ev.response !== undefined && ev.response.length > 0) {
+                    delta.content = ev.response
+                    gotAnyContent = true
+                  }
+                  if (ev.reasoningContent !== undefined && ev.reasoningContent.length > 0) {
+                    delta.reasoning_content = ev.reasoningContent
+                  }
+                  if (ev.toolCalls !== undefined && ev.toolCalls.length > 0) {
+                    delta.tool_calls = ev.toolCalls
+                  }
+
+                  if (Object.keys(delta).length > 0) {
+                    // 按块类型分发
+                    if (delta.content !== undefined) {
+                      let block = blocks.find(c => c.kind === 'text')
+                      if (block === undefined) {
+                        block = { index: nextIndex++, kind: 'text', text: '' }
+                        blocks.push(block)
+                        yield { type: 'block-start', index: block.index, blockType: 'text' }
+                      }
+                      block.text += delta.content as string
+                      yield { type: 'text-delta', index: block.index, text: delta.content as string }
+                    }
+                    if (delta.reasoning_content !== undefined) {
+                      let block = blocks.find(c => c.kind === 'reasoning')
+                      if (block === undefined) {
+                        block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                        blocks.push(block)
+                        yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                      }
+                      block.text += delta.reasoning_content as string
+                      yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content as string }
+                    }
+                    if (delta.tool_calls !== undefined) {
+                      const calls = delta.tool_calls as Array<Record<string, unknown>>
+                      for (const call of calls) {
+                        const wireIndex = typeof call.index === 'number' ? call.index : 0
+                        if (typeof call.id === 'string' && call.id.length > 0) toolIds.set(wireIndex, call.id)
+                        const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
+                        let block = toolCalls.get(wireIndex)
+                        if (block === undefined) {
+                          block = { index: nextIndex++, text: '', callId }
+                          toolCalls.set(wireIndex, block)
+                          toolOrder.push(block.index)
+                          yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+                        }
+                        block.callId = callId
+                        const callFn = call.function
+                        const fn = typeof callFn === 'object' && callFn !== null ? callFn as Record<string, unknown> : undefined
+                        if (fn !== undefined && typeof fn.name === 'string' && fn.name.length > 0) {
+                          block.name = fn.name
+                        }
+                        const fragment = fn !== undefined && typeof fn.arguments === 'string' ? fn.arguments : ''
+                        block.text += fragment
+                        yield {
+                          type: 'tool-call-delta',
+                          index: block.index,
+                          id: ToolCallId(callId),
+                          ...block.name !== undefined ? { name: block.name } : {},
+                          argumentsDelta: fragment,
+                        }
+                      }
+                    }
+                  }
+                  break
+                }
+                case 'token_usage': {
+                  if (ev.usage !== undefined) {
+                    const promptTokens = typeof ev.usage.prompt_tokens === 'number' ? ev.usage.prompt_tokens : 0
+                    const completionTokens = typeof ev.usage.completion_tokens === 'number' ? ev.usage.completion_tokens : 0
+                    const reasoningTokens = typeof ev.usage.reasoning_tokens === 'number' ? ev.usage.reasoning_tokens : undefined
+                    yield {
+                      type: 'usage',
+                      usage: {
+                        inputTokens: promptTokens,
+                        outputTokens: completionTokens,
+                        ...reasoningTokens !== undefined && reasoningTokens > 0 ? { reasoningTokens } : {},
+                      },
+                    }
+                  }
+                  break
+                }
+                case 'done':
+                  if (ev.finishReason !== undefined) {
+                    finishReason = ev.finishReason as 'stop' | 'tool_calls' | 'length'
+                  }
+                  streamEnded = true
+                  break
+                case 'error': {
+                  // 上游 event:error → 作为业务错误抛出
+                  // 如果是配额/plan 限流等可换号的错误，不应该走到这里（错误响应走 HTTP 400+ 路径）
+                  // 但如果流内出现 error，按不可重试处理
+                  if (ev.errorCode !== undefined && ev.errorMessage !== undefined) {
+                    throw new LlmError(
+                      traeStreamErrorMessage(ev.errorCode, ev.errorMessage, options.model),
+                      ev.errorCode === 1005 || ev.errorCode === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER',
+                    )
+                  }
+                  break
+                }
+              }
+            }
+            continue
+          }
+
+          // 行处理
+          const trimmed = line.trim()
+          if (trimmed.startsWith('event:')) {
+            currentEvent = trimmed.slice(6).trim()
+          } else if (trimmed.startsWith('data:')) {
+            currentData += trimmed.slice(5) // SOLO data 可能会跨行拼接
+          }
+          // 注释行（":"）或其他忽略
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+
+    // ── 空响应判定（可重试信号）──
+    //
+    // 一个上游事件都没收到 = 上游静默结束事件流，属于**可重试的瞬时故障**，
+    // 不是「模型决定不说话」。抛 TRANSPORT 让 DSH 的常规重试机制接管，
+    // 同时保留精确原因（CN 项目同样把该情形归类为 retryable empty response）。
+    //
+    // 注意：这里**不能**改成返回一个空的正常 finish —— 那会让用户看到
+    // 「模型回复为空」这种毫无线索的结果，且不会触发任何重试。
+    if (!sawAnyUpstreamEvent) {
+      throw new LlmError(
+        'trae: upstream returned no events (empty response before first model event)',
+        'TRANSPORT',
+      )
+    }
+
+    // 按创建顺序关闭每个块
+    const textBlock = blocks.find(block => block.kind === 'text')
+    for (const index of toolOrder) {
+      const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      yield {
+        type: 'block-end',
+        index,
+        block: {
+          type: 'tool-call',
+          id: ToolCallId(block.callId ?? ''),
+          name: block.name ?? '',
+          arguments: isTruncatedArguments(block.text) ? block.text : normalizeToolArguments(block.text),
+        },
+      }
+    }
+    if (textBlock !== undefined) {
+      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+    }
+    const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
+    if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
+      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+    }
+    const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
+    const reason = finishReason === 'length'
+      || (finishReason === undefined && toolOrder.length > 0)
+      || argsTruncated
+      ? { kind: 'max-tokens' as const }
+      : finishReason === 'tool_calls' || toolOrder.length > 0
+        ? { kind: 'tool-calls' as const }
+        : { kind: 'stop' as const }
+    yield { type: 'finish', reason }
+  }
+}
+
+/**
+ * 请求体历史字符上限。
+ *
+ * ## 为什么必须有（对齐 `Trae2api-cn` 的实测结论）
+ *
+ * 上游在 query 超过约 **500K 字符**时会**静默结束事件流** —— 不报错、不返回
+ * 错误码，流就那么断掉。这是最难排查的一类失败：日志里看到的是「模型没有
+ * 回复」，而不是任何 4xx/5xx。CN 项目为此设了两道闸门：
+ * `TRAE_REMOTE_MAX_HISTORY_CHARS=480000`（压缩阶段）与
+ * `TRAE_REMOTE_QUERY_MAX_CHARS=480000`（扁平化 query 的硬上限）。
+ *
+ * 这里取其**下沿**并在裁剪后仍可能超限时兜底，避免请求打到那个静默阈值。
+ * 可通过 `DSH_TRAE_MAX_HISTORY_CHARS` 覆盖。
+ */
+function resolveMaxHistoryChars(): number {
+  const raw = Number.parseInt(process.env.DSH_TRAE_MAX_HISTORY_CHARS ?? '', 10)
+  if (Number.isFinite(raw) && raw > 0) return raw
+  return 480_000
+}
+
+/** 估算一条 wire 消息的字符体量（按 JSON 序列化长度）。 */
+function wireMessageSize(message: Record<string, unknown>): number {
+  try {
+    return JSON.stringify(message).length
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 把 wire 消息裁剪到字符预算以内。
+ *
+ * ## 三条不可违反的约束
+ *
+ * 1. **从最早的非系统消息开始丢**，最近的历史（尤其本轮工具结果）必须保住 ——
+ *    丢尾部会让模型丢失当前任务上下文，比丢开头更糟。
+ * 2. **绝不切断 tool_call / tool 配对**：`tool` 消息必须紧跟其 `tool_calls`
+ *    所在的那条 assistant 消息。丢一半会被上游以 400 拒绝整个请求，所以这里
+ *    以「轮」为单位裁剪 —— 带 `tool_calls` 的 assistant 连同其后连续的
+ *    `tool` 结果一起处理。
+ * 3. **system 消息永不裁剪**（无论它出现在哪个位置），它是行为约束，
+ *    丢了比丢历史更危险。
+ *
+ * 已经是 OpenAI wire 形状的消息（本函数只接受 `serializeTraeMessages` 的产物）。
+ *
+ * @param messages 已序列化的 wire 消息（system 已并入）
+ * @param maxChars 字符预算（默认 480000）
+ */
+function trimTraeHistory(
+  messages: Array<Record<string, unknown>>,
+  maxChars: number = resolveMaxHistoryChars(),
+): Array<Record<string, unknown>> {
+  let total = messages.reduce((sum, message) => sum + wireMessageSize(message), 0)
+  if (total <= maxChars) return messages
+
+  // ── 1. 先切成「可丢弃的轮次」与「不可丢弃的 system」──
+  //
+  // 不假设 system 都在开头：历史里可能夹着 system（如 developer 角色被归一化）。
+  // 用显式的 keep 标记逐条判断，而不是靠下标切片 —— 后者在 system 不连续时会
+  // 错位。
+  const drop = new Set<number>()
+  let index = 0
+  while (index < messages.length && total > maxChars) {
+    if (messages[index]!.role === 'system') {
+      index += 1
+      continue
+    }
+    // 收集本轮：本条 + 其后连续的 tool 结果。
+    const roundStart = index
+    let roundEnd = index + 1
+    if (Array.isArray(messages[index]!.tool_calls) && (messages[index]!.tool_calls as unknown[]).length > 0) {
+      while (roundEnd < messages.length && messages[roundEnd]!.role === 'tool') roundEnd++
+    }
+    for (let cursor = roundStart; cursor < roundEnd; cursor++) {
+      drop.add(cursor)
+      total -= wireMessageSize(messages[cursor]!)
+    }
+    index = roundEnd
+  }
+
+  // 裁剪后仍超限（例如单条 system 提示就超预算）：不再继续丢 —— 继续丢只会把
+  // 请求变成空内容，同样失败且更难诊断，交由上游定夺。
+  return messages.filter((_, position) => !drop.has(position))
+}
+
+/**
+ * 在 `ctx.llm` 上注册 TRAE provider 路由与适配器。
+ */
+export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): void {
+  const product = options.product ?? TRAE
+  ctx.llm.registerConfigurableProviders([
+    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+  ])
+  ctx.llm.registerAdapter([product.id], new TraeAdapter(options))
+}

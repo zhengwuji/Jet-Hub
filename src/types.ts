@@ -58,6 +58,20 @@ export interface ProviderAccountEntry {
   refreshable: boolean
   /** 每个模型的重置时间，key=模型ID（毫秒时间戳） */
   modelRateLimits?: Record<string, number>
+  /**
+   * TRAE 签到设备轮换代次（仅 `trae` provider 使用）。
+   *
+   * 业务码 `9074`（签到人数过多）的限流范围是 **device_id 而非账号**：
+   * 命中后把代次 +1，即可由 `device_id` 派生出一个全新的签到设备号绕开它
+   * （见 `src/trae.ts` 的 `deriveCheckinDeviceId`）。
+   *
+   * 这里只存**整数代次**而不是新设备号本身：派生结果由
+   * `(credential.device_id, generation)` 唯一决定，故无需改写凭据本体
+   * （登录凭据里的 `device_id` 是设备指纹，动它会牵涉风控）。
+   *
+   * 缺省/0 = 使用凭据原始 `device_id`，既有账号行为完全不变。
+   */
+  traeCheckinDeviceGeneration?: number
 }
 
 /** 账号详细状态（返回给 Client 展示） */

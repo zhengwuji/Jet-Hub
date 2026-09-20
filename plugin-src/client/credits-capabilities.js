@@ -59,6 +59,9 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // Qoder：有余额（`sash/api/v2/me/usage`）、无签到。
   // 显式登记而非省略 —— 单测要求本表与 PROVIDERS 同步。
   qoder: Object.freeze({ balance: true, dailyCheckin: false }),
+  // TRAE：余额与签到都有（`/trae/api/v2/pay/ide_user_ent_usage` +
+  // `checkin_credits/status` → `checkin_credits/claim`，见 `src/trae-credits.ts`）。
+  trae: Object.freeze({ balance: true, dailyCheckin: true }),
 });
 
 /**

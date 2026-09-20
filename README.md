@@ -111,11 +111,12 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册四个独立的 provider 路由：`buddy`（见
+除 `codearts` 外，插件另注册五个独立的 provider 路由：`buddy`（见
 [buddy provider](#buddy-provider)）、`workbuddy`（见
 [WorkBuddy provider](#workbuddy-provider)）、`lobsterai`（见
-[LobsterAI provider](#lobsterai-provider有道龙虾)）与 `qoder`（见
-[Qoder provider](#qoder-provider)）。五者互不覆盖，可同时使用。
+[LobsterAI provider](#lobsterai-provider有道龙虾)）、`qoder`（见
+[Qoder provider](#qoder-provider)）与 `trae`（见
+[TRAE provider](#trae-provider字节跳动-trae)）。六者互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -322,9 +323,14 @@ composer 的模型切换菜单**只渲染 `name`**，`description` 仅用于 `/m
 | `buddy` / `workbuddy` | `modelPromotions[].discount.discountedCredits` | 字符串 `"0.50x"`（**x 在后**） |
 | `lobsterai` | `data[].costMultiplier` | 裸数字 `0.05` |
 | `qoder` | 目录 `chat[].price_factor` | 裸数字，**`0` = 免费** |
+| `trae` | `display_contact_config.consumption_rate.data.rate` | **裸数字** `0.08`；`0` = 免费（⚠️ `display_contact_config` 本身是 **JSON 字符串**，须二次解析） |
 | `codearts` | 无 | 两个目录端点都不含计费字段 |
 
 已结束的促销占位值 `"0x"` 被当作无促销（否则用户会误以为免费）。
+
+TRAE 的活动折扣只用**当前确实生效**的那一档：`activity_discount.enable` 为
+`true` 也可能是「无折扣」（`discount_type: "none"`、原价==折后价，实测 `off_peak`
+型即如此），照显会得到 `x0.13→x0.13`；已过 `end_at` 的活动同样不展示。
 
 Qoder 的免费模型（`price_factor: 0`）显示为「免费」而不是 `x0`：
 
@@ -959,3 +965,110 @@ Cosy-ClientType: 5
 
 **仅支持国际版**（`qoder.com` / `qoder.sh`）。中国版（`qoder.com.cn`）的
 端点与 client id 不同，本实现未覆盖。
+
+## TRAE provider（字节跳动 TRAE）
+
+独立路由 `trae`（字节跳动 **TRAE**），走 SOLO 免费对话通道，
+端点 `https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`，
+以 `Cloud-IDE-JWT <token>` 头鉴权。
+
+该 provider 是**第三个独立协议族**（实现见 `src/trae*.ts`），与腾讯系、
+LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的 provider：
+
+| 项 | 其它 provider | TRAE |
+|---|---|---|
+| 消息序列化 | 有（`tool-call` → `tool_calls`） | **必须有**（DSH 原生块 → OpenAI wire）；漏掉会让**模型看不到工具调用与结果**（真实缺陷，已修复） |
+| 请求体 | 基本透传 OpenAI 格式 | **必须转换**为 SOLO 格式（`function: "solo_work_lite"`、`config_name`、`tools.parameters` 序列化为字符串、`tool_calls.function` → `function_call`） |
+| 响应流 | OpenAI 标准 SSE | **SOLO 自定义事件**（`output` / `token_usage` / `done` / `error`），需转成 OpenAI chunk |
+| 鉴权头 | `Bearer` / 签名 | `Cloud-IDE-JWT` + 十余个 `X-*` 身份头 |
+| 换 token | 轮询 / authCode | **ExchangeToken**（`refresh_token` 会**轮换**） |
+| 设备指纹 | 无 | **必须持久化** `machine_id` 与 `device_id`（均为 32 位 hex） |
+| **登录回调** | 各不相同 | **老流程直接回传 token**（`refreshToken` / `userInfo` / `userJwt`）；**并存 PKCE 新流程**（带 `code` / `authCodeInfo`），两套都要认；参数名是 **`auth_callback_url`** |
+| 回调端口 | 各不同 | 默认 `127.0.0.1:18080`，**被占用时自动回退随机端口** |
+| 图片输入 | Buddy / LobsterAI 支持 | **不支持**（`inputModalities` 仅 `text`） |
+| 历史长度 | 无硬约束 | 超约 **500K 字符上游会静默断流** → 自动裁剪（保最新、不切断工具配对） |
+| 单次输出上限 | 采信远端声明 | 收敛到 **64000**（上游安全线，可配） |
+| 模型列表 | `GET` | `POST /api/ide/v1/get_detail_param`（响应 `config_info_list[]`） |
+
+- **登录入口：Jet Hub 设置页的 TRAE 面板**（支持多账号与账号池自动切换）。
+  不注册斜杠命令。
+- 编程式调用：`ctx.traeAuth.login()` / `startLogin()` / `status()` / `refresh()` /
+  `logout()` / `fetchModels()`。
+- 凭据 ref：
+  - 单账号：`TRAE_ACCESS_TOKEN`；
+  - 多账号：`TRAE_ACCOUNT_<UUID_SHORT>`，由 Jet Hub「+ 新建账号」生成。
+- 凭据结构（JSON 字符串）：除 `access_token` / `refresh_token` / `expires_at` /
+  `uid` 外，还持久化 **`machine_id`** 与 **`device_id`**（两者均为 32 位 hex）：
+  - `machine_id` 是设备指纹，续期时**绝不可重新生成**（服务端按它标识设备）；
+  - `device_id` 是签到设备号，**账号间必须互异** —— 同一天两账号共用会被
+    「该设备已签到」拦截，为空则签到报 9004。
+- 登录 URL 含 **18 个参数**（对齐唯一权威实现 `login.sh`），包括
+  `auth_from=solo`、`login_channel=native_ide`、`plugin_version`、
+  `login_trace_id` 与 `x_*` 客户端形态系列。少发参数会让登录页停在授权中。
+- **两套回调流程都要认**：
+  - **老流程**（当前 `auth_type=local` 实际走的）：直接回传 token，形如
+    `?refreshToken=...&userInfo={...}&userJwt={...}`，不做授权码交换；
+  - **新流程**（PKCE）：回带 `code` / `authCodeInfo`。本实现会**识别**它并给出
+    「上游走了 PKCE 流程，暂不支持」的**精确报错**，而不是笼统地说
+    「缺少 refreshToken」（把合法回调误判为无效会把排查方向带偏）。
+  另外 `userInfo` 的中文昵称存在双重编码乱码，插件会自动回转修复。
+- ⚠️ **任何回调路径都必须落定登录结果 Promise**：早期实现里解析失败分支只
+  `res.end()` 就 return，导致 `login.poll` 永远拿不到 `done:true`，
+  前端**永久停在「认证中」**。这与「参数名写错」是两个独立根因、同一个症状。
+- 模型列表：走**批量**端点 `POST /api/ide/v1/batch_get_detail_param`（真实 CN IDE
+  的用法），**一次拉取多个「通道」（`function`）各自一套模型目录**；失败时回退
+  `src/trae-product.ts` 的 32 个内置模型。
+- ⚠️ **模型只在列出它的通道里可调用**。实测：`glm-5.1` 在 `solo_agent_remote`
+  正常、在 `solo_work_lite` 回流内 `4001`；`glm-5-turbo` / `sagitta` 恰好相反。
+  因此插件会**按每个模型所属通道分别下发 `function`** —— 旧实现把 `function`
+  写死 `solo_work_lite`，agent 专有模型一用就报
+  `trae: We're sorry, the param is invalid. (code=4001)`。
+- ⚠️ **两种「不可用」要分开看**：
+  - `display_config.is_custom_model === true`（需在 IDE 内自行绑定供应商）
+    → **必然 4001，插件剔除**。实测 2026-09-19 该账号有 5 个，但**该名单已过期**
+    （复测 2026-09-20：3 个下架、2 个转为 `false` 可调用，全目录 custom 条目数为 0）
+    —— 判据是**标志的值**而非模型名，别把某一刻的快照写成规则。
+  - `is_invisible_to_user === true`（**官方 picker 不展示**）→ **硬性剔除**，
+    使目录与官方 Auto Mode 选择器一致（代价是看不到 `glm-5.1` 等可调用模型）。
+  - 若仍选中了不可调用的模型（如会话里持久化的旧 id），报错文案会直接点明
+    「模型不被上游接受」，而不是让人去查参数格式。
+- **远端参数会被消费**：`context_window_tokens.dev` → 上下文窗口
+  （实测主流 **200000**；`max` 的 1M 需官方 max_mode，本插件不实现）；
+  `model_detail_list[].max_tokens` → 输出上限（实测主流 **32000**）。
+- **`4001` 还有一个自伤成因**：请求头里 `Content-Type` 与 `content-type`
+  各写一次会被 `Headers` 合并成 `"application/json, application/json"`，
+  上游回 HTTP 400 + `code=4001`。写探针时请用 `new Headers(base).set(...)`。
+- 续期：启动后每 30 分钟对可续期账号静默刷新（与其他 provider 同一调度器）。
+  终态判定有三条依据（HTTP 401/403、`session-dead` 分类、2xx 但无 `accessToken`）；
+  网络抖动与 5xx 走可重试路径。
+- 失败模式：`4008`（`ide_credits` 耗尽）与 `1005`（plan 权益不足）是最主要的
+  两个，会被分类为需要冷却的类别并触发多账号轮换。
+- **签到所得积分如实上报**：`checkin_credits/claim` 的响应**只有**
+  `{"code":0,"message":"success"}`，**不含积分数** —— 故领取成功后会补查一次
+  `checkin_credits/status`（其 `credits` 字段即所得，实测 `150`，与积分余额里
+  「签到奖励」包的 `credits_limit` 吻合）。早期从 claim 响应读 `credits`，
+  于是恒为 0，界面显示「领取成功 **+0 积分**」。
+- **已签到必须靠状态判定**：claim 对「今天已签到」是**幂等**的，重复领取同样返回
+  `code:0`，与真正成功**无法区分** —— 故 `claimAll` 的 TRAE 分支**必须开启状态
+  预检**（`checked_in`），不能用 `precheckStatus: false`，否则已签到的账号会被
+  报成「领取成功」。
+- **签到 `9074`（人数过多）不再换设备号重试**：设备身份已由 `uid` 确定性派生、
+  每账号独立，「换个 id 就能成功」的前提不成立。命中即归为业务错误（300s 冷却）
+  并如实上报。
+- **空响应（HTTP 200 但零事件）重试一次**，且**仅在首个模型事件之前** ——
+  已有输出后绝不放，避免重复计费与重复执行工具。
+- 可调环境变量：
+  - `DSH_TRAE_CHANNELS`（默认 `solo_work_lite,solo_agent_remote`）要拉取的通道，
+    **顺序即优先级**（前面的通道优先决定同名模型走哪个通道）；
+  - `DSH_TRAE_HIDE_INTERNAL=1` 连官方隐藏的条目一并从目录剔除（与真实 CN IDE
+    的选择器一致，代价是看不到 `glm-5.1` 等可调用模型）；
+  - `DSH_TRAE_MAX_COMPLETION_TOKENS`（默认 `64000`，设 `0` 关闭收敛）；
+  - `DSH_TRAE_MAX_HISTORY_CHARS`（默认 `480000`）；
+  - `DSH_TRAE_ROTATE_MACHINE_ID=1`（**默认关闭**）启用机器指纹轮换以应对集中风控。
+
+> 尚未实现：真实 CN IDE 的 `llm_utils_chat` / `create_agent_task` **请求体是加密的**
+> （配 `x-helios` / `x-medusa` / `x-neptune`）；实测仅换版本头解不开依赖它的模型
+> （`deepseek-v4-flash` 等）。属独立工作量。
+
+> 实现依据见 `docs/trae-integration-plan.md`（协议逆向自
+> [`trae2api`](https://github.com/Sliverkiss/traework2api) 及其衍生项目）。
