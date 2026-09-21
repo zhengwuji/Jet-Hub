@@ -101,7 +101,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 ## LLM Provider 约定
 
-- provider 名称：`codearts` / `buddy` / `workbuddy` / `antigravity`
+- provider 名称：`codearts` / `buddy` / `buddy-intl` / `workbuddy-cn` / `workbuddy` / `antigravity`
 - 端点格式为 OpenAI 兼容
 - 请求签名/鉴权方式因 provider 而异：
   - `codearts`：华为云 `SDK-HMAC-SHA256` 签名方案

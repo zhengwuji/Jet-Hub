@@ -433,6 +433,13 @@ export class BuddyAdapter extends LlmAdapter {
         .filter((model) => model.contextWindow !== undefined)
         .map((model) => [model.id, model.contextWindow as number]),
     )
+    if (typeof this.options.accountPool?.onAccountsChanged === "function") {
+      this.options.accountPool.onAccountsChanged(() => {
+        this.remoteModels = undefined
+        this.remoteMeta = new Map()
+        this.remoteContextWindows = new Map()
+      })
+    }
   }
 
   /**
@@ -551,6 +558,8 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    const cred = await this.options.resolveCredential?.()
+    if (!cred) return []
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? this.staticFallbackModels()
     return source.map((model) => ({
@@ -577,6 +586,13 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    const cred = await this.options.resolveCredential?.()
+    if (!cred) {
+      throw new LlmError(
+        `[${this.product.displayName}] 当前未配置有效账号或凭据，请在 Jet Hub 中添加或启用账号`,
+        'AUTHENTICATION',
+      )
+    }
     await this.ensureRemoteModels()
     // 三级查找：远端 maxInputTokens → 产品兜底表 → 通用静态表
     // （对齐 Rust context_limit_for_model 的两级查找，多一层产品级）。

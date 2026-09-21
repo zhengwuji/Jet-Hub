@@ -27,7 +27,25 @@
 
 ## ✨ 更新日志
 
-### v0.2.0 (最新发布)
+### v0.2.1 (最新发布)
+
+- 🐛 **修复 CodeBuddy (国际版) 无账号时在 DSH 模型列表中残留泄露的缺陷**：
+  - **前置凭据鉴权防护**：在 `BuddyAdapter.listModels` 与 `resolveModel` 前置增加 `resolveCredential` 校验，未配置或未启用账号时直接返回空模型列表，彻底杜绝无账号状态下静态兜底模型（如 deepseek-v4.1-flash 等）错误暴露给前端的问题。
+  - **账号池动态变更感知 (`onAccountsChanged`)**：监听账号池变更事件，在用户添加、删除或停用账号时，自动原子清空已缓存的远端模型列表及上下文限制，保证 DSH 模型目录能够实时联动刷新，不留任何死锁或僵尸配置。
+- 🛡️ **管理端 RPC 健壮性与超时保护**：
+  - 前端控制面板向后端发起 RPC 调用（`account.list`、`account.probe`、`account.credits` 等）时引入 10 秒超时防护（`AbortSignal.timeout(10000)`），彻底解决后端服务未就绪时界面无限转圈卡死的问题。
+  - 优化错误提示展示，明确区分连接超时与服务未启动状态，给出直观的重启/重试排查指引。
+- 🎨 **Jet Hub 面板交互与样式优化**：
+  - 完善支持静默自动续期（`REFRESHABLE_PROVIDERS`）的提供方名单（包含 codearts、buddy、buddy-intl、workbuddy-cn、workbuddy 等）；
+  - 顶部操作栏（重测所有/重置受限/新建账号）启用弹性自适应布局（`flex-wrap`），适配多分辨率与不同面板宽度；
+  - 引入 `info` 紫色色调提示气泡，状态展示层次更分明。
+- 🚀 **自动化部署脚本增强 (`deploy-antigravity.ps1`)**：
+  - 部署到 DSH Desktop 运行时（`F:\Users\Administrator\AppData\Local\Programs\DSH Desktop`）时，自动检测并安全清理旧的遗留产物；
+  - 保持逐文件 SHA256 无损比对与 Node 语法自检。
+- 🧪 **单元测试体系健全**：
+  - 补充 `tests/unit/buddy-adapter.spec.ts` 中无可用账号时的防护回归用例，70 个单测全部 100% 通过。
+
+### v0.2.0
 
 - 🚀 **全新支持 Google Antigravity 本地私有直连通道**：
   - **零凭据配置、极速直连**：无需配置 API Key、OAuth Token 或翻找本地凭据文件，启动 Antigravity IDE 即可自动无缝直连本地 `language_server` 进程。

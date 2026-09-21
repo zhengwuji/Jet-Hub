@@ -26,7 +26,8 @@ export function callManagementRpc(connection, channel, method, payload, signal) 
   // connection.rpc.call(mountPoint, endpoint, payload, signal)
   // mountPoint = '/api', endpoint = 'jet-hub'
   // payload = { method: 'account.list', payload: { provider: 'buddy' } }
-  return connection.rpc.call('/api', ENDPOINT, { method, payload }, signal)
+  const timeoutSignal = signal ?? (typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(10000) : undefined)
+  return connection.rpc.call('/api', ENDPOINT, { method, payload }, timeoutSignal)
 }
 
 /**

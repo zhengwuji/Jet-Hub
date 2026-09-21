@@ -3,7 +3,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { describe, expect, it } from 'vitest'
 import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, registerBuddyLlm } from '../../src/buddy-adapter.js'
 import type { BuddyCredential, BuddyRemoteModel } from '../../src/buddy.js'
-import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
+import { CODEBUDDY, CODEBUDDY_INTL, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
 
 const CREDENTIAL_REF = credentialRef('BUDDY_ACCESS_TOKEN')
 
@@ -1343,5 +1343,27 @@ describe('产品兜底模型目录校正', () => {
     })
     const models = await adapter.listModels('workbuddy')
     expect(models.map((m) => m.id)).toEqual(['x', 'y'])
+  })
+})
+describe('无可用账号时模型目录防护', () => {
+  it('未配置有效凭据时 listModels 返回空数组（不泄露静态兜底模型）', async () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('BUDDY_INTL_ACCESS_TOKEN'),
+      resolveCredential: async () => undefined,
+      refresh: async () => {},
+      product: CODEBUDDY_INTL,
+    })
+    const models = await adapter.listModels('buddy-intl')
+    expect(models).toEqual([])
+  })
+
+  it('未配置有效凭据时 resolveModel 抛出 AUTHENTICATION 错误', async () => {
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('BUDDY_INTL_ACCESS_TOKEN'),
+      resolveCredential: async () => undefined,
+      refresh: async () => {},
+      product: CODEBUDDY_INTL,
+    })
+    await expect(adapter.resolveModel('buddy-intl', 'deepseek-v4.1-flash')).rejects.toThrow(/未配置有效账号/)
   })
 })

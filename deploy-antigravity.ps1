@@ -246,6 +246,11 @@ if ($ih -eq 0) { throw '部署后 index.js 未注册 registerAntigravityLocalLlm
 Write-Ok "client bundle 含 antigravity（$bh 处，部署前为 $currentHits）"
 Write-Ok 'index.js 注册 registerAntigravityLocalLlm'
 
+# 清理运行时中旧的 Qoder 产物（若存在）
+Get-ChildItem (Join-Path $Runtime 'lib') -Filter 'qoder*' -File -ErrorAction SilentlyContinue | ForEach-Object {
+  Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+}
+
 # 逐文件哈希比对，确保拷贝无损
 $diffFiles = @()
 Get-ChildItem $srcLib -Recurse -File | ForEach-Object {
@@ -264,7 +269,10 @@ Write-Info "jet-hub.js 当前链接数: $(($links | Measure-Object).Count)"
 
 # 语法校验（node --check 不解析依赖，只查语法）
 $synBad = @()
-foreach ($f in @('lib\index.js', 'lib\antigravity-local.js', 'lib\antigravity-local-adapter.js', 'lib\client\jet-hub.js')) {
+foreach ($f in @(
+  'lib\index.js', 'lib\antigravity-local.js', 'lib\antigravity-local-adapter.js',
+  'lib\client\jet-hub.js'
+)) {
   $p = Join-Path $Runtime $f
   & node --check $p 2>$null
   if ($LASTEXITCODE -ne 0) { $synBad += $f } else { Write-Ok "语法 OK: $f" }

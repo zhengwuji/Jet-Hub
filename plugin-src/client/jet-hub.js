@@ -18,6 +18,8 @@ const PROVIDERS = Object.freeze([
 
 const REUSE_PROVIDERS = Object.freeze(['antigravity']);
 const CREDITS_PROVIDERS = Object.freeze(['buddy', 'workbuddy-cn']);
+/** 支持静默续期的提供方。 */
+const REFRESHABLE_PROVIDERS = Object.freeze(['buddy', 'buddy-intl', 'workbuddy-cn', 'workbuddy', 'codearts']);
 
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find(p => p.id === provider);
@@ -139,6 +141,7 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy }) {
 function ProviderPanel({ provider, rpcCall }) {
   const reuseMode = REUSE_PROVIDERS.includes(provider);
   const supportsCredits = CREDITS_PROVIDERS.includes(provider);
+  const refreshable = REFRESHABLE_PROVIDERS.includes(provider);
 
   const [accounts, setAccounts] = React.useState([]);
   const [phase, setPhase] = React.useState('loading');
@@ -158,7 +161,10 @@ function ProviderPanel({ provider, rpcCall }) {
       setPhase('ready');
     } catch (caught) {
       if (!mounted.current) return;
-      setError(caught?.message || '无法获取账号列表');
+      const msg = caught?.name === 'TimeoutError'
+        ? '读取账号列表超时，后端服务可能未就绪或未启动，请尝试重新读取或重启 DSH'
+        : (caught?.message || '无法获取账号列表');
+      setError(msg);
       setPhase('error');
     }
   }, [provider, rpcCall]);

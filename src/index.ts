@@ -322,7 +322,7 @@ export function apply(ctx: Context): void {
       }
     }
 
-    // 3. Antigravity (Google)：作为本地私有 IDE 直连通道，始终注册该提供方。
+    // 4. Antigravity (Google)：作为本地私有 IDE 直连通道，始终注册该提供方。
     //    用户启动 Antigravity IDE 即可自动无缝直连调用模型。
     activeEntries.push({
       provider: ANTIGRAVITY_PROVIDER,
