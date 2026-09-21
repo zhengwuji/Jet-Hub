@@ -51,7 +51,7 @@ pnpm build:assets          # 同步到 lib/
 取 `.qoder-versions/<v>` 而非 `resources/` —— 后者可能是与 IDE **实际运行**不同的版本
 （实测 IDE 跑 0.3.4）。刷新后**必须实测一次对话**（`qfmodel` / `qmodel_38max`）确认签名仍被接受。
 
-它**有积分余额、无签到**（能力矩阵登记为 `{balance:true, dailyCheckin:false}`），并复用 `src/openai-compat.ts` 的 OpenAI 协议层共享实现（消息序列化 / SSE 消费 / 错误归类）。详见 README 的「Qoder provider」章节与 `docs/superpowers/specs/2026-09-19-qoder-provider-design.md`。
+它**积分余额与每日领取都有**（能力矩阵登记为 `{balance:true, dailyCheckin:true}`），并复用 `src/openai-compat.ts` 的 OpenAI 协议层共享实现（消息序列化 / SSE 消费 / 错误归类）。详见 README 的「Qoder provider」章节与 `docs/superpowers/specs/2026-09-19-qoder-provider-design.md`。
 
 ### ⚠️ Qoder 积分余额：路径在 `/sash/` 下，且只需 Bearer
 
@@ -70,8 +70,39 @@ pnpm build:assets          # 同步到 lib/
 企业版（`displayMode:"enterprise"`）不下发额度数字、只给外部链接 →
 返回 `null`（UI 显示「查询失败」）而非 `0`。
 
-签到仍为 **false**：`/sash/api/v1/me/campaigns` 实测 `claimable:false`，
-逆向未发现签到动作端点。**余额与签到是彼此独立的能力**，不可互相推断。
+### ⚠️ Qoder 每日领取：端点由 **keylog 解密抓包** 解出（2026-09-21）
+
+```
+GET  {openApiBase}/sash/api/v1/me/campaigns
+POST {openApiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body **空**
+```
+
+请求头同上（Bearer + `Cosy-ClientType`，**无需签名**）。
+
+⚠️ **幂等判据是响应体的 `replayed`，不是 HTTP 状态码**：重复领取同样返回
+**200**，但 `replayed:true`、**不含 `benefit`**，且 `claimedAt` 是**上一次
+领取的旧时间**（实测请求发生在 09-21、而 `claimedAt` 是 09-18）。
+只看状态码会把「今天已领」误报成「领取成功 +100」。
+
+⚠️ **请求体必须是空串**（抓包实测 `content-length: 0`）。
+
+⚠️ **只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`** ——
+实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
+
+⚠️ **为什么曾经误判「Qoder 无签到」**：`/sash/api/v1/me/campaigns` 当时返回
+`{"showCampaign":false,"claimable":false,"campaigns":[]}`，据此下了结论。
+真相是**那天已领** —— 活动**每日 10:00（UTC+8）刷新**（响应里
+`description: "每日 10:00（UTC+8）刷新，领取后 30 天有效"`）。
+**教训：「某次实测没看到」不能推广成「不存在」**，这与 TRAE「带 code 的
+回调」那次是同一类错误。
+
+⚠️ **`CheckinStatus.active` 必须恒为 `true`**（拿到响应即 true，不按
+「列表非空」判）：服务端在「今天已领」时清空 `campaigns`，若据此判
+`active:false`，`collectClaimResults` 会先命中「活动未开启」分支，
+把「今天已领」误报成「签到活动未开启」。
+
+⚠️ **RPC 分支须传 `precheckStatus: false`** —— `claimQoderDailyCheckin`
+自带活动列表查询，否则会重复发一次 GET（与 LobsterAI 传 false 同理）。
 
 ### ⚠️ `openai-compat.ts` 只服务 qoder，不要顺手重构既有适配器
 
@@ -81,7 +112,7 @@ pnpm build:assets          # 同步到 lib/
 
 `trae` 同样**完全独立**（第五个脉系，独立一套 `src/trae*.ts`），且差异点与其他四者都不一样：认证用 **ExchangeToken 轮换 refreshToken**（不是轮询、也不是 authCode 交换）；鉴权头是 `Cloud-IDE-JWT <token>` 加十余个 `X-*` 身份头；**请求体需要从 OpenAI 格式转换为 SOLO 格式**（`function` / `config_name` / `tools.parameters` 序列化等）；**响应是 SOLO 自定义 SSE 事件**（`output` / `token_usage` / `done` / `error`），必须自行解析并转成 OpenAI chunk；凭据还必须持久化 `machine_id` 与 `device_id`（均为 **32 位 hex**，分别用作设备指纹与签到设备号，后者账号间必须互异）。**登录回调默认直接回传 token**（`auth_callback_url` 参数，老流程没有 `code`；但也并存 PKCE 新流程，两套都要认），详见下「TRAE 协议要点」。实现见 `docs/trae-integration-plan.md`。
 
-Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI、CodeArts 与 TRAE 四个面板提供** —— 国际版 WorkBuddy 后端没有签到接口、Qoder 无签到端点，故均不提供。四者是**四套互不相同的协议**（见下「积分领取」）。
+Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI、CodeArts、Qoder 与 TRAE 五个面板提供** —— 只有国际版 WorkBuddy 不提供（其后端没有签到接口）。五者是**五套互不相同的协议**（见下「积分领取」）。
 
 - **包名**：`dsh-codearts-auth`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
@@ -1142,7 +1173,16 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 ⚠️ 只有 **buddy / workbuddy** 走这条默认路径（其余三个 provider 都在自己的分支里
 显式注入 `claim`），所以故障面恰好是 CodeBuddy 系。
 
-**四套协议完全不同**的实现，各自独立：
+**五套协议完全不同**的实现，各自独立：
+
+**Qoder** —— `src/qoder-credits.ts`（2026-09-21 由 keylog 解密抓包解出）：
+
+- 状态查询：`GET /sash/api/v1/me/campaigns`（**只需 Bearer + `Cosy-ClientType`**）
+- 领取：`POST /sash/api/v1/me/campaigns/{campaignId}/claim`（**body 空**）
+- 幂等：重复领取返回 **HTTP 200 + `replayed:true`**（且不含 `benefit`、
+  `claimedAt` 是旧时间）—— 判定**以响应体 `replayed` 为准**，不能只看 HTTP 状态
+- 只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`
+- 活动每日 10:00（UTC+8）刷新，领取后 30 天有效
 
 **CodeBuddy** —— `src/credits.ts`（国际版 WorkBuddy 后端无签到接口）：
 
@@ -1235,7 +1275,7 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 | `buddy` | ✓ | ✓ |
 | `workbuddy` | ✓ | ✗（国际版后端无签到接口） |
 | `lobsterai` | ✓ | ✓（`client-activities` 三步流程） |
-| `qoder` | ✓（`sash/api/v2/me/usage`，只需 Bearer） | ✗（未见签到接口） |
+| `qoder` | ✓（`sash/api/v2/me/usage`，只需 Bearer） | ✓（`sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim`） |
 | `trae` | ✓ | ✓（`checkin_credits` 两步流程） |
 
 > ⚠️ `qoder` **必须显式登记**，不能省略：上面那条「能力矩阵与 `PROVIDERS` 条目集合相等」的断言要求两者同步，而 qoder 必然要进 `PROVIDERS`（否则面板不渲染）。

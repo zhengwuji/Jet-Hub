@@ -38,12 +38,18 @@
  *   `get-dosage-notify` 用量通知）；LobsterAI 用 `client-activities` 的
  *   slot → context → check_in 三步（见 `src/lobsterai-credits.ts`）；
  *   CodeArts 用 `/v1/ops/delivery` + `/v1/ops/claim`(+`confirm`)
- *   （见 `src/codearts-credits.ts`）。
- * - `qoder` **有余额、无签到**。⚠️ 早期误判为「两项皆无」，原因是只按
- *   `/api/` 前缀搜索端点，而它挂在 **`/sash/`** 下、且**只需 Bearer +
- *   `Cosy-ClientType`、不需要 WASM 签名**（实测 200 并返回
- *   `addOnQuota.remaining: 100`）。`/sash/api/v1/me/campaigns` 实测
- *   `claimable: false` 且逆向未发现签到动作端点，故签到仍为 false。
+ *   （见 `src/codearts-credits.ts`）；Qoder 用
+ *   `/sash/api/v1/me/campaigns` 列出活动再逐个
+ *   `POST …/{campaignId}/claim`（见 `src/qoder-credits.ts`）。
+ * - `qoder` **两项都有**。⚠️ 早期误判为「两项皆无」，原因有二：
+ *   ① 只按 `/api/` 前缀搜索端点，而它挂在 **`/sash/`** 下、且只需
+ *   Bearer + `Cosy-ClientType`（不需要 WASM 签名，实测返回
+ *   `addOnQuota.remaining: 100`）；
+ *   ② 随后又误判「无签到」—— 依据是 `/sash/api/v1/me/campaigns` 返回
+ *   `claimable:false, campaigns:[]`，但那是**当天已领**的正常表现
+ *   （活动每日 10:00（UTC+8）刷新）。2026-09-21 用 keylog 解密抓包
+ *   拿到了领取端点与幂等证据（`replayed:true`）。
+ *   **教训**：「某次实测没看到」不能推广成「不存在」。
  *
  * 判定一律**默认关闭**：未登记的 provider 视为不支持任何积分能力。这样将来
  * 新增 provider 时，若忘记在此登记，最坏结果是「暂时看不到积分」，而不是
@@ -56,9 +62,11 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   buddy: Object.freeze({ balance: true, dailyCheckin: true }),
   workbuddy: Object.freeze({ balance: true, dailyCheckin: false }),
   lobsterai: Object.freeze({ balance: true, dailyCheckin: true }),
-  // Qoder：有余额（`sash/api/v2/me/usage`）、无签到。
+  // Qoder：余额（`sash/api/v2/me/usage`）+ 每日领取
+  // （`sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim`，
+  // 2026-09-21 由 keylog 解密抓包解出）。
   // 显式登记而非省略 —— 单测要求本表与 PROVIDERS 同步。
-  qoder: Object.freeze({ balance: true, dailyCheckin: false }),
+  qoder: Object.freeze({ balance: true, dailyCheckin: true }),
   // TRAE：余额与签到都有（`/trae/api/v2/pay/ide_user_ent_usage` +
   // `checkin_credits/status` → `checkin_credits/claim`，见 `src/trae-credits.ts`）。
   trae: Object.freeze({ balance: true, dailyCheckin: true }),

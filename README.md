@@ -14,8 +14,8 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 - **lobsterai（有道 LobsterAI / 龙虾）** — 见 [LobsterAI provider](#lobsterai-provider)；
   另支持「一键领取积分」（每日签到）。
 - **qoder（阿里系 Qoder）** — 见 [Qoder provider](#qoder-provider)；
-  **支持积分余额**（不支持签到）；走**加密推理端点**，模型池与客户端一致
-  （含 Qwen3.8 系列）。
+  **支持积分余额与每日领取**（每日 100 Credits，10:00（UTC+8）刷新）；
+  走**加密推理端点**，模型池与客户端一致（含 Qwen3.8 系列）。
 
 `codearts` 面板同样支持**积分账户检测、积分余额与「一键领取积分」**
 （华为云「每日签到得积分」活动，走 `SDK-HMAC-SHA256` 签名）——
@@ -948,7 +948,7 @@ pnpm build:assets          # 同步到 lib/
 
 ### 积分余额（Credits Balance）
 
-`qoder` 面板**支持积分余额**（但不支持签到）：
+`qoder` 面板**支持积分余额**：
 
 ```
 GET https://openapi.qoder.sh/sash/api/v2/me/usage
@@ -967,16 +967,24 @@ Cosy-ClientType: 5
 （`displayMode: "enterprise"`）不下发额度数字、只给外部链接，此时返回
 「查询失败」而非 0。
 
-### 无签到能力
+### 每日领取（每日 100 Credits）
 
-`dailyCheckin` 为 **false**：`/sash/api/v1/me/campaigns` 实测返回
-`{"showCampaign":false,"claimable":false,"campaigns":[]}`，且协议逆向中
-**未发现**签到动作端点（只有活动查询）。故面板不渲染「一键领取积分」按钮。
+```
+GET  https://openapi.qoder.sh/sash/api/v1/me/campaigns
+POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/{campaignId}/claim   ← body 空
+```
 
-> 积分能力矩阵（`plugin-src/client/credits-capabilities.js`）中 qoder 登记为
-> `{ balance: true, dailyCheckin: false }`。**两项能力彼此独立** ——
-> 不能因为「没有签到」就推断「也查不到余额」（这正是早期误判的形态）。
-> 该表键集合必须与客户端 `PROVIDERS` 相等，有单测锁死。
+活动**每日 10:00（UTC+8）刷新**，领取后 30 天有效。
+
+⚠️ **幂等判据是响应体的 `replayed`，不是 HTTP 状态码**：重复领取同样返回
+**200**，但 `replayed:true`、**不含 `benefit`**，且 `claimedAt` 是上一次领取的
+旧时间。只看状态码会把「今天已领」误报成「领取成功 +100」。
+
+⚠️ 只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'` ——
+实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
+
+> **这段协议是抓包解出来的**：早期依据 `/sash/api/v1/me/campaigns` 返回
+> `claimable:false` 判定「Qoder 无签到」，真相是**那天已领**。
 
 ### 凭据与续期
 

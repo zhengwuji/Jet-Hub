@@ -89,13 +89,21 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
     expect(creditsBlock).toContain('fetchQoderCreditBalance')
   })
 
-  it('credits.claimAll 不含 qoder（无签到能力）', () => {
-    // 签到能力仍为 false：`/sash/api/v1/me/campaigns` 实测 claimable:false，
-    // 且逆向未发现签到动作端点。claimAll 分支不应出现 qoder。
+  it('credits.claimAll 含 qoder 分支（2026-09-21 抓包解出领取端点）', () => {
+    // ⚠️ 早期该用例断言的是**相反**的结论（「不含 qoder」），依据是
+    // `/sash/api/v1/me/campaigns` 返回 `claimable:false`。真相是**那天已领** ——
+    // 活动每日 10:00（UTC+8）刷新。用 keylog 解密抓包拿到：
+    //   GET  /sash/api/v1/me/campaigns
+    //   POST /sash/api/v1/me/campaigns/{campaignId}/claim   （body 空）
+    // 幂等判据是响应体的 `replayed`（重复领取同样 HTTP 200）。
     const code = codeOnly(rpc)
     const start = code.indexOf("case 'credits.claimAll'")
     const end = code.indexOf("case 'credits.balances'")
     expect(start).toBeGreaterThan(-1)
-    expect(code.slice(start, end)).not.toContain('QODER.id')
+    const branch = code.slice(start, end)
+    expect(branch).toContain('QODER.id')
+    expect(branch).toContain('claimQoderDailyCheckin')
+    // Qoder 的领取流程自带活动列表查询 → 必须跳过外部预检，否则重复发一次 GET。
+    expect(branch).toContain('precheckStatus: false')
   })
 })

@@ -48,16 +48,21 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('workbuddy')).toBe(false)
   })
 
-  it('Qoder 支持余额但不支持签到（两者彼此独立）', () => {
-    // ⚠️ 早期把 qoder 误判为「两项皆无」：只按 `/api/` 前缀搜端点，
-    // 而余额挂在 `/sash/api/v2/me/usage`，且**只需 Bearer + Cosy-ClientType**
-    // （不需要模型列表那样的 WASM 签名）。实测该端点 200 且返回
-    // `addOnQuota.remaining: 100`。
-    // 签到仍为 false：`/sash/api/v1/me/campaigns` 实测 claimable:false，
-    // 且逆向未发现签到动作端点。
-    expect(CREDITS_CAPABILITIES.qoder).toEqual({ balance: true, dailyCheckin: false })
+  it('Qoder 两项能力都有（余额 + 每日领取）', () => {
+    // ⚠️ 早期把 qoder 误判为「两项皆无」，随后又误判为「有余额、无签到」，
+    // 两次都值得记录：
+    //
+    // ① 余额：只按 `/api/` 前缀搜端点，而它挂在 `/sash/api/v2/me/usage`，
+    //    且**只需 Bearer + Cosy-ClientType**（不需要模型列表那样的 WASM 签名）。
+    // ② 签到：曾依据 `/sash/api/v1/me/campaigns` 返回 `claimable:false,
+    //    campaigns:[]` 判定「没有签到端点」。真相是**那天已领** ——
+    //    活动每日 10:00（UTC+8）刷新。2026-09-21 用 keylog 解密抓包拿到了
+    //    领取端点（`POST …/{campaignId}/claim`）与幂等证据（`replayed:true`）。
+    //
+    // 教训：「某次实测没看到」不能推广成「不存在」。
+    expect(CREDITS_CAPABILITIES.qoder).toEqual({ balance: true, dailyCheckin: true })
     expect(supportsCreditBalance('qoder')).toBe(true)
-    expect(supportsDailyCheckin('qoder')).toBe(false)
+    expect(supportsDailyCheckin('qoder')).toBe(true)
   })
 
   it('未登记的 provider 默认不支持任何积分能力（默认关闭）', () => {

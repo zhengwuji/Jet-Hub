@@ -27,7 +27,7 @@ import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobste
 import type { LobsteraiCredential } from './lobsterai.js'
 import { isQoderRefreshable, qoderCredentialExpiresAtMs } from './qoder.js'
 import type { QoderCredential } from './qoder.js'
-import { fetchQoderCreditBalance } from './qoder-credits.js'
+import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
 import { isTraeRefreshable, traeCredentialExpiresAtMs } from './trae.js'
 import type { TraeCredential } from './trae.js'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
@@ -1007,6 +1007,21 @@ function registerJetHubEndpoints(
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         const accounts = await pool.listAccounts(req.provider)
+        if (req.provider === QODER.id) {
+          // Qoder 的领取流程**自带活动列表查询**（loadCampaigns → 逐个 claim），
+          // 故 precheckStatus: false 跳过外部那次检查 —— 否则会重复发一次 GET
+          // （与 LobsterAI 传 false 的理由同类）。
+          //
+          // ⚠️ Qoder 的幂等判据是响应体的 `replayed:true`（重复领取同样返回
+          // HTTP 200），已在 claimQoderCampaign 内部处理。
+          const value = await collectClaimResults<QoderCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            claim: (credential) => claimQoderDailyCheckin(credential, QODER),
+            precheckStatus: false,
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
         if (req.provider === 'codearts') {
           // CodeArts（华为云）走**签名**协议，与两个腾讯系 provider 都不同源：
           // 领取流程自带「账户类型 + 活动列表」预检（见 claimCodeArtsDailyCheckin），
