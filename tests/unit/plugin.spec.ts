@@ -119,64 +119,22 @@ afterEach(() => {
 })
 
 describe('plugin entry', () => {
-  it('registers the codeartsAuth service and the codearts-login command', () => {
+  it('registers the codeartsAuth service (no slash commands)', () => {
     const { ctx, commands } = makeContext()
     apply(ctx)
     expect(ctx.codeartsAuth).toBeInstanceOf(CodeArtsAuth)
-    expect(commands.definitions.map((d) => d.name)).toContain('codearts-login')
+    // CodeArts 不再注册任何斜杠命令：登录/状态/续期统一在 Jet Hub 设置页完成。
+    const names = commands.definitions.map((d) => d.name)
+    for (const removed of ['codearts-login', 'codearts-status', 'codearts-refresh', 'codearts-logout']) {
+      expect(names, removed).not.toContain(removed)
+    }
   })
 
-  it('command handler reports success with ref and expiry', async () => {
-    mockedRunOAuthFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    const login = commands.definitions.find((d) => d.name === 'codearts-login')!
-    const result = await login.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toMatchObject({ kind: 'success' })
-    expect((result as { text?: string }).text).toContain('CODEARTS_ACCESS_TOKEN')
-  })
-
-  it('command handler reports a failure as an error result', async () => {
-    mockedRunOAuthFlow.mockRejectedValue(new Error('CodeArts login timed out'))
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    const login = commands.definitions.find((d) => d.name === 'codearts-login')!
-    const result = await login.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toEqual({ kind: 'error', text: 'CodeArts login timed out' })
-  })
-
-  it('registers the codearts LLM route and the status/refresh commands', () => {
-    const { ctx, commands, llm } = makeContext()
+  it('注册 codearts LLM 路由（目录、适配器、设置 namespace）', () => {
+    const { ctx, llm } = makeContext()
     apply(ctx)
     expect(llm.providers).toContain('codearts')
     expect(llm.adapters).toContain('codearts')
-    const names = commands.definitions.map((d) => d.name)
-    expect(names).toContain('codearts-status')
-    expect(names).toContain('codearts-refresh')
-  })
-
-  it('codearts-status reports refreshability', async () => {
-    mockedRunOAuthFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    const status = commands.definitions.find((d) => d.name === 'codearts-status')!
-    const result = await status.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toMatchObject({ kind: 'success' })
   })
 
   it('stops the refresh scheduler when the plugin context is disposed', async () => {
@@ -248,17 +206,18 @@ describe('WorkBuddy provider 注册', () => {
     expect(ctx.settings.registeredNamespaces).toContain('llm-workbuddy')
   })
 
-  it('不注册任何 buddy/workbuddy 斜杠命令（入口在 Jet Hub 设置页）', () => {
+  it('不注册任何 provider 的斜杠命令（入口都在 Jet Hub 设置页）', () => {
     const ctx = createMockContext()
     apply(ctx as never)
     const names = ctx.commands.definitions.map((d) => d.name)
-    for (const removed of ['buddy-login', 'buddy-status', 'buddy-refresh', 'workbuddy-login', 'workbuddy-status']) {
+    for (const removed of [
+      'buddy-login', 'buddy-status', 'buddy-refresh', 'workbuddy-login', 'workbuddy-status',
+      // CodeArts 的三个命令也已移除：登录/状态/续期统一在 Jet Hub 完成，
+      // 六个 provider 的做法现在完全一致。
+      'codearts-login', 'codearts-status', 'codearts-refresh', 'codearts-logout',
+    ]) {
       expect(names, removed).not.toContain(removed)
     }
-    // codearts 的三个命令保留（CodeArts 没有 Jet Hub 登录入口的替代品）。
-    expect(names).toContain('codearts-login')
-    expect(names).toContain('codearts-status')
-    expect(names).toContain('codearts-refresh')
     // 命令名必须唯一，重复注册会让后注册的覆盖先注册的。
     expect(new Set(names).size).toBe(names.length)
   })

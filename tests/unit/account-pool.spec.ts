@@ -844,4 +844,75 @@ describe('AccountPool · TRAE 签到设备轮换代次', () => {
     expect(entry.traeCheckinDeviceGeneration).toBe(2)
     expect(entry.modelRateLimits?.['glm-5.2']).toBeGreaterThan(0)
   })
+
+  /**
+   * `hasLoggedInAccount` —— 「没有已登录账号就不显示该 provider 的模型」的判据。
+   *
+   * 必须由这个测试锁死三条语义（都容易被改错）：
+   * 1. 判据是**凭据能否解析**，不是「有没有条目」（`logout()` 只清凭据、留条目）；
+   * 2. **不看 `enabled`**（停用只影响自动选号，与是否已登录无关）；
+   * 3. CodeArts 的**单凭据 ref** 必须能作为额外判据传入。
+   */
+  describe('hasLoggedInAccount（模型目录门控判据）', () => {
+    it('没有账号条目时返回 false', async () => {
+      expect(await pool.hasLoggedInAccount('trae')).toBe(false)
+    })
+
+    it('有账号且凭据可解析时返回 true', async () => {
+      await pool.addAccount(makeTraeAccount())
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_T1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+    })
+
+    it('⚠️ 有条目但凭据读不到（已登出）时返回 false', async () => {
+      // `Auth.logout()` 只 unset 凭据、**保留账号条目**，故不能只看「有条目」，
+      // 否则用户登出后模型仍然显示，门控形同虚设。
+      await pool.addAccount(makeTraeAccount())
+      // 故意不写凭据（等价于 logout 之后的状态）
+      expect(await pool.hasLoggedInAccount('trae')).toBe(false)
+    })
+
+    it('⚠️ 账号被停用（enabled=false）但凭据仍在时**仍返回 true**', async () => {
+      // 停用只影响「自动选号」，不代表「未登录」。若这里返回 false，
+      // 把所有账号停用的用户会发现整个 provider 的模型凭空消失 ——
+      // 与「续期只看 refreshable、不看 enabled」是同一条既有约定。
+      await pool.addAccount(makeTraeAccount({ enabled: false }))
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_T1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+    })
+
+    it('只统计本 provider 的账号（不串号）', async () => {
+      await pool.addAccount(makeTraeAccount())
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_T1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+      expect(await pool.hasLoggedInAccount('lobsterai')).toBe(false)
+    })
+
+    it('多账号时任一凭据可用即为 true', async () => {
+      await pool.addAccount(makeTraeAccount())
+      await pool.addAccount(makeTraeAccount({ id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' }))
+      // 只有第二个账号的凭据可用
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_2'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+    })
+
+    it('⚠️ 只认账号池条目，不再有「单凭据 ref」例外', async () => {
+      // CodeArts 早期的单凭据模式（固定 ref `CODEARTS_ACCESS_TOKEN`）已移除：
+      // 即便该 ref 下有凭据，账号池为空时也应返回 false —— 六个 provider 判据一致。
+      await ctx.credentials.set(credentialRef('CODEARTS_ACCESS_TOKEN'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('codearts')).toBe(false)
+      // 在账号池里登记后才是「已登录」。
+      await pool.addAccount({
+        id: 'codearts-1',
+        provider: 'codearts',
+        nickname: 'ca',
+        enabled: true,
+        credentialRef: 'CODEARTS_ACCOUNT_1',
+        createdAt: Date.now(),
+        refreshable: true,
+      })
+      await ctx.credentials.set(credentialRef('CODEARTS_ACCOUNT_1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('codearts')).toBe(true)
+    })
+  })
 })

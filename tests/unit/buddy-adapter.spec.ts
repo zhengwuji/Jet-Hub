@@ -2031,3 +2031,40 @@ describe('BuddyAdapter 模型黑名单', () => {
     expect(resolved.context?.contextWindow).toBe(1_000_000)
   })
 })
+
+// ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──
+//
+// DSH 的 `buildModelCatalog` 显式 `.filter(group => group.models.length > 0)`，
+// 故返回空数组即让整个 provider 分组消失（用户需求：减少模型选择列表臃肿）。
+describe('BuddyAdapter 目录门控（无已登录账号时隐藏）', () => {
+  /** 账号池替身：报告是否有已登录账号。 */
+  function poolWithLogin(loggedIn: boolean) {
+    return {
+      disabledModelsFor: () => new Set<string>(),
+      hasLoggedInAccount: async () => loggedIn,
+    } as never
+  }
+
+  it('没有已登录账号 → 返回空数组', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithLogin(false) })
+    expect(await adapter.listModels('buddy')).toEqual([])
+  })
+
+  it('有已登录账号 → 正常返回目录', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithLogin(true) })
+    expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
+  })
+
+  it('accountPool 缺失时保守放行（判定不可用 ≠ 无账号）', async () => {
+    const adapter = makeAdapter()
+    expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
+  })
+
+  it('未实现 hasLoggedInAccount 的替身同样保守放行', async () => {
+    // 门控是展示优化而非安全边界：判定不可用时宁多勿少。
+    const adapter = makeAdapter({
+      accountPool: { disabledModelsFor: () => new Set<string>() } as never,
+    })
+    expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
+  })
+})

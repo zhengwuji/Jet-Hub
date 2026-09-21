@@ -451,6 +451,39 @@ export class AccountPool {
   }
 
   /**
+   * 该 provider 是否**至少有一个已登录（凭据可用）的账号**。
+   *
+   * 供适配器的 `listModels` 做门控：没有已登录账号时返回空目录，让 DSH 的
+   * `buildModelCatalog` 把整个 provider 分组隐藏（它显式
+   * `.filter(group => group.models.length > 0)`），从而显著减少模型选择
+   * 列表里用不上的条目（用户需求：「没有已登录账号就不显示该供应商的所有
+   * 模型」）。
+   *
+   * ## 为什么判据是「凭据可解析」而不是「有条目」
+   *
+   * 1. **`logout()` 只清凭据、保留账号条目**（删除条目是另一条路径
+   *    `removeAccount`）。若只看「有没有条目」，用户登出后模型仍会显示，
+   *    门控形同虚设。
+   * 2. **不看 `enabled`**：停用只应影响「自动选号」，与「是否已登录」无关。
+   *    这与续期调度器「只按 `refreshable` 过滤、不看 `enabled`」是同一条
+   *    既有约定（停用账号同样参与积分领取），故这里保持一致。
+   *
+   * ⚠️ **这是异步的**：需要逐个解析凭据。但只解析到**第一个可用账号**即返回
+   * （短路），多账号场景下通常第一次就命中。
+   *
+   * ⚠️ **本方法只用于「目录展示」的门控**，绝不能用于路由判定 ——
+   * DSH 约定 `listModels` 结果仅供参考，隐藏目录不等于拒绝请求
+   * （被隐藏的模型仍可 `resolveModel` / 正常收发）。
+   */
+  async hasLoggedInAccount(provider: string): Promise<boolean> {
+    for (const entry of this.listAccountsByProvider(provider)) {
+      const credential = await this.resolveCredentialByRef(entry.credentialRef)
+      if (credential !== undefined) return true
+    }
+    return false
+  }
+
+  /**
    * 按账号 id 解析凭据（**不检查 enabled**）。
    *
    * 限流重测必须能对已停用账号发请求（用户明确要求"停用的账号也能发送"），
@@ -669,4 +702,70 @@ export class AccountPool {
     const value = entry?.traeCheckinDeviceGeneration
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
   }
+}
+
+/**
+ * `listModels` 的门控：**该 provider 是否应在模型目录中展示**。
+ *
+ * ## 需求来源
+ *
+ * 「如果某供应商没有已登录的账号，就不显示该供应商的所有模型 —— 这样对大多数
+ * 用户来说模型选择选项卡臃肿的问题能改善很多。」
+ *
+ * ## 为什么可行：DSH 原生支持「空目录即隐藏」
+ *
+ * `dsh-api-session-controller` 的 `buildModelCatalog` 显式做了
+ * `.filter(group => group.models.length > 0)`（注释：*"successful non-empty
+ * provider groups"*）。因此适配器返回 `[]` 就能让整个 provider 分组从模型
+ * 选择器中消失 —— **无需任何前端改动**。
+ *
+ * ⚠️ **必须返回空数组，不能抛错**：`buildModelCatalog` 的 `catch` 会把抛错
+ * 归入 `failures`，界面上会多出一条 provider 报错，比「不显示」更糟。
+ *
+ * ⚠️ **不影响路由**：`catalog.routableProviders` 由 `listProviders()` 单独
+ * 生成（不经过该 filter），且 DSH 明确约定 *"Catalog membership is advisory
+ * and never changes routing"* —— 隐藏目录不等于拒绝请求，已持久化的模型
+ * 仍能 `resolveModel` / 正常收发。
+ *
+ * ## 判定语义
+ *
+ * - **默认开启**（`DSH_HIDE_MODELS_WITHOUT_ACCOUNT=0` 可关）：与
+ *   `DSH_TRAE_MAX_MODE` 同为「默认开、显式假值才关」的语义，故单列解析函数。
+ * - `accountPool` 缺失（headless / CLI / 单测）或替身未实现
+ *   `hasLoggedInAccount` 时**视为可见** —— 门控是**展示优化而非安全边界**，
+ *   判定不可用时宁多勿少（否则会让整个 provider 的模型凭空消失）。
+ * - **六个 provider 判据完全一致**：都只看账号池。早期 CodeArts 有一个「单凭据
+ *   例外」（额外认固定 ref `CODEARTS_ACCESS_TOKEN`），该模式已移除，故
+ *   `extraCredentialRefs` 参数也一并删除，避免留下无人使用的分支。
+ *
+ * @param accountPool - 适配器的账号池（可能为 undefined）。
+ * @param provider - provider id。
+ */
+export async function providerCatalogVisible(
+  accountPool: AccountPool | undefined,
+  provider: string,
+): Promise<boolean> {
+  if (!resolveHideWithoutAccountFlag(process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT)) return true
+  if (accountPool === undefined) return true
+  // 能力检测：单测替身通常只 mock 了 disabledModelsFor 等少量方法。
+  if (typeof accountPool.hasLoggedInAccount !== 'function') return true
+  try {
+    return await accountPool.hasLoggedInAccount(provider)
+  } catch {
+    // 读凭据异常（存储损坏等）时保守展示：宁可多显示，也不要让用户
+    // 因为一次读取抖动而「所有模型都不见了」且无从排查。
+    return true
+  }
+}
+
+/**
+ * 解析 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`；**默认开启**。
+ *
+ * 只有显式假值（`0` / `false` / `no` / `off`）才关闭。与 `isTruthyFlag`
+ * 的「默认关」语义相反，故单列一个函数，**不要混用**。
+ */
+function resolveHideWithoutAccountFlag(raw: string | undefined): boolean {
+  if (raw === undefined) return true
+  const value = raw.trim().toLowerCase()
+  return !(value === '0' || value === 'false' || value === 'no' || value === 'off')
 }

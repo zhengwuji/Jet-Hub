@@ -195,6 +195,96 @@ describe('TRAE 适配器 · listModels', () => {
   })
 
   /**
+   * 模型目录门控：**没有已登录账号就不显示该 provider 的所有模型**。
+   *
+   * DSH 的 `buildModelCatalog` 显式 `.filter(group => group.models.length > 0)`，
+   * 故 adapter 返回 `[]` 即可让整个 provider 分组从模型选择器消失。
+   */
+  describe('无已登录账号时隐藏整个 provider 目录', () => {
+    /** 复刻真实账号池的替身（带 hasLoggedInAccount）。 */
+    function poolWithLogin(loggedIn: boolean) {
+      return {
+        disabledModelsFor: () => new Set<string>(),
+        hasLoggedInAccount: async () => loggedIn,
+      }
+    }
+
+    it('没有已登录账号 → listModels 返回空数组（分组被隐藏）', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'a', name: 'A' }],
+        accountPool: poolWithLogin(false),
+      })
+      expect(await adapter.listModels('trae')).toEqual([])
+    })
+
+    it('有已登录账号 → 正常返回目录', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'a', name: 'A' }],
+        accountPool: poolWithLogin(true),
+      })
+      expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['a'])
+    })
+
+    it('⚠️ 无账号时**不发远端目录请求**（门控在 ensureRemoteModels 之前）', async () => {
+      // 省掉无谓 HTTP；同时避免冷缓存路径下的额外延迟。
+      const fetcher = vi.fn(async () => {
+        throw new Error('本用例不应发起任何请求')
+      })
+      const adapter = new TraeAdapter({
+        credentialRef: 'TRAE_ACCESS_TOKEN' as never,
+        resolveCredential: async () => makeCredential(),
+        refresh: vi.fn(async () => {}),
+        fetchImpl: fetcher as unknown as typeof fetch,
+        fetchRemoteModels: fetcher as never,
+        accountPool: poolWithLogin(false) as never,
+        product: TRAE,
+      })
+      expect(await adapter.listModels('trae')).toEqual([])
+      expect(fetcher).not.toHaveBeenCalled()
+    })
+
+    it('⚠️ 返回空数组而**不是抛错**（抛错会变成 catalog 的 failure）', async () => {
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'a', name: 'A' }],
+        accountPool: poolWithLogin(false),
+      })
+      await expect(adapter.listModels('trae')).resolves.toEqual([])
+    })
+
+    it('⚠️ 门控只影响 listModels；listAllModels（设置页）不受影响', async () => {
+      // 设置页必须仍能列出全部模型 —— 否则用户关掉模型后连开关都看不到，
+      // 更无法重新打开（这是此前修过的真实缺陷）。
+      //
+      // ⚠️ `listAllModels` 是**同步**的、不自己拉远端目录（由 `listModels` 或
+      // `resolveModel` 触发 `ensureRemoteModels`），故这里先用 `resolveModel`
+      // 把远端目录加载进来，再断言它不受门控影响。
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'a', name: 'A' }],
+        accountPool: poolWithLogin(false),
+      })
+      // 门控生效：对话框目录为空
+      expect(await adapter.listModels('trae')).toEqual([])
+      // 但设置页仍能看到它（模拟真实调用顺序：先 resolveModel 加载目录）
+      await adapter.resolveModel('trae', 'a')
+      expect(adapter.listAllModels().map((m) => m.id)).toEqual(['a'])
+    })
+
+    it('⚠️ 替身未实现 hasLoggedInAccount 时保守放行（门控非安全边界）', async () => {
+      // 能力检测：判定不可用时宁多勿少，否则整个 provider 的模型会凭空消失。
+      const { adapter } = makeAdapter({
+        remoteModels: [{ id: 'a', name: 'A' }],
+        accountPool: { disabledModelsFor: () => new Set<string>() },
+      })
+      expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['a'])
+    })
+
+    it('未提供 accountPool 时保守放行（headless / CLI 场景）', async () => {
+      const { adapter } = makeAdapter({ remoteModels: [{ id: 'a', name: 'A' }] })
+      expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['a'])
+    })
+  })
+
+  /**
    * 消耗倍率（`display_contact_config.consumption_rate.data.rate`）。
    *
    * 项目约定：倍率**必须拼进 `name`** —— composer 的模型切换菜单只渲染 `name`，

@@ -48,13 +48,27 @@ function poolWithDisabled(provider: string, ids: string[]) {
   }
 }
 
+/**
+ * 目录门控替身。
+ *
+ * `loggedInRefs` = 账号池里**凭据可解析**的 ref（空数组表示没有已登录账号）。
+ * 替身只关心「账号池里有没有可用凭据」这一件事 —— 单凭据例外已移除，
+ * 故不再需要额外 ref 参数。
+ */
+function poolWithCredentials(loggedInRefs: readonly string[]) {
+  const pool = new Set(loggedInRefs)
+  return {
+    disabledModelsFor: () => new Set<string>(),
+    hasLoggedInAccount: async (_provider: string) => pool.size > 0,
+  }
+}
+
 describe('CodeArtsAdapter', () => {
   it('providerInfo identifies the codearts route', () => {
     expect(makeAdapter().providerInfo('codearts')).toMatchObject({ id: 'codearts', name: 'CodeArts Agent' })
   })
 
-  it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {
-    // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
+  it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {    // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
     // openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
     // 后端 /v1/default/models 下发的 model_id 为全小写。
     // DeepSeek V4（对齐 deveco-code 62834ff6）：CodeArts Agent 模型列表新增
@@ -699,6 +713,34 @@ describe('CodeArtsAdapter', () => {
     const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
     expect(resolved.id).toBe('GLM-5.2')
     expect(resolved.context?.contextWindow).toBe(202752)
+  })
+
+  // ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──
+  //
+  // ⚠️ **CodeArts 不再有「单凭据模式」例外**：登录入口只有 Jet Hub 设置页，
+  // 凭据一律写账号池条目（`CODEARTS_ACCOUNT_XXX`）。固定的
+  // `CODEARTS_ACCESS_TOKEN` 不会再被写入或读取，判据与其余五个 provider 一致。
+  describe('无已登录账号时隐藏整个 provider 目录', () => {
+    it('没有已登录账号 → 返回空数组', async () => {
+      const adapter = makeAdapter({ accountPool: poolWithCredentials([]) })
+      expect(await adapter.listModels('codearts')).toEqual([])
+    })
+
+    it('⚠️ 单凭据 ref 有值但账号池为空 → 仍隐藏（单凭据模式已移除）', async () => {
+      // 这是本次变更的核心断言：老用户若只用固定 ref 登录过，模型会消失、
+      // 需要在 Jet Hub 重新登录一次（用户已确认接受该行为）。
+      const adapter = makeAdapter({ accountPool: poolWithCredentials([]) })
+      expect(await adapter.listModels('codearts')).toEqual([])
+    })
+
+    it('账号池里有已登录账号 → 正常返回目录', async () => {
+      const adapter = makeAdapter({ accountPool: poolWithCredentials(['CODEARTS_ACCOUNT_1']) })
+      expect((await adapter.listModels('codearts')).map((m) => m.id)).toContain('GLM-5.2')
+    })
+
+    it('未提供 accountPool 时保守放行（headless / CLI 场景）', async () => {
+      expect((await makeAdapter().listModels('codearts')).length).toBeGreaterThan(0)
+    })
   })
 
   it('switches deepseek-v4 to DSML tool mode: no tools field, schema injected into system', async () => {

@@ -1,5 +1,4 @@
 import type { Context } from '@deepseek-ai/cordis'
-import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import { registerCodeArtsLlm } from './llm-adapter.js'
@@ -118,7 +117,7 @@ export function makeReadImage(ctx: Context) {
   }
 }
 
-/** 注册 codeartsAuth 服务、命令以及 codearts LLM 路由。 */
+/** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
 export function apply(ctx: Context): void {
   // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
   // 六个 namespace 分别对应：codearts 路由、CodeBuddy（buddy）路由、
@@ -147,72 +146,32 @@ export function apply(ctx: Context): void {
     ctx.logger.warn(`[jet-hub] 清理 WorkBuddy 旧版账号失败：${String(error)}`)
   })
 
-  ctx.commands.register({
-    name: 'codearts-login',
-    description: '通过浏览器 OAuth 登录华为云 CodeArts',
-    handler: async (): Promise<CommandResult> => {
-      try {
-        const result = await service.login()
-        return {
-          kind: 'success',
-          text: `CodeArts 登录完成。凭据已存储于 ${String(result.ref)}；过期时间 ${new Date(result.expires).toISOString()}。`,
-        }
-      } catch (error) {
-        return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
-      }
-    },
-  })
-  ctx.commands.register({
-    name: 'codearts-status',
-    description: '显示 CodeArts 登录状态及刷新能力',
-    handler: async (): Promise<CommandResult> => {
-      const status = await service.status()
-      return {
-        kind: 'success',
-        text: [
-          `已配置: ${status.configured}`,
-          ...status.source === undefined ? [] : [`来源: ${status.source}`],
-          ...status.expiresAt === undefined ? [] : [`过期时间: ${new Date(status.expiresAt).toISOString()}`],
-          `可刷新: ${status.refreshable}`,
-          ...status.refreshError === undefined ? [] : [`刷新错误: ${status.refreshError}`],
-        ].join('\n'),
-      }
-    },
-  })
-  ctx.commands.register({
-    name: 'codearts-refresh',
-    description: '静默刷新 CodeArts 凭据',
-    handler: async (): Promise<CommandResult> => {
-      try {
-        await service.refresh()
-        const status = await service.status()
-        return {
-          kind: 'success',
-          text: `CodeArts 凭据已刷新；过期时间 ${status.expiresAt === undefined ? '未知' : new Date(status.expiresAt).toISOString()}。`,
-        }
-      } catch (error) {
-        return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
-      }
-    },
-  })
+  // ⚠️ **CodeArts 不注册任何斜杠命令**（`codearts-login` / `codearts-status` /
+  // `codearts-refresh` 三个已删除）：登录、状态与续期统一在 Jet Hub 设置页完成，
+  // 与 buddy / workbuddy / lobsterai / qoder / trae 的既有做法一致。
   const codearts = registerCodeArtsLlm(ctx, {
     credentialRef: credentialRef(CODEARTS_CREDENTIAL_REF),
     resolveCredential: async () => {
-      // 优先使用账号池获取可用账号，回退到单凭据解析
-      if (pool) {
-        const available = await pool.getAvailableAccount('codearts', '')
-        if (available) return available.credential as CodeArtsCredential
-      }
-      const resolved = await ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as CodeArtsCredential
-      } catch {
-        return undefined
-      }
+      // CodeArts **只认账号池**，与其余五个 provider 一致。
+      //
+      // ⚠️ 早期它额外支持「单凭据模式」（`CODEARTS_ACCESS_TOKEN`）：登录后把凭据
+      // 写到那个固定 ref，适配器在账号池取不到时回退去读它。该模式**已移除** ——
+      // 登录入口只有 Jet Hub 设置页，凭据一律写入 `CODEARTS_ACCOUNT_XXX`，
+      // 固定的 `CODEARTS_ACCESS_TOKEN` 不会再被写入或读取。
+      //
+      // 这里仍保留 `credentialRef` 选项，仅为满足适配器契约与报错文案
+      // （其余 provider 同样传各自的默认 ref，但都不再作为回退来源）。
+      const available = await pool.getAvailableAccount('codearts', '')
+      return available?.credential as CodeArtsCredential | undefined
     },
-    refresh: () => service.refresh(),
-    fetchRemoteModels: () => service.refreshModels(),
+    // 续期按**账号池里的具体账号**走：`refreshAccountCredential` 读写的是
+    // `CODEARTS_ACCOUNT_XXX`，而旧的 `service.refresh()` 读写的是已废弃的
+    // 单凭据 ref —— 那会刷到另一个（不存在的）凭据上。
+    refresh: async () => {
+      const available = await pool.getAvailableAccount('codearts', '')
+      if (available) await service.refreshAccountCredential(available.entry.credentialRef)
+    },
+    fetchRemoteModels: () => service.refreshModels(pool),
     accountPool: pool,
   })
 

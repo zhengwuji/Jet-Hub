@@ -89,6 +89,30 @@ describe('QoderAdapter 模型目录', () => {
     expect(models.some((m) => m.id === 'dmodel')).toBe(true)
   })
 
+  // 目录门控：没有已登录账号时不显示该 provider 的任何模型。
+  // 见 `providerCatalogVisible`（src/account-pool.ts）。
+  describe('无已登录账号时隐藏整个 provider 目录', () => {
+    it('没有已登录账号 → 返回空数组', async () => {
+      const adapter = makeAdapter({
+        accountPool: {
+          disabledModelsFor: () => new Set<string>(),
+          hasLoggedInAccount: async () => false,
+        } as never,
+      })
+      expect(await adapter.listModels('qoder')).toEqual([])
+    })
+
+    it('有已登录账号 → 正常返回目录', async () => {
+      const adapter = makeAdapter({
+        accountPool: {
+          disabledModelsFor: () => new Set<string>(),
+          hasLoggedInAccount: async () => true,
+        } as never,
+      })
+      expect((await adapter.listModels('qoder')).length).toBe(QODER.fallbackModels.length)
+    })
+  })
+
   it('providerInfo 返回 qoder', () => {
     expect(makeAdapter().providerInfo('qoder')).toEqual({ id: 'qoder', name: QODER.displayName })
   })

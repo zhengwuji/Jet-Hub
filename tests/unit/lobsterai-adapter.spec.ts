@@ -327,6 +327,34 @@ describe('LobsteraiAdapter 模型目录', () => {
     expect(models).toEqual([{ provider: 'lobsterai', id: 'remote-only', name: 'Remote Only', inputModalities: ['text'] }])
   })
 
+  // ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──
+  //
+  // DSH 的 `buildModelCatalog` 显式 `.filter(group => group.models.length > 0)`，
+  // 故返回空数组即让整个 provider 分组消失（减少模型选择列表臃肿）。
+  describe('目录门控（无已登录账号时隐藏）', () => {
+    it('没有已登录账号 → 返回空数组', async () => {
+      const { adapter } = makeAdapter(() => textSse('x'), {
+        fetchRemoteModels: async () => [{ id: 'm', name: 'M' }],
+        accountPool: {
+          disabledModelsFor: () => new Set<string>(),
+          hasLoggedInAccount: async () => false,
+        } as never,
+      })
+      expect(await adapter.listModels('lobsterai')).toEqual([])
+    })
+
+    it('有已登录账号 → 正常返回目录', async () => {
+      const { adapter } = makeAdapter(() => textSse('x'), {
+        fetchRemoteModels: async () => [{ id: 'm', name: 'M' }],
+        accountPool: {
+          disabledModelsFor: () => new Set<string>(),
+          hasLoggedInAccount: async () => true,
+        } as never,
+      })
+      expect((await adapter.listModels('lobsterai')).map((m) => m.id)).toEqual(['m'])
+    })
+  })
+
   // 计费倍率展示。⚠️ **必须写进 `name`，不是 `description`**：composer 的模型
   // 切换菜单只渲染 `name`（ModelSelect 的 `children: model.name`），
   // `description` 仅用于 `/model` 弹窗。用户报障「消耗倍率没有显示在切换模型

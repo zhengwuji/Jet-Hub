@@ -158,11 +158,26 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`traeAuth`）均遵循统一接口：
 
 - `login(options?)` — 执行浏览器登录流程
-- `status()` — 查询凭据状态（configured、source、expiresAt、refreshable）
-- `refresh()` — 手动静默续期凭据
-- `logout()` — 清除凭据并停止续期定时器
+- `startLogin(options?)` — 两步式登录（先返回 loginUrl，Jet Hub 据此弹窗）
+- `refreshAccountCredential(refName)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）
+- `refreshAll(pool)` — 批量续期全部账号（定时调度器）
 
-另有按凭据 ref 续期**指定账号**的 `refreshAccountCredential(refName)` —— 供 Jet Hub 账号卡片的「刷新」按钮使用。**不要**用 `refresh()` 去刷账号池里的账号：它读写的是该 provider 的**默认单凭据 ref**（如 `BUDDY_ACCESS_TOKEN`），而账号卡片对应的是 `BUDDY_ACCOUNT_XXX`，会刷到另一个凭据上。
+⚠️ **不注册任何斜杠命令**：六个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
+
+⚠️ **CodeArts 只支持账号池，单凭据模式已移除**（用户要求）：
+
+- 凭据一律存 `CODEARTS_ACCOUNT_XXX`；固定的 `CODEARTS_ACCESS_TOKEN`
+  **不再被写入或读取**（常量保留仅为兼容 `login`/`startLogin` 的 `refName` 缺省值）。
+- 只服务于单凭据路径的方法**已删除**：`status()` / `refresh()` / `logout()` /
+  `scheduleRefresh()` / `scheduleModelRefresh()`（后两者当时就没有调用方）。
+  `refreshModels()` **签名改为接收 `pool`** —— 它原先直接读固定 ref，
+  移除单凭据后会恒返回空列表。
+- `codearts-login` / `codearts-status` / `codearts-refresh` 三个命令**已删除**
+  （注意代码里**从来没有** `codearts-logout` 命令，logout 只是服务方法）。
+- 六个 provider 的门控判据因此**完全一致**：都只看账号池，
+  `providerCatalogVisible` 的 `extraCredentialRefs` 参数已随之删除。
+- 老用户影响：若此前只用固定 ref 登录过，模型列表会变空，需在 Jet Hub 重新登录一次
+  （用户已确认接受该行为，不做自动迁移）。
 
 ### ⚠️ 续期不得按 `enabled` 过滤
 
@@ -490,6 +505,70 @@ IDE 按 name 归并，我们按 id 列出。二者是**不同区域的独立计�
 ⚠️ **同名消歧必须基于未过滤的全量集合**（`displayNameFor(model, source)` 而非
 `listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
 名字随开关跳变。
+
+## 目录门控：没有已登录账号就隐藏整个 provider
+
+**需求**：「如果某供应商没有已登录的账号，就不显示该供应商的所有模型，这样对
+大多数用户来说模型选择选项卡臃肿的问题能改善很多。」
+
+### 机制：DSH 原生支持「空目录即隐藏」，无需前端改动
+
+`dsh-api-session-controller` 的 `buildModelCatalog` 显式做了
+
+```js
+groups: catalog.flatMap(...).filter(group => group.models.length > 0)
+```
+
+（注释：*"successful non-empty provider groups"*）。所以适配器 `listModels`
+返回 `[]` 就能让整个 provider 分组从模型选择器消失。
+
+两点**必须遵守**：
+
+1. ⚠️ **返回空数组，绝不抛错** —— 抛错会被 `catch` 归入 `failures`，界面上
+   反而多出一条 provider 报错，比「不显示」更糟；
+2. ⚠️ **不影响路由** —— `routableProviders` 由 `listProviders()` 单独生成
+   （不经该 filter），且 DSH 明确约定 *"Catalog membership is advisory and
+   never changes routing"*。隐藏目录 ≠ 拒绝请求，已持久化的模型仍可
+   `resolveModel` / 正常收发（与黑名单同一契约）。
+
+### 判据：凭据能否解析（**不是**「有没有账号条目」）
+
+`AccountPool.hasLoggedInAccount(provider)`，由
+`providerCatalogVisible()`（同文件）包装。两条语义都容易被改错：
+
+| 语义 | 原因 |
+|---|---|
+| 判据是**凭据可解析** | 服务层的 `logout()` **只 unset 凭据、保留账号条目**（删条目是另一条路径 `removeAccount`）。若只看「有条目」，用户登出后模型仍然显示，门控形同虚设 |
+| **不看 `enabled`** | 停用只影响「自动选号」，与「是否已登录」无关。若过滤 `enabled`，把所有账号停用的用户会发现整个 provider 的模型凭空消失。与「续期只看 `refreshable`、不看 `enabled`」是同一条既有约定 |
+
+⚠️ **六个 provider 判据完全一致，没有例外**：早期 CodeArts 曾额外接受固定单凭据
+ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs` 参数一并
+删除。老用户若只用固定 ref 登录过，模型列表会变空 —— 需在 Jet Hub 重新登录一次
+（用户已确认接受，不做自动迁移）。
+
+### 保守放行的三种情形（门控是**展示优化**，不是安全边界）
+
+1. `accountPool === undefined`（headless / CLI / 单测）；
+2. 替身未实现 `hasLoggedInAccount`（**能力检测** —— 大量既有单测只 mock 了
+   `disabledModelsFor`）；
+3. 读凭据抛异常（存储损坏等）。
+
+三种都返回「可见」：判定不可用时**宁多勿少**，否则会让用户看到「所有模型凭空
+消失」且无从排查。
+
+### 开关与落点
+
+- `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` —— **默认开启**，只有显式假值
+  （`0`/`false`/`no`/`off`）才关闭。与 `DSH_TRAE_MAX_MODE` 同为「默认开」语义，
+  故用**独立的** `resolveHideWithoutAccountFlag`，不要与 `isTruthyFlag`
+  （「默认关」）混用。
+- 门控放在各 `listModels` 的 **`ensureRemoteModels()` 之前**：无账号时连远端
+  目录都不必拉（省一次无谓 HTTP）。
+- ⚠️ **门控只加在 `listModels`，`listAllModels`（设置页）不受影响** ——
+  否则用户关掉模型后连开关都看不到，更无法重新打开（这是此前修过的真实缺陷）。
+- 六个适配器的 `listModels` 都要加（`llm-adapter` / `buddy` / `lobsterai` /
+  `qoder` / `trae`）。`buddy` 与 `workbuddy` 共用同一个适配器类，但
+  `this.product.id` 不同 → 两者按各自 provider 独立判定，互不影响。
 
 ## 常见开发任务
 

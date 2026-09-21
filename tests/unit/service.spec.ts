@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
-import { RefreshTokenExpiredError, exchangeRefreshToken, generateDpopKeyPair, type TokenResponse } from '../../src/oauth.js'
+import { RefreshTokenExpiredError, exchangeRefreshToken, generateDpopKeyPair } from '../../src/oauth.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from '../../src/service.js'
 
 vi.mock('../../src/login.js', () => ({
@@ -22,7 +22,7 @@ const mockedRunLoginFlow = vi.mocked(runLoginFlow)
 const mockedRunOAuthFlow = vi.mocked(runOAuthFlow)
 const mockedExchangeRefreshToken = vi.mocked(exchangeRefreshToken)
 
-/** 所有已创建的 service；afterEach 统一 stop()，避免登录/刷新后 armed 的真实定时器泄漏。 */
+/** 所有已创建的 service；afterEach 统一 stop()。 */
 const services: CodeArtsAuth[] = []
 
 /** 最小化的内存凭据提供者，形状与 ctx.credentials 一致。 */
@@ -46,11 +46,32 @@ function makeContext(): { ctx: Context; credentials: FakeCredentials } {
   return { ctx, credentials }
 }
 
-/** 新建并登记一个 service，保证 afterEach 能 stop() 掉它持有的定时器。 */
+/** 新建并登记一个 service，保证 afterEach 能 stop() 掉它。 */
 function newService(ctx: Context, options: { fetcher?: typeof fetch } = {}): CodeArtsAuth {
   const service = new CodeArtsAuth(ctx, options)
   services.push(service)
   return service
+}
+
+/**
+ * 账号池替身：只实现 service 用到的两个方法
+ * （`listAccountsByProvider` 给 refreshModels 取凭据、`listAccounts` 给 refreshAll）。
+ */
+function makePool(entries: Array<{ id: string; credentialRef: string; refreshable?: boolean }>) {
+  const accounts = entries.map(e => ({
+    id: e.id,
+    provider: 'codearts',
+    nickname: e.id,
+    enabled: true,
+    credentialRef: e.credentialRef,
+    createdAt: 0,
+    refreshable: e.refreshable ?? true,
+  }))
+  return {
+    listAccountsByProvider: () => accounts,
+    listAccounts: async () => accounts,
+    updateAccount: vi.fn(async () => {}),
+  } as never
 }
 
 /** 永不打真实网络的 stub fetch：即使定时器意外触发，刷新也只走 mock。 */
@@ -79,14 +100,14 @@ describe('CodeArtsAuth', () => {
     expect(ctx.codeartsAuth.name).toBe('codeartsAuth')
   })
 
-  it('login stores the flow access value under the fixed ref', async () => {
+  it('login stores the flow access value under the given ref', async () => {
     mockedRunOAuthFlow.mockResolvedValue({ access: 'json-credential', expires: 1234, loginUrl: 'https://login' })
     const { ctx, credentials } = makeContext()
     const service = newService(ctx, { fetcher: mockFetcher })
-    const result = await service.login()
-    expect(await credentials.resolve(CODEARTS_CREDENTIAL_REF)).toEqual({ value: 'json-credential', source: 'fake' })
+    const result = await service.login({ refName: 'CODEARTS_ACCOUNT_1' })
+    expect(await credentials.resolve('CODEARTS_ACCOUNT_1')).toEqual({ value: 'json-credential', source: 'fake' })
     expect(result).toMatchObject({ access: 'json-credential', expires: 1234, loginUrl: 'https://login' })
-    expect(String(result.ref)).toBe(CODEARTS_CREDENTIAL_REF)
+    expect(String(result.ref)).toBe('CODEARTS_ACCOUNT_1')
   })
 
   it('login forwards flow options and propagates failures', async () => {
@@ -97,39 +118,36 @@ describe('CodeArtsAuth', () => {
     expect(mockedRunOAuthFlow).toHaveBeenCalledWith({ maxAttempts: 1 })
   })
 
-  it('status reports unconfigured without a stored value', async () => {
-    const { ctx } = makeContext()
-    const service = newService(ctx)
-    expect(await service.status()).toEqual({ configured: false, refreshable: false })
-  })
-
-  it('status parses expires_at from the stored JSON credential', async () => {
-    const { ctx, credentials } = makeContext()
-    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
-      access_key_id: 'AK', expires_at: '2026-08-15T00:00:00Z', refresh_token: 'RT',
-    }))
-    const service = newService(ctx)
-    expect(await service.status()).toEqual({
-      configured: true,
-      source: 'fake',
-      expiresAt: Date.parse('2026-08-15T00:00:00Z'),
-      refreshable: true,
+  it('login registers the account into the pool when accountId/pool are given', async () => {
+    mockedRunOAuthFlow.mockResolvedValue({
+      access: JSON.stringify({
+        access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+        expires_at: '2026-08-15T00:00:00Z', refresh_token: 'RT', user_name: 'someone',
+      }),
+      expires: Date.parse('2026-08-15T00:00:00Z'),
+      loginUrl: 'https://login',
     })
+    const { ctx } = makeContext()
+    const addAccount = vi.fn(async () => {})
+    const pool = { addAccount } as never
+    const service = newService(ctx, { fetcher: mockFetcher })
+    await service.login({ refName: 'CODEARTS_ACCOUNT_1', accountId: 'codearts-1', pool })
+    expect(addAccount).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'codearts-1',
+      provider: 'codearts',
+      credentialRef: 'CODEARTS_ACCOUNT_1',
+      refreshable: true,
+    }))
   })
 
-  it('status tolerates a raw-token credential without expiry metadata', async () => {
+  it('login falls back to the fixed ref when refName is omitted (兼容既有签名)', async () => {
+    // 单凭据模式已移除，但 refName 缺省值仍保留 —— 该 ref 不再有读取方。
+    mockedRunOAuthFlow.mockResolvedValue({ access: 'legacy', expires: 1, loginUrl: 'https://login' })
     const { ctx, credentials } = makeContext()
-    await credentials.set(CODEARTS_CREDENTIAL_REF, 'raw-token')
-    const service = newService(ctx)
-    expect(await service.status()).toEqual({ configured: true, source: 'fake', expiresAt: undefined, refreshable: false })
-  })
-
-  it('logout removes the stored credential', async () => {
-    const { ctx, credentials } = makeContext()
-    await credentials.set(CODEARTS_CREDENTIAL_REF, 'value')
-    const service = newService(ctx)
-    await service.logout()
-    expect(await credentials.resolve(CODEARTS_CREDENTIAL_REF)).toBeUndefined()
+    const service = newService(ctx, { fetcher: mockFetcher })
+    const result = await service.login()
+    expect(String(result.ref)).toBe(CODEARTS_CREDENTIAL_REF)
+    expect(await credentials.resolve(CODEARTS_CREDENTIAL_REF)).toBeDefined()
   })
 })
 
@@ -142,11 +160,11 @@ describe('CodeArtsAuth OAuth login', () => {
     })
     const { ctx, credentials } = makeContext()
     const service = newService(ctx, { fetcher: mockFetcher })
-    const result = await service.login()
+    const result = await service.login({ refName: 'CODEARTS_ACCOUNT_1' })
     expect(mockedRunOAuthFlow).toHaveBeenCalled()
     expect(mockedRunLoginFlow).not.toHaveBeenCalled()
     expect(result.refreshable).toBe(true)
-    const stored = JSON.parse((await credentials.resolve(CODEARTS_CREDENTIAL_REF))!.value) as Record<string, string>
+    const stored = JSON.parse((await credentials.resolve('CODEARTS_ACCOUNT_1'))!.value) as Record<string, string>
     expect(stored.refresh_token).toBe('RT')
   })
 
@@ -164,11 +182,18 @@ describe('CodeArtsAuth OAuth login', () => {
   })
 })
 
-describe('CodeArtsAuth silent refresh', () => {
-  it('refresh exchanges the refresh_token and rewrites the credential', async () => {
+/**
+ * 续期只有**按账号**这一条路径（`refreshAccountCredential`）。
+ *
+ * ⚠️ 早期的 `refresh()`（读写固定单凭据 ref）与 `status()` / `logout()` /
+ * `scheduleRefresh()` / `scheduleModelRefresh()` 已随单凭据模式一并移除 ——
+ * 它们的用例也相应替换为按账号续期的用例。
+ */
+describe('CodeArtsAuth 按账号续期', () => {
+  it('refreshAccountCredential exchanges the refresh_token and rewrites the credential', async () => {
     const { ctx, credentials } = makeContext()
     const { privateKeyJwk } = await generateDpopKeyPair()
-    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
+    await credentials.set('CODEARTS_ACCOUNT_1', JSON.stringify({
       access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
       expires_at: '2026-08-14T12:00:00Z',
       refresh_token: 'RT', code_verifier: 'VERIFIER', dpop_private_key_jwk: privateKeyJwk,
@@ -182,8 +207,8 @@ describe('CodeArtsAuth silent refresh', () => {
       refresh_token: 'RT2',
     }), { status: 200 }))
     const service = newService(ctx, { fetcher })
-    await service.refresh()
-    const stored = JSON.parse((await credentials.resolve(CODEARTS_CREDENTIAL_REF))!.value) as Record<string, string>
+    await service.refreshAccountCredential('CODEARTS_ACCOUNT_1')
+    const stored = JSON.parse((await credentials.resolve('CODEARTS_ACCOUNT_1'))!.value) as Record<string, string>
     expect(stored.refresh_token).toBe('RT2')
     expect(mockedRunLoginFlow).not.toHaveBeenCalled()
     // 验证请求体（mock fetch 被 exchangeRefreshToken 调用）：
@@ -198,96 +223,77 @@ describe('CodeArtsAuth silent refresh', () => {
     expect(stored.user_name).toBe('NAME')
   })
 
-  it('refresh reports an explicit error when the credential lacks refresh fields', async () => {
+  it('refreshAccountCredential reports an explicit error when the credential lacks refresh fields', async () => {
     const { ctx, credentials } = makeContext()
-    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
+    await credentials.set('CODEARTS_ACCOUNT_1', JSON.stringify({
       access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST', expires_at: '',
     }))
     const service = newService(ctx)
-    await expect(service.refresh()).rejects.toThrow(/refresh_token/)
+    await expect(service.refreshAccountCredential('CODEARTS_ACCOUNT_1')).rejects.toThrow(/refresh_token/)
   })
 
-  it('status reports refreshable: false and surfaces refreshError', async () => {
-    const { ctx, credentials } = makeContext()
-    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
-      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST', expires_at: '',
-    }))
+  it('refreshAccountCredential reports an error when the credential is missing', async () => {
+    const { ctx } = makeContext()
     const service = newService(ctx)
-    const status = await service.status()
-    expect(status.refreshable).toBe(false)
+    await expect(service.refreshAccountCredential('CODEARTS_ACCOUNT_MISSING')).rejects.toThrow('凭据未配置')
   })
 
-  it('status reports refreshable: false and surfaces refreshError after refresh_token expiry', async () => {
-    vi.useFakeTimers()
-    try {
-      const { ctx, credentials } = makeContext()
-      // 过期时间已落入过去：调度器会被 scheduleRefresh 立即武装。
-      await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
-        access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
-        expires_at: new Date(Date.now() - 60_000).toISOString(),
-        refresh_token: 'RT', code_verifier: 'VERIFIER',
-        dpop_private_key_jwk: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y', d: 'd' },
-      }))
-      // 后端判定 refresh_token 已失效：exchangeRefreshToken 抛 RefreshTokenExpiredError。
-      mockedExchangeRefreshToken.mockRejectedValue(new RefreshTokenExpiredError('invalid_grant'))
-      const service = newService(ctx)
-      await service.scheduleRefresh()
-      await vi.runAllTimersAsync()
-      const status = await service.status()
-      expect(status.refreshError).toContain('已失效')
-      expect(status.refreshable).toBe(false)
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('manual refresh marks refresh_token invalid so status reports refreshable: false', async () => {
+  it('refreshAccountCredential propagates RefreshTokenExpiredError from the backend', async () => {
     const { ctx, credentials } = makeContext()
     const { privateKeyJwk } = await generateDpopKeyPair()
-    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
+    await credentials.set('CODEARTS_ACCOUNT_1', JSON.stringify({
       access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
       expires_at: '2026-08-14T12:00:00Z',
       refresh_token: 'RT', code_verifier: 'VERIFIER', dpop_private_key_jwk: privateKeyJwk,
     }))
-    // 后端判定 refresh_token 已失效：手动 refresh() 也必须更新状态供 /codearts-status 展示。
     mockedExchangeRefreshToken.mockRejectedValue(new RefreshTokenExpiredError('invalid_grant'))
     const service = newService(ctx)
-    await expect(service.refresh()).rejects.toBeInstanceOf(RefreshTokenExpiredError)
-    const status = await service.status()
-    expect(status.refreshError).toContain('已失效')
-    expect(status.refreshable).toBe(false)
+    await expect(service.refreshAccountCredential('CODEARTS_ACCOUNT_1'))
+      .rejects.toBeInstanceOf(RefreshTokenExpiredError)
+  })
+})
+
+/**
+ * `refreshModels` 现在**必须接收账号池**：单凭据模式移除后，固定 ref
+ * `CODEARTS_ACCESS_TOKEN` 不再被读取，凭据只能来自账号池条目。
+ */
+describe('CodeArtsAuth refreshModels', () => {
+  it('从账号池里取第一个可用账号的凭据拉取模型', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('CODEARTS_ACCOUNT_1', JSON.stringify({
+      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+    }))
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      data: { models: [{ id: 'm1', name: 'M1' }] },
+    }), { status: 200 }))
+    const service = newService(ctx, { fetcher })
+    await service.refreshModels(makePool([{ id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1' }]))
+    expect(fetcher).toHaveBeenCalled()
   })
 
-  it('logout during an in-flight refresh prevents credential resurrection', async () => {
+  it('⚠️ 账号池为空时返回空列表（不再回退读单凭据 ref）', async () => {
     const { ctx, credentials } = makeContext()
-    const { privateKeyJwk } = await generateDpopKeyPair()
+    // 即便固定 ref 下有凭据，也不该被读取。
     await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
       access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
-      expires_at: '2026-08-14T12:00:00Z',
-      refresh_token: 'RT', code_verifier: 'VERIFIER', dpop_private_key_jwk: privateKeyJwk,
     }))
-    // 可控 Promise：模拟刷新请求在途，直到手动 resolve。
-    let resolveToken!: (value: TokenResponse) => void
-    mockedExchangeRefreshToken.mockReturnValue(new Promise<TokenResponse>((resolve) => {
-      resolveToken = resolve
+    const fetcher = vi.fn()
+    const service = newService(ctx, { fetcher })
+    expect(await service.refreshModels(makePool([]))).toEqual([])
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('跳过凭据缺失的账号，用后面可用的账号', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('CODEARTS_ACCOUNT_2', JSON.stringify({
+      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
     }))
-    const service = newService(ctx)
-    const scheduleSpy = vi.spyOn(service, 'scheduleRefresh')
-    const refreshing = service.refresh()
-    // 等待刷新越过 resolve 并停在在途的 exchangeRefreshToken 上。
-    await vi.waitFor(() => expect(mockedExchangeRefreshToken).toHaveBeenCalled())
-    await service.logout()
-    resolveToken({
-      credentials: {
-        access_key_id: 'AK3', secret_access_key: 'SK3', security_token: 'ST3',
-        expiration: '2026-08-16T00:00:00Z',
-      },
-      refresh_token: 'RT3',
-    })
-    await refreshing
-    // 凭据未被在途刷新回写：登出后存储仍为空。
-    expect(await credentials.resolve(CODEARTS_CREDENTIAL_REF)).toBeUndefined()
-    // 调度未被重新武装。
-    expect(scheduleSpy).not.toHaveBeenCalled()
+    const fetcher = vi.fn(async () => new Response('{}', { status: 200 }))
+    const service = newService(ctx, { fetcher })
+    await service.refreshModels(makePool([
+      { id: 'ca-1', credentialRef: 'CODEARTS_ACCOUNT_1' }, // 凭据不存在
+      { id: 'ca-2', credentialRef: 'CODEARTS_ACCOUNT_2' },
+    ]))
+    expect(fetcher).toHaveBeenCalled()
   })
 })

@@ -76,14 +76,12 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 ## 用法
 
-- `/codearts-login` — 在浏览器中打开华为云 portal 授权页；授权后，插件经本地
-  `/oauth/callback` 回调收取 `code`，并由 STS token 端点换取含 `refresh_token` 的
-  AK/SK/SecurityToken 凭据。
-- `/codearts-status` — 显示 `configured`、`source`、`expiresAt`、
-  `refreshable` 以及最新的 `refreshError`。
-- `/codearts-refresh` — 手动静默续期凭据（refresh_token 换取；无 refresh_token 时提示重新登录）。
-- 编程式调用：`ctx.codeartsAuth.login()`、`ctx.codeartsAuth.status()`、
-  `ctx.codeartsAuth.refresh()`、`ctx.codeartsAuth.logout()`。
+**登录入口：Jet Hub 设置页的 CodeArts 面板**（与其余五个 provider 一致）。
+
+⚠️ **不注册任何斜杠命令**。早期的 `/codearts-login`、`/codearts-status`、
+`/codearts-refresh` 三个命令已移除 —— 登录、状态查看与续期统一在 Jet Hub 完成。
+编程式调用仍可用：`ctx.codeartsAuth.login()` / `startLogin()` /
+`refreshAccountCredential(refName)` / `refreshAll(pool)`。
 
 ## LLM provider
 
@@ -120,12 +118,15 @@ Tokens 福利）。
 
 ## 凭证
 
-- Ref：`CODEARTS_ACCESS_TOKEN`（POSIX 标识符格式的凭证 ref）。
+- ⚠️ **只支持账号池**：每个账号的凭据存储在 `CODEARTS_ACCOUNT_XXX`（Ref 为 POSIX
+  标识符格式的凭证 ref），由 Jet Hub 设置页管理。
+- **单凭据模式已移除**：早期那条「登录写固定 ref `CODEARTS_ACCESS_TOKEN`、
+  适配器在账号池取不到时回退读它」的路径已删除。固定的
+  `CODEARTS_ACCESS_TOKEN` 不再被写入或读取 —— 若你此前只用它登录过，
+  模型列表会变空，请在 Jet Hub 的 CodeArts 面板重新登录一次。
 - 值：JSON 字符串 `{ access_key_id, secret_access_key, security_token,
   expires_at, domain_id?, user_id?, user_name? }` — AK/SK 对用于给每个 CodeArts
   后端 API 请求签名。
-- `status()` 报告 `configured`、`source`、`expiresAt`、`refreshable` 和
-  `refreshError`。
 
 ## 续期（refresh）
 
@@ -135,12 +136,14 @@ Tokens 福利）。
 - 凭据在过期前 1 小时静默续期（`getFirstRefreshTime` 语义：距过期 ≤1h 立即刷，
   否则 `now+1h` 叠加随机秒偏移），全程无浏览器、无人工操作。
 - 刷新失败后 10 分钟重试（异常网络 1 分钟）；`refresh_token` 失效后停止续期并提示
-  重新登录（原因会体现在 `status().refreshError` 中）。
-- 旧 ticket 流程保留为显式回退：`/codearts-login` 默认走 OAuth；编程式调用
+  重新登录。
+- 旧 ticket 流程保留为显式回退：编程式调用
   `ctx.codeartsAuth.login({ flow: 'ticket' })`。ticket 凭据没有 `refresh_token`，
   其续期仍意味着重新运行浏览器登录流程。
-- 手动续期：`/codearts-refresh` 或 `ctx.codeartsAuth.refresh()`。
-- 续期定时器是 unref 的，在 `logout()` 和插件卸载时停止。
+- **续期按账号**：`refreshAccountCredential(refName)`（账号卡片的「刷新」按钮）
+  与 `refreshAll(pool)`（定时调度器）。早期的 `refresh()` / `logout()` /
+  `status()` / `scheduleRefresh()` / `scheduleModelRefresh()` 只服务于单凭据路径，
+  已随该模式一并移除。
 - 运行时依赖新增 `jose`（用于 DPoP JWS 签发，与 CodeArts Agent 插件实现一致）。
 
 ### ⚠️ 停用的账号同样会被续期
@@ -575,6 +578,34 @@ Jet Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的**�
 - 开关按 provider 隔离，CodeArts / CodeBuddy / WorkBuddy / LobsterAI 四份黑名单互不影响。
 - 相关 RPC 端点：`model.list`（列出模型并回填 `disabled`）、`model.setDisabled`
   （打开/关闭单个模型），实现见 `src/jet-hub-rpc.ts`。
+
+### 没有已登录账号就不显示该 provider（目录门控）
+
+**需求**：若某供应商没有已登录的账号，就不显示该供应商的所有模型 —— 这样对
+大多数用户来说模型选择选项卡臃肿的问题能改善很多。
+
+**机制**：DSH 的 `buildModelCatalog` 显式 `.filter(group => group.models.length > 0)`
+（注释 *"successful non-empty provider groups"*），所以适配器 `listModels`
+返回**空数组**即可让整个 provider 分组从模型选择器消失 —— **无需任何前端改动**。
+
+- **判据是「凭据能否解析」**，不是「有没有账号条目」：登出（`logout()`）只清凭据、
+  保留条目，若只看条目则登出后模型仍会显示，门控形同虚设。
+- **不看 `enabled`**：停用只影响自动选号，与「是否已登录」无关。把所有账号停用的
+  用户仍能看到模型（与「续期只看 `refreshable`」是同一条约定）。
+- ⚠️ **CodeArts 是唯一保留单凭据模式的 provider**：它额外把
+  `CODEARTS_ACCESS_TOKEN` 计入判据，只用单凭据登录的老用户不会受影响。
+  其余五个 provider 只看账号池。
+- ⚠️ **返回空数组而非抛错**：抛错会被归入 catalog 的 `failures`，界面反而多出
+  一条 provider 报错。
+- ⚠️ **不影响路由**：`routableProviders` 单独生成（不经该 filter），已持久化的
+  模型仍可正常收发 —— 与黑名单同一契约。
+- ⚠️ **门控只作用于对话框目录**；Jet Hub 的「显示列表」（`listAllModels`）仍列出
+  全部模型，否则用户关掉模型后连开关都看不到、无法重新打开。
+- **判据不可用时保守放行**（无账号池 / 替身未实现 / 读凭据异常）：门控是展示优化
+  而非安全边界，宁多勿少。
+- 开关：`DSH_HIDE_MODELS_WITHOUT_ACCOUNT`（**默认开启**，设 `0`/`false`/`no`/`off`
+  可关闭）。实现见 `src/account-pool.ts` 的 `hasLoggedInAccount` /
+  `providerCatalogVisible`。
 
 ### 积分余额（Credits Balance）
 

@@ -22,7 +22,7 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import {
   TRAE_DEFAULT_MODEL,
   TRAE_MAX_CONTEXT_TOKENS,
@@ -685,6 +685,13 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+    // 不必拉（省掉一次无谓的 HTTP 请求）。没有任何已登录账号时返回空数组，让
+    // DSH 的 `buildModelCatalog`（它 `.filter(group => group.models.length > 0)`）
+    // 把整个 provider 分组隐藏，减少模型选择列表的臃肿（见 providerCatalogVisible）。
+    // ⚠️ 这里必须返回 `[]` 而**不能抛错**：抛错会被归入 catalog 的 `failures`，
+    // 界面上反而多出一条 provider 报错。
+    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
     await this.ensureRemoteModels()
     // 过滤逻辑分两层：
     //

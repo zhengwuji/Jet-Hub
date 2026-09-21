@@ -6,7 +6,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { signRequestHuawei } from './sign.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
@@ -783,6 +783,19 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
+    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
+    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
+    // 界面上反而多出一条 provider 报错）。
+    //
+    // ⚠️ **CodeArts 不再有单凭据例外**：早期它额外把固定 ref
+    // `CODEARTS_ACCESS_TOKEN` 计入判据（单凭据模式），该模式已随
+    // `credentialRef` 回退解析一并移除 —— 六个 provider 现在判据完全一致，
+    // 都只看账号池。
+    //
+    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+    // 不必拉。
+    if (!await providerCatalogVisible(this.options.accountPool, PROVIDER)) return []
     // 必须 await：ensureRemoteModels 是异步的，早期实现用 `void` 丢弃 Promise，
     // 冷缓存时远端目录尚未落地就走静态兜底表，模型选择器会短暂显示错误的
     // 模型集合（Jet Hub 的模型开关也据此渲染，会造成"关掉的模型又冒出来"）。
