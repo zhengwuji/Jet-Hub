@@ -448,7 +448,11 @@ describe('buddy fetchModels', () => {
             modelPromotions: [{
               enabled: true, priority: 100, modelIds: ['glm-5.2'],
               discount: { discountedCredits: '0.50x', factor: 0.5 },
-              schedule: { daily: [{ start: '23:00', end: '7:50' }], timezone: 'Asia/Shanghai' },
+              // ⚠️ 窗口必须**全天覆盖**（`00:00`–`23:59`），不要写真实的
+              // `23:00–7:50` —— 那样用例就只在夜间通过，白天跑会假失败。
+              // 本用例要验证的是「促销表从 /v3/config 合并进来」，
+              // 而「窗口外不生效」另有专门用例覆盖，不该混在这里。
+              schedule: { daily: [{ start: '00:00', end: '23:59' }], timezone: 'Asia/Shanghai' },
             }],
           },
         }), { status: 200 }),
@@ -457,7 +461,7 @@ describe('buddy fetchModels', () => {
     const models = await fetchModels(makeCredential(), fetcher, undefined, WORKBUDDY)
     const glm = models.find((m) => m.id === 'glm-5.2')
     expect(glm?.creditsRate).toBe('x0.79')
-    // 夜间窗口内 → 促销价应被合并（用户要看的 0.5）
+    // 窗口内 → 促销价应被合并（用户要看的 0.5）
     expect(glm?.discountedCreditsRate).toBe('x0.50')
   })
 

@@ -154,6 +154,13 @@ export interface TraeAdapterOptions {
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号）。 */
   accountPool?: AccountPool
+  /**
+   * 读取图片附件的原始字节（内联为 `data:` URL 用）。
+   *
+   * 由调用方桥接 `ctx.attachments.readImage(ref)`。未提供时收到图片会报
+   * `UNSUPPORTED_CONTENT`（而不是静默丢弃）—— 见 `stream()` 的图片分支。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link TRAE}。 */
   product?: TraeProduct
 }
@@ -173,6 +180,81 @@ function contentToText(content: unknown): string {
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text')
     .map((block) => String(block.text))
     .join('')
+}
+
+/** 工具结果内嵌图片的载体文本（与 buddy / lobsterai 适配器同名同义）。 */
+const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
+
+/**
+ * 把 harness 内容块转成 OpenAI 多模态 parts（含图片）。
+ *
+ * 图片必须转成 `{type:'image_url', image_url:{url}}` —— **实测（2026-09-21）
+ * 这是 SOLO 上游唯一接受的形态**：`transformToSOLOBody` 对数组 content 原样
+ * 透传，而这种 parts 形状直发即可被模型读到（纯红图答「红色」、纯蓝图答
+ * 「蓝色」，不带图则答「无法确定」）。故无需任何额外的协议转换。
+ *
+ * 返回 `undefined` 表示「无图」；只要出现过图片块就一定返回数组（即便字节
+ * 解析失败也留 `[image unavailable]` 占位符），以免图片被静默吞掉。
+ *
+ * 与 `collectImages` **对称地递归**处理 `tool-result` 内层：收集侧是任意深度，
+ * 序列化侧若只走一层，深层图片会被收进 refs 却在序列化时静默丢弃。
+ */
+function userContentParts(
+  content: readonly unknown[],
+  imageUrls: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> | undefined {
+  const parts: Array<Record<string, unknown>> = []
+  let hasImage = false
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
+    if (block.type === 'text') {
+      const text = String(block.text ?? '')
+      if (text.length > 0) parts.push({ type: 'text', text })
+      continue
+    }
+    if (block.type === 'image') {
+      hasImage = true
+      const url = block.attachment?.attachmentId === undefined
+        ? undefined
+        : imageUrls.get(String(block.attachment.attachmentId))
+      // 解析不到字节时留占位文本，而不是静默吞掉整张图。
+      parts.push(url === undefined
+        ? { type: 'text', text: '[image unavailable]' }
+        : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      const inner = userContentParts(block.content, imageUrls)
+      if (inner !== undefined) {
+        hasImage = true
+        parts.push(...inner)
+      } else {
+        // 内层无图：保留其文本，避免内容丢失。
+        const text = contentToText(block.content)
+        if (text.length > 0) parts.push({ type: 'text', text })
+      }
+    }
+  }
+  return hasImage && parts.length > 0 ? parts : undefined
+}
+
+/** 收集消息中的图片附件引用（含工具结果内嵌图片），按 attachmentId 去重。 */
+function collectImages(content: readonly unknown[], refs: Map<string, unknown>): void {
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown }; content?: unknown }
+    if (block.type === 'image' && typeof block.attachment?.attachmentId === 'string') {
+      refs.set(block.attachment.attachmentId, block.attachment)
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) collectImages(block.content, refs)
+  }
 }
 
 /**
@@ -211,14 +293,35 @@ function contentToText(content: unknown): string {
  * assistant 带 `tool_calls`（`function` 形态），工具结果展开为独立
  * `{role:'tool', tool_call_id}` 消息。随后 `transformToSOLOBody` 再按 SOLO
  * 规则把 `function` → `function_call`（与 Go 端同一条流水线）。
+ *
+ * ## 图片（`imageUrls`）
+ *
+ * `imageUrls` 为 `undefined` 表示整个请求没有图片；非 undefined（**含空 Map**）
+ * 时把带图的 user 消息升级为多模态 parts（`{type:'image_url',...}`）。
+ * 空 Map **不能**降级为 undefined —— 那会让「图片存在但字节读取失败」的
+ * `[image unavailable]` 占位符也被跳过，图片静默消失。
  */
 function serializeTraeMessages(
   messages: readonly { role: string; content: unknown }[],
+  imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
   // 剔除无法配对的工具调用/结果：SOLO 上游同样要求 tool_calls 与 tool 结果
   // 严格配对，孤儿条目会让整条会话被拒（与三个兄弟适配器同款防线）。
   const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+
+  // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
+  // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
+  // 故挂起到其后的独立 user 消息统一发出（与 buddy / lobsterai 同款处理）。
+  let pendingToolImages: Array<Record<string, unknown>> = []
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
+    })
+    pendingToolImages = []
+  }
 
   for (const message of messages) {
     if (message.role === 'assistant') {
@@ -256,16 +359,33 @@ function serializeTraeMessages(
         typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result',
     )
     const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    // 图片：仅当本请求带图（imageUrls 非 undefined）时升级为多模态 parts。
+    const parts = imageUrls === undefined ? undefined : userContentParts(content, imageUrls)
+    if (parts !== undefined) {
+      // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
+      flushToolImages()
+      wire.push({ role: 'user', content: parts })
+    } else if (text.length > 0 || toolResults.length === 0) {
+      wire.push({ role: 'user', content: text })
+    }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 tool_call 同样会被上游拒绝。
       if (!keepResultIds.has(String(result.toolCallId))) continue
+      const innerParts = imageUrls === undefined
+        ? undefined
+        : (Array.isArray(result.content) ? userContentParts(result.content, imageUrls) : undefined)
+      if (innerParts !== undefined) {
+        // 工具结果内嵌图片：该消息的 content 只能是字符串，图片挂到后续独立
+        // user 消息里（不能就地展开，否则违反 role:'tool' 的协议约束）。
+        pendingToolImages.push(...innerParts.filter((part) => part.type === 'image_url'))
+      }
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
+        content: contentToText(result.content) || (innerParts !== undefined ? TOOL_RESULT_IMAGE_TEXT : '(no output)'),
       })
     }
+    flushToolImages()
   }
   return wire
 }
@@ -404,13 +524,26 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   /**
-   * 模型接受的输入模态。
+   * 模型接受的输入模态 —— **逐模型**判定，不是按 provider 一刀切。
    *
-   * TRAE SOLO 通道**目前不支持图片**（上游以纯文本对话为主），
-   * 故恒为 `['text']`。
+   * 判据是远端 `display_config.multimodal`（见
+   * {@link TraeRemoteModel.multimodal} 的实测记录）：
+   *
+   * - `true` → `['text', 'image']`
+   * - `false` / **未声明** → `['text']`（保守：兜底表没有该字段，
+   *   且「远端没说」不等于「远端支持」）
+   *
+   * ⚠️ **这里返回的 `image` 是 DSH 的准入闸门**：不声明 `image` 时，图片会在
+   * **附件入库阶段**就被拒（`session/attachment-invalid`），用户看到
+   * 「当前模型不支持图片」——而图根本没发到上游。因此漏报 `image` 不只是
+   * 「少个功能」，而是「连降级成文本占位符的机会都没有」。
+   *
+   * **历史缺陷**（Issue #IKHDKC）：早期这里恒返回 `['text']`（参数名甚至是
+   * `_model`，即刻意忽略模型），理由是「SOLO 通道未见图片能力」—— 实测证伪：
+   * 远端一直在目录里声明该能力，且直发图片后模型真的看得见。
    */
-  private inputModalitiesFor(_model: string): readonly ('text' | 'image')[] {
-    return ['text']
+  private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
+    return this.remoteMeta.get(model)?.multimodal === true ? ['text', 'image'] : ['text']
   }
 
   /**
@@ -577,7 +710,9 @@ export class TraeAdapter extends LlmAdapter {
       provider: this.product.id,
       id: model.id,
       name: model.name,
-      inputModalities: ['text'],
+      // ⚠️ 逐模型判定（远端 `display_config.multimodal`）—— 早期这里硬编码
+      // `['text']`，导致 DSH 在附件准入阶段就拒掉图片（Issue #IKHDKC）。
+      inputModalities: this.inputModalitiesFor(model.id),
     }))
   }
 
@@ -588,7 +723,8 @@ export class TraeAdapter extends LlmAdapter {
       provider,
       id: model,
       name: remoteName ?? this.fallbackIndex.get(model)?.name ?? model,
-      inputModalities: ['text'],
+      // ⚠️ 与 listModels 同源：必须逐模型判定，否则准入闸门仍会拦下图。
+      inputModalities: this.inputModalitiesFor(model),
     }
     const contextWindow = this.contextWindowFor(model)
     if (contextWindow !== undefined) resolved.context = { contextWindow }
@@ -640,30 +776,47 @@ export class TraeAdapter extends LlmAdapter {
       }
     }
 
-    // 3. 构造请求体（OpenAI → SOLO 转换）
+    // 3. 图片：按**模型**判定是否接受，并把字节读成 data URL
     //
-    // ⚠️ **必须在构造请求体之前拒绝图片**：TRAE SOLO 通道不支持图片输入
-    // （`inputModalities` 恒为 `['text']`，与 CodeBuddy / LobsterAI 不同）。
-    // 只声明不支持却不检查，图片会被 `contentToText` 静默丢掉 —— 用户以为
-    // 模型看到了图片，实际请求里一个字都没有，且没有任何错误提示。
+    // ⚠️ **不能无条件拒绝**：实测（2026-09-21）TRAE 上游真的支持图片 ——
+    // 远端目录里 `display_config.multimodal` 一直在声明该能力，且直发图片后
+    // 模型确实读到了像素（红图答「红色」、蓝图答「蓝色」、无图答「无法确定」）。
+    // 早期这里无条件抛错（理由「SOLO 通道不支持图片」），配合 `inputModalities`
+    // 恒为 `['text']`，导致图片在**附件准入阶段**就被 DSH 拒掉（用户报障
+    // Issue #IKHDKC）。
+    //
+    // 现在：`multimodal !== true` 的模型仍明确报错（实测 `DeepSeek-V4-Pro-Official`
+    // 收到图后答「无法确定」、思考链说「但没有图片」，证明该标志是权威判据）；
+    // `multimodal === true` 的模型读字节并转成 data URL 随请求发出。
+    //
     // 宁可显式报错（DSH 会据此把图片投影成文本占位符），也不要静默吞掉。
+    const imageRefs = new Map<string, unknown>()
     for (const message of options.messages) {
-      if (!Array.isArray(message.content)) continue
-      const hasImage = message.content.some((block) => {
-        if (typeof block !== 'object' || block === null) return false
-        const type = (block as { type?: unknown }).type
-        if (type === 'image') return true
-        // 工具结果内嵌的图片（read_image）同样不能被静默丢弃。
-        const nested = (block as { content?: unknown }).content
-        return type === 'tool-result' && Array.isArray(nested)
-          && nested.some((inner) =>
-            typeof inner === 'object' && inner !== null && (inner as { type?: unknown }).type === 'image')
-      })
-      if (hasImage) {
+      if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+    }
+    // `imageUrls` 为 undefined 表示「本请求没有图片」；非 undefined（含空 Map）
+    // 时序列化层会把带图的 user 消息升级为多模态 parts。空 Map 不能降级为
+    // undefined —— 那会让「图片存在但字节读取失败」的占位符也被跳过。
+    let imageUrls: Map<string, string> | undefined
+    if (imageRefs.size > 0) {
+      if (!this.inputModalitiesFor(options.model).includes('image')) {
         throw new LlmError(
           `trae: model "${options.model}" does not accept image input.`,
           'UNSUPPORTED_CONTENT',
         )
+      }
+      if (this.options.readImage === undefined) {
+        throw new LlmError(
+          'trae: image input requires the attachment service; '
+          + 'confirm the profile loads @deepseek-ai/dsh-attachment-local.',
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      imageUrls = new Map()
+      for (const [id, ref] of imageRefs) {
+        const image = await this.options.readImage(ref)
+        if (image === undefined) continue
+        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }
     }
 
@@ -678,7 +831,7 @@ export class TraeAdapter extends LlmAdapter {
     // 传输格式（tool_calls / role:'tool' / 纯文本 content）。DSH 的
     // 原生 content 块（tool-call / tool-result / reasoning）不是 SOLO 认识的
     // 结构，原样下发会让模型看不到工具调用与工具结果（详见该函数注释）。
-    const wireMessages = serializeTraeMessages(options.messages)
+    const wireMessages = serializeTraeMessages(options.messages, imageUrls)
 
     const openaiBody: Record<string, unknown> = {
       model: options.model,

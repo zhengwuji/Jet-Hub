@@ -534,6 +534,58 @@ describe('多通道批量解析（batch_get_detail_param）', () => {
     expect(model!.reasoningConfig?.options).toEqual(['high'])
   })
 
+  // ── 图片能力（Issue #IKHDKC）──
+
+  it('读出 display_config.multimodal（逐模型，不是按 provider 一刀切）', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('deepseek-v4.1-flash', {
+        display_config: { display_name: 'DeepSeek-V4.1-Flash', multimodal: true },
+      }),
+    ]]]))
+    expect(model!.multimodal).toBe(true)
+  })
+
+  it('multimodal=false 如实读出（不能当成「未声明」）', () => {
+    // 「远端说不支持」与「远端没说」是两回事：前者可用于拒绝，后者只能保守处理。
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('glm-5.2', { display_config: { display_name: 'GLM-5.2', multimodal: false } }),
+    ]]]))
+    expect(model!.multimodal).toBe(false)
+  })
+
+  it('未声明 multimodal 的模型该字段为 undefined（不臆造能力）', () => {
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('x', { display_config: { display_name: 'X' } }),
+    ]]]))
+    expect(model!.multimodal).toBeUndefined()
+  })
+
+  it('⚠️ 用户贴图与工具结果图是**两个独立字段**，不可合并', () => {
+    // 实测 deepseek-v4.1-flash: multimodal=true 而 tool_response_multimodal=false
+    // （用户能贴图，但工具读到的图回传不了）；Doubao/Kimi 系列则两者皆 true。
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('deepseek-v4.1-flash', {
+        display_config: {
+          display_name: 'DeepSeek-V4.1-Flash',
+          multimodal: true,
+          tool_response_multimodal: false,
+        },
+      }),
+    ]]]))
+    expect(model!.multimodal).toBe(true)
+    expect(model!.toolResponseMultimodal).toBe(false)
+  })
+
+  it('兼容 PascalCase 形态', () => {
+    // 注意 `entry()` 已内置 `display_config`，故 PascalCase 键要写在它**内部**
+    // （代码优先取 `display_config`，容器名写成 `DisplayConfig` 会被忽略）。
+    const [model] = parseTraeBatchModelList(batch([['solo_agent', [
+      entry('x', { display_config: { display_name: 'X', Multimodal: true, ToolResponseMultimodal: true } }),
+    ]]]))
+    expect(model!.multimodal).toBe(true)
+    expect(model!.toolResponseMultimodal).toBe(true)
+  })
+
   // ── Max 模式（1M 上下文）──
 
   it('读出 display_config.max_mode 与 context_window_tokens.max', () => {

@@ -693,6 +693,51 @@ POST {agentHost}/api/ide/v1/batch_get_detail_param
   **两者绝不能混用** —— 未开 Max 却声明 1M 会让 DSH 把超长上下文直接发出去，
   上游按 200K 校验后拒绝。
 
+#### ⚠️ TRAE **支持图片**，但必须逐模型判定（Issue #IKHDKC）
+
+**真实缺陷**（用户报障「TRAE字节 模型不支持图片」）：早期 `inputModalitiesFor`
+恒返回 `['text']`（参数名是 `_model`，即**刻意忽略模型**），理由写的是
+「SOLO 通道未见图片能力」。后果不只是「少个功能」——`inputModalities` 是
+**DSH 的准入闸门**，图片在**附件入库阶段**就被拒
+（`session/attachment-invalid`），用户看到「当前模型不支持图片，请切换支持
+图片的模型」，而报错把原因指向**模型**，真实原因是**插件**。
+
+**实测证伪**（2026-09-21，真实凭据）：
+
+1. 远端目录**一直**在 `display_config.multimodal` 里声明该能力 —— 它与
+   `max_mode` / `is_custom_model` 是**同一层级的相邻字段**，当初读了一个漏了另一个
+   （52 个可调用条目中 27 个为 `true`；本插件可见集 19 个中 15 个为 `true`）；
+2. **直发图片，模型真的看得见**：纯红图答「红色」、纯蓝图答「蓝色」、
+   不带图答「无法确定」—— 三次答案不同，且无图时思考链明说「并没有提供图片」。
+   ⚠️ 只验「不报错」不够：**静默丢图同样不报错**，必须做这种三连对照；
+3. **反向对照定死判据**：`multimodal: false` 的模型（`DeepSeek-V4-Pro-Official`）
+   收到图后答「无法确定」、思考链说「但没有图片」，**与不带图的回答一致**
+   → 该标志是**权威准入判据**，不能按 provider 一刀切。
+
+⚠️ **两个字段是两种独立能力，不可合并**：`multimodal`（用户贴图）与
+`tool_response_multimodal`（工具结果图能否回传）。实测 `deepseek-v4.1-flash`
+前者 `true`、后者 `false`；Doubao / Kimi 系列两者皆 `true`。
+本插件**只消费 `multimodal`**，另一个仅保留信息。
+
+⚠️ **请求形态无需协议逆向**：`transformToSOLOBody` 对**数组形态的 content
+原样透传**，所以 OpenAI 的 `{type:'image_url',image_url:{url}}`（data URL）
+直发即被接受 —— 与 buddy / lobsterai 适配器**完全同款**，没有 TRAE 专属转换。
+
+落点（四处）：
+
+1. `src/trae.ts`：`TraeRemoteModel` 加 `multimodal` / `toolResponseMultimodal`，
+   `parseTraeConfigEntry` 与 `maxMode` 相邻处读取（含 PascalCase 回退）；
+2. `inputModalitiesFor(model)` 改为 `remoteMeta.get(model)?.multimodal === true
+   ? ['text','image'] : ['text']`（**未声明按不支持**，不臆造能力）；
+3. `listModels` / `resolveModel` **两个出口**都改用它（漏一个闸门仍会拦图）；
+4. `stream()`：按模型判定 —— 声明支持则读 `readImage` 字节转 data URL
+   （`collectImages` 递归收集 + `userContentParts` 递归序列化，
+   **两侧必须对称**）；不支持则明确报错且**不发请求**。
+
+⚠️ `readImage` 必须由 `index.ts` 桥接（`makeReadImage(ctx)`）。缺失时收到图片
+报「需要附件服务」而**不是**静默丢图；字节读取失败时留 `[image unavailable]`
+占位符（空 Map 不能降级为 undefined，否则占位符也被跳过）。
+
 #### 修法落点（四处）
 
 1. `parseTraeBatchModelList`（`src/trae.ts`）按通道合并目录，每条记上 `function`

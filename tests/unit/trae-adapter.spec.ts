@@ -67,7 +67,13 @@ function makeAdapter(options: {
     maxMode?: boolean
     maxContextWindow?: number
     maxModeOutputTokens?: number
+    /** `display_config.multimodal` —— 该模型是否接受用户图片。 */
+    multimodal?: boolean
+    /** `display_config.tool_response_multimodal` —— 工具结果内嵌图能否回传。 */
+    toolResponseMultimodal?: boolean
   }>
+  /** 桥接图片字节（`readImage`）；省略时适配器收到图片会报「需要附件服务」。 */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   accountPool?: unknown
   /** 覆盖产品配置（用于验证 hideInternalModels 等开关）。 */
   product?: typeof TRAE
@@ -91,6 +97,7 @@ function makeAdapter(options: {
       ? {}
       : { fetchRemoteModels: async () => options.remoteModels! },
     ...options.accountPool === undefined ? {} : { accountPool: options.accountPool as never },
+    ...options.readImage === undefined ? {} : { readImage: options.readImage },
     product: options.product ?? TRAE,
   })
   return { adapter, fetcher, refresh }
@@ -140,12 +147,32 @@ describe('TRAE 适配器 · listModels', () => {
     expect(models[0]!.id).toBe(visible[0]!.id)
   })
 
-  it('inputModalities 恒为 text（SOLO 通道不支持图片）', async () => {
+  it('inputModalities 按远端 multimodal 判定；未声明时保守为 text', async () => {
+    // 兜底表没有 multimodal 字段 → 一律 text（「远端没说」不等于「远端支持」）。
     const { adapter } = makeAdapter()
     const models = await adapter.listModels('trae')
     for (const model of models) {
       expect(model.inputModalities).toEqual(['text'])
     }
+  })
+
+  it('⚠️ multimodal=true 的模型声明 image（Issue #IKHDKC 回归）', async () => {
+    // 真实缺陷：早期这里恒为 ['text']，DSH 于是在**附件准入阶段**就拒掉图片
+    // （用户看到「当前模型不支持图片」），而实测上游真的支持 —— 直发图片后
+    // 模型能读出颜色。故必须逐模型判定，不能按 provider 一刀切。
+    const { adapter } = makeAdapter({
+      remoteModels: [
+        { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true },
+        { id: 'glm-5.2', name: 'GLM-5.2', multimodal: false },
+        { id: 'unknown', name: 'Unknown' },
+      ],
+    })
+    const models = await adapter.listModels('trae')
+    const byId = new Map(models.map((m) => [m.id, m.inputModalities]))
+    expect(byId.get('deepseek-v4.1-flash')).toEqual(['text', 'image'])
+    expect(byId.get('glm-5.2')).toEqual(['text'])
+    // 字段缺失同样保守为 text。
+    expect(byId.get('unknown')).toEqual(['text'])
   })
 
   it('应用账号池的模型黑名单（关闭的模型不出现在目录里）', async () => {
@@ -915,8 +942,21 @@ describe('TRAE 适配器 · 凭据', () => {
   })
 })
 
-describe('TRAE 适配器 · 图片不支持', () => {
-  it('收到图片时抛 UNSUPPORTED_CONTENT（而非静默丢弃）', async () => {
+/**
+ * 图片能力**按模型**判定（Issue #IKHDKC）。
+ *
+ * 实测（2026-09-21，真实凭据）：
+ * - 远端 `display_config.multimodal` 一直在目录里声明该能力（52 个可调用条目中
+ *   27 个为 true，本插件可见集 19 个中 15 个为 true）；
+ * - 直发图片后模型真的读到了像素（纯红图答「红色」、纯蓝图答「蓝色」、
+ *   无图答「无法确定」）；
+ * - 反向对照：`multimodal: false` 的模型收到图后答「无法确定」，思考链明说
+ *   「但没有图片」—— 与不带图的回答一致，证明该标志是**权威准入判据**。
+ *
+ * 下方用例把「拒绝」的语义锚定在**模型是否声明 multimodal**，而不是 provider。
+ */
+describe('TRAE 适配器 · 图片按模型判定', () => {
+  it('multimodal 未声明（兜底/未知模型）时收到图片抛 UNSUPPORTED_CONTENT', async () => {
     // 只声明 inputModalities=['text'] 就必须真的拒绝；静默丢图会让用户
     // 以为模型看到了图片。错误文案与 Buddy / LobsterAI 适配器保持一致。
     const { adapter, fetcher } = makeAdapter()
@@ -935,7 +975,7 @@ describe('TRAE 适配器 · 图片不支持', () => {
     expect(fetcher).not.toHaveBeenCalled()
   })
 
-  it('工具结果内嵌的图片同样被拒绝（不得静默丢弃）', async () => {
+  it('工具结果内嵌的图片在未声明 multimodal 时同样被拒绝', async () => {
     const { adapter, fetcher } = makeAdapter()
     const options = {
       model: 'glm-5.2',
@@ -950,6 +990,72 @@ describe('TRAE 适配器 · 图片不支持', () => {
     } as unknown as GenerateOptions
     const error = await collect(adapter, options).catch((e: unknown) => e)
     expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ multimodal=true 的模型：图片被转成 image_url data URL 并发往上游', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', attachment: { attachmentId: 'att-1' } },
+          { type: 'text', text: '什么颜色' },
+        ],
+      }],
+    } as unknown as GenerateOptions)
+
+    expect(fetcher, '必须真的发出请求').toHaveBeenCalled()
+    const body = JSON.parse(String(fetcher.mock.calls[0]![1].body))
+    const parts = body.messages[0].content
+    // 图片必须是 image_url + data URL（实测上游唯一接受的形态）。
+    const image = parts.find((p: { type: string }) => p.type === 'image_url')
+    expect(image.image_url.url).toBe('data:image/png;base64,iVBORw==')
+    // 文本块必须保留。
+    expect(parts.some((p: { type: string }) => p.type === 'text' && p.text === '什么颜色')).toBe(true)
+  })
+
+  it('⚠️ 读取图片字节失败时留 [image unavailable] 占位符（不静默丢图）', async () => {
+    // 空 Map 不能降级为 undefined —— 那会让占位符也被跳过。
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      // readImage 回 undefined（附件已被清理等）。
+      readImage: async () => undefined,
+    })
+    await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }],
+      }],
+    } as unknown as GenerateOptions)
+
+    const body = JSON.parse(String(fetcher.mock.calls[0]![1].body))
+    const json = JSON.stringify(body)
+    expect(json, '不得静默丢弃').toContain('image unavailable')
+  })
+
+  it('声明 multimodal=true 但未提供 readImage 时明确报错（不静默丢图）', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [sseResponse(soloSse(['done', {}]))],
+      remoteModels: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', multimodal: true }],
+      // 故意不传 readImage
+    })
+    const error = await collect(adapter, {
+      model: 'deepseek-v4.1-flash',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }],
+      }],
+    } as unknown as GenerateOptions).catch((e: unknown) => e)
+    expect((error as { code?: string }).code).toBe('UNSUPPORTED_CONTENT')
+    expect(String((error as Error).message)).toContain('attachment service')
     expect(fetcher).not.toHaveBeenCalled()
   })
 })

@@ -1020,10 +1020,23 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
 | 设备指纹 | 无 | **必须持久化** `machine_id` 与 `device_id`（均为 32 位 hex） |
 | **登录回调** | 各不相同 | **老流程直接回传 token**（`refreshToken` / `userInfo` / `userJwt`）；**并存 PKCE 新流程**（带 `code` / `authCodeInfo`），两套都要认；参数名是 **`auth_callback_url`** |
 | 回调端口 | 各不同 | 默认 `127.0.0.1:18080`，**被占用时自动回退随机端口** |
-| 图片输入 | Buddy / LobsterAI 支持 | **不支持**（`inputModalities` 仅 `text`） |
+| 图片输入 | Buddy / LobsterAI 支持 | **支持**，但**逐模型**判定（远端 `display_config.multimodal`；本插件可见集里约 15/19 为 `true`） |
 | 历史长度 | 无硬约束 | 超约 **500K 字符上游会静默断流** → 自动裁剪（保最新、不切断工具配对） |
 | 单次输出上限 | 采信远端声明 | 收敛到 **64000**（上游安全线，可配） |
 | 模型列表 | `GET` | `POST /api/ide/v1/get_detail_param`（响应 `config_info_list[]`） |
+
+> **图片输入（逐模型）**：判据是远端 `display_config.multimodal`。
+> `true` → 声明 `['text','image']` 并把图片转成 `{type:'image_url',image_url:{url}}`
+> 的 data URL 发出；`false` / 未声明 → 收到图片时明确报错且**不发请求**。
+>
+> 实测（2026-09-21）：直发纯红图答「红色」、纯蓝图答「蓝色」、不带图答「无法确定」
+> —— 三次答案不同，证明模型真读到了像素。而 `multimodal: false` 的模型
+> （如 `DeepSeek-V4-Pro-Official`）收到图后答「无法确定」、思考链明说「但没有图片」，
+> 与不带图的回答一致 → 该标志是**权威准入判据**。
+>
+> ⚠️ **用户贴图**与**工具结果内嵌图**是两个独立字段
+> （`multimodal` / `tool_response_multimodal`）：实测 `deepseek-v4.1-flash`
+> 前者 `true`、后者 `false`，不可合并判断。
 
 - **登录入口：Jet Hub 设置页的 TRAE 面板**（支持多账号与账号池自动切换）。
   不注册斜杠命令。

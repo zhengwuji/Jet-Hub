@@ -619,6 +619,46 @@ export interface TraeRemoteModel {
    */
   reasoningConfig?: TraeReasoningConfig
   /**
+   * `display_config.multimodal` —— 该模型是否接受**用户图片**输入。
+   *
+   * ## 为什么必须按模型读，而不能按 provider 一刀切
+   *
+   * **真实缺陷**（用户报障 / Issue #IKHDKC「TRAE 字节 模型不支持图片」）：
+   * 早期实现把 TRAE 的 `inputModalities` 恒定为 `['text']`（理由写的是
+   * 「SOLO 通道未见图片能力」），于是 DSH 在**附件准入阶段**就把图片拒了
+   * —— 图根本没发到上游，用户看到「当前模型不支持图片，请切换支持图片的模型」，
+   * 而报错把原因指向**模型**，真实原因是**插件**。
+   *
+   * 实测（2026-09-21，真实凭据）证伪了那个假设：
+   *
+   * 1. 远端目录**一直**在 `display_config.multimodal` 里声明该能力
+   *    （52 个可调用条目里 27 个为 `true`）；
+   * 2. **直发图片给上游，模型真的看得见** —— 纯红图答「红色」、纯蓝图答
+   *    「蓝色」，而不带图时思考链明说「并没有提供图片……不能判断」。
+   *    三次答案不同，证明不是幻觉；
+   * 3. 反向对照：`multimodal: false` 的模型（`DeepSeek-V4-Pro-Official`）
+   *    收到图后答「无法确定」，思考链说「但没有图片」—— **与不带图的回答
+   *    完全一致**。故该标志是**权威准入判据**，必须逐模型判断。
+   *
+   * ⚠️ 请求体的图片形态沿用 `transformToSOLOBody` 对数组 content 的**原样透传**
+   * （OpenAI 的 `{type:'image_url',image_url:{url}}`），实测上游直接接受，
+   * 无需任何额外协议转换。
+   */
+  multimodal?: boolean
+  /**
+   * `display_config.tool_response_multimodal` —— **工具结果**内嵌图片能否回传。
+   *
+   * ⚠️ 与 {@link multimodal} 是**两种独立能力**，不可合并判断：实测
+   * `deepseek-v4.1-flash` 为 `multimodal: true` 而 `tool_response_multimodal: false`
+   * （即「用户能贴图，但工具读到的图回传不了」），Doubao / Kimi 系列则两者皆 `true`。
+   *
+   * 当前实现**只消费 `multimodal`**：`multimodal` 为 true 的模型会把工具结果里的
+   * 图片也一并发出（本插件自身不发 `read_image` 的工具图，实际影响面有限）。
+   * 单独保存该字段是为了保留远端权威信息、便于将来细化，**不要**用它去否决
+   * 用户贴图。
+   */
+  toolResponseMultimodal?: boolean
+  /**
    * `display_config.max_mode` —— 该模型是否支持 **Max 模式**（1M 上下文）。
    *
    * Max 模式是**逐模型**能力：只有该标志为 `true` 的模型才能被上游接受
@@ -928,6 +968,16 @@ function parseTraeConfigEntry(
       ?? readBooleanField(displayRecord, 'MaxMode')
   const maxContextWindow = readMaxContextWindowField(entry)
   const maxModeOutputTokens = readDetailMaxTokens(entry, '__max')
+  // 图片能力（逐模型，见 `TraeRemoteModel.multimodal` 的说明）。
+  // `multimodal` 与 `tool_response_multimodal` 是**两个独立字段**，不可合并。
+  const multimodal = displayRecord === undefined
+    ? undefined
+    : readBooleanField(displayRecord, 'multimodal')
+      ?? readBooleanField(displayRecord, 'Multimodal')
+  const toolResponseMultimodal = displayRecord === undefined
+    ? undefined
+    : readBooleanField(displayRecord, 'tool_response_multimodal')
+      ?? readBooleanField(displayRecord, 'ToolResponseMultimodal')
   const reasoningConfig = readReasoningEffortConfig(entry)
   // 计费：`display_contact_config` 里的倍率与活动折扣（两次 JSON.parse）。
   const creditsRate = readConsumptionRate(entry)
@@ -942,6 +992,8 @@ function parseTraeConfigEntry(
     ...usage.length > 0 ? { usage } : {},
     ...reasoningConfig === undefined ? {} : { reasoningConfig },
     ...maxMode === undefined ? {} : { maxMode },
+    ...multimodal === undefined ? {} : { multimodal },
+    ...toolResponseMultimodal === undefined ? {} : { toolResponseMultimodal },
     ...maxContextWindow === undefined ? {} : { maxContextWindow },
     ...maxModeOutputTokens === undefined ? {} : { maxModeOutputTokens },
     ...contextWindow === undefined ? {} : { contextWindow },
