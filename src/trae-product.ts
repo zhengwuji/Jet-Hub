@@ -50,7 +50,14 @@ export interface TraeFallbackModel {
  */
 export interface TraeProduct {
   /** provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。 */
-  id: 'trae'
+  id: 'trae' | 'trae-intl'
+  /**
+   * 区域站点：`cn`（国内版，trae.cn）/ `global`（国际版，trae.ai）。
+   *
+   * 官方把两个区域做成**两个独立客户端**（本机实测：`Trae` 与 `Trae CN`
+   * 两套用户数据目录，安装包也不同）。差异全在域名上，协议一致。
+   */
+  site: 'cn' | 'global'
   /** 设置页 / 模型选择器展示名。 */
   displayName: string
   /** 上游 API 基址（Agent 服务：对话 + 模型列表）。 */
@@ -151,14 +158,48 @@ export interface TraeProduct {
   fallbackModels: readonly TraeFallbackModel[]
 }
 
-/** 上游 API 基址（Agent 服务）。 */
+/** 上游 API 基址（Agent 服务，国内版）。 */
 export const TRAE_AGENT_HOST = 'https://trae-api-cn.mchost.guru'
-/** 签到/积分/Ug 基址。 */
+/** 签到/积分/Ug 基址（国内版）。 */
 export const TRAE_UG_HOST = 'https://api.trae.cn'
-/** OAuth/认证基址。 */
+/** OAuth/认证基址（国内版）。 */
 export const TRAE_OAUTH_HOST = 'https://api.trae.com.cn'
-/** 登录门户基址。 */
+/** 登录门户基址（国内版）。 */
 export const TRAE_CONSOLE_HOST = 'https://www.trae.cn'
+
+/**
+ * 国际版（Trae / trae.ai）端点。
+ *
+ * ## 证据来源（本机已装官方客户端，2026-09-22 实测）
+ *
+ * 本机同时存在 `Trae` 与 `Trae CN` 两套客户端用户数据
+ * （`%APPDATA%\Trae` / `%APPDATA%\Trae CN`），从其中的日志与
+ * `ahanet/server.json` 提取到两套互不相同的域名：
+ *
+ * | 维度 | 国内版（Trae CN） | 国际版（Trae） |
+ * |---|---|---|
+ * | 门户 | `www.trae.cn` | `www.trae.ai` |
+ * | 认证 | `api.trae.com.cn` | `api.trae.ai` / `api-us-east.trae.ai` |
+ * | 站点 | `api.trae.cn` | —— |
+ * | Agent | `trae-api-cn.mchost.guru` | `api5-normal-alisg.mchost.guru` |
+ *
+ * ⚠️ **Agent host 不能简单把 `-cn` 换成 `sg`**：国际版真实出站域名是
+ * `api5-normal-alisg.mchost.guru`（日志 `x-tt-net-final-domain` 实测），
+ * 而 `trae-api-sg.mchost.guru` / `trae-api-us.mchost.guru` 出现在
+ * `ahanet/server.json` 的 IP 映射表里 —— 那是**接入点**，与业务 host 不同层。
+ * 取实测出站的那个。
+ *
+ * ⚠️ 国际版**没有** `api.trae.cn` 那层「站点域」，其 Ug（签到/积分）走
+ * `api.trae.ai`（日志里 userRegion=us 时 host 为 `api-us-east.trae.ai`；
+ * 通用入口用 `api.trae.ai`，与 `coresg-normal.trae.ai` 同域族）。
+ */
+export const TRAE_INTL_AGENT_HOST = 'https://api5-normal-alisg.mchost.guru'
+/** 签到/积分/Ug 基址（国际版）。 */
+export const TRAE_INTL_UG_HOST = 'https://api.trae.ai'
+/** OAuth/认证基址（国际版）。 */
+export const TRAE_INTL_OAUTH_HOST = 'https://api.trae.ai'
+/** 登录门户基址（国际版）。 */
+export const TRAE_INTL_CONSOLE_HOST = 'https://www.trae.ai'
 
 /**
  * 兜底模型目录（32 个，对齐 Go 端 staticModels）。
@@ -258,10 +299,11 @@ function resolveMaxModeModels(raw: string | undefined): readonly string[] | unde
 }
 
 /**
- * TRAE provider 配置。
+ * TRAE provider 配置（国内版）。
  */
 export const TRAE: TraeProduct = {
   id: 'trae',
+  site: 'cn',
   displayName: 'TRAE (字节)',
   agentHost: TRAE_AGENT_HOST,
   ugHost: TRAE_UG_HOST,
@@ -283,4 +325,61 @@ export const TRAE: TraeProduct = {
   defaultCredentialRef: 'TRAE_ACCESS_TOKEN',
   userAgent: 'Trae/0.1.52',
   fallbackModels: TRAE_FALLBACK_MODELS,
+}
+
+/**
+ * TRAE 国际版（Trae / trae.ai）。
+ *
+ * 与国内版是**两个独立客户端**（本机实测 `Trae` 与 `Trae CN` 各一套用户数据），
+ * 协议一致、仅域名不同 —— 因此共用同一个 `TraeAdapter`，差异全部由本配置承载，
+ * 与 buddy / workbuddy 那对同源产品同一套做法。
+ *
+ * ⚠️ **登录与账号体系互相独立**：两边的登录态不通（不同 client_id 与门户域），
+ * 故国际版给独立的 `defaultCredentialRef`，账号也各归各的 provider
+ * （`trae` / `trae-intl`），避免串用凭据 —— 这与本插件在 workbuddy 上踩过的
+ * 「provider 实参写死导致查不到账号」是同一类防护。
+ *
+ * ⚠️ 其余身份字段（`clientId` / `appId` / `ideVersion` / `pluginVersion`）
+ * **沿用与国内版相同的值**：本机国际版客户端的日志里能读到
+ * `client_id=ono9krqynydwx5`，但那是**桌面 IDE 的 OAuth client**，与
+ * 「SOLO 通道」所用的 `en1oxy7wnw8j9n` 不是同一套体系（本插件走 SOLO 通道）。
+ * 在没有国际版 SOLO 通道实测凭据前**不臆造新值** —— 沿用已知可用值，
+ * 若上游拒绝会以明确的 `4001` 报错暴露，便于再校正。
+ */
+export const TRAE_INTL: TraeProduct = {
+  id: 'trae-intl',
+  site: 'global',
+  displayName: 'TRAE (国际版)',
+  agentHost: TRAE_INTL_AGENT_HOST,
+  ugHost: TRAE_INTL_UG_HOST,
+  oauthHost: TRAE_INTL_OAUTH_HOST,
+  consoleHost: TRAE_INTL_CONSOLE_HOST,
+  clientId: 'en1oxy7wnw8j9n',
+  appId: '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8',
+  ideVersion: '0.1.52',
+  ideVersionCode: '20260811',
+  deviceBrand: 'Apple',
+  osVersion: 'macOS 15.7.4',
+  function: 'solo_work_lite',
+  channels: TRAE_CHANNELS,
+  fallbackMaxOutputTokens: 32_000,
+  maxMode: resolveMaxModeFlag(process.env.DSH_TRAE_MAX_MODE),
+  maxModeModels: resolveMaxModeModels(process.env.DSH_TRAE_MAX_MODELS),
+  hideInternalModels: isTruthyFlag(process.env.DSH_TRAE_HIDE_INTERNAL),
+  pluginVersion: '2.3.62834',
+  defaultCredentialRef: 'TRAE_INTL_ACCESS_TOKEN',
+  userAgent: 'Trae/0.1.52',
+  fallbackModels: TRAE_FALLBACK_MODELS,
+}
+
+/**
+ * 全部 TRAE 产品配置。
+ *
+ * 国内版与国际版**分别注册**（provider id 为 `trae` / `trae-intl`）。
+ */
+export const ALL_TRAE_PRODUCTS: readonly TraeProduct[] = [TRAE, TRAE_INTL]
+
+/** 按 provider id 取 TRAE 产品配置；未知 id 返回 undefined。 */
+export function traeProductById(id: string): TraeProduct | undefined {
+  return ALL_TRAE_PRODUCTS.find((product) => product.id === id)
 }

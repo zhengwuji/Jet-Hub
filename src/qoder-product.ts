@@ -125,7 +125,15 @@ export interface QoderModelPromotion {
  */
 export interface QoderProduct {
   /** provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。 */
-  id: 'qoder'
+  id: 'qoder' | 'qoder-cn'
+  /**
+   * 区域站点（源码 CLI 的 `site` 概念，`_o = "cn" === site`）。
+   *
+   * 官方客户端把两个区域编译成**同一个代码库的两个构建**（`runtime-info.json`
+   * 里 `build.site` 分别是 `global` / `cn`，git commit 相同），所有区域差异都由
+   * 这个 `site` 常量分流。本字段保留该语义，便于排查时对照源码。
+   */
+  site: 'global' | 'cn'
   /** 设置页 / 模型选择器展示名。 */
   displayName: string
   /** 登录与 OAuth 基址。 */
@@ -310,6 +318,7 @@ const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
 /** Qoder provider 配置（国际版）。 */
 export const QODER: QoderProduct = {
   id: 'qoder',
+  site: 'global',
   displayName: 'Qoder',
   authBase: 'https://qoder.com',
   openApiBase: 'https://openapi.qoder.sh',
@@ -328,8 +337,72 @@ export const QODER: QoderProduct = {
   fallbackModels: QODER_FALLBACK_MODELS,
 }
 
-/** 全部 Qoder 产品配置（当前只有一个，保留数组以便将来扩展中国版）。 */
-export const ALL_QODER_PRODUCTS: readonly QoderProduct[] = [QODER]
+/**
+ * Qoder 国内版（Qoder CN）。
+ *
+ * ## 证据来源（本机已装官方客户端，2026-09-22 实测）
+ *
+ * 本机同时装了 `Qoder`（国际版）与 `Qoder CN` 两个客户端：
+ * - 安装目录 `%LOCALAPPDATA%\Programs\Qoder` 与 `...\Qoder CN`
+ * - 用户数据 `%APPDATA%\com.qoder.app.stable` 与 `com.qodercn.app.stable`
+ * - CLI 配置 `~/.qoder` 与 `~/.qoder-cn`
+ *
+ * 两者是**同一代码库的两个构建**：worker runtime 的 `runtime-info.json` 里
+ * `version` 都是 `1.1.57`、`git.commit` 都是 `e24572e`，只有
+ * `build.site` 分 `global` / `cn`。全部区域差异由源码里的 `site` 常量分流
+ * （`_o = "cn" === site`），对应关系已逐条核对于 worker bundle：
+ *
+ * ```js
+ * Bke = _o ? "qoder.com.cn"            : "qoder.sh"          // 站点域
+ * wR  = _o ? "gateway.qoder.com.cn"    : "api2.qoder.sh"     // 推理/加密推理
+ * wke = _o ? "openapi.qoder.com.cn"    : "openapi.qoder.sh"  // OpenAPI
+ * or  = _o ? "qoderclicn"              : "qodercli"          // CLI 名
+ * Srr = _o ? "QODERCN"                 : "QODER"             // 环境变量前缀
+ * ```
+ *
+ * ⚠️ **`inferBase` 与 `encryptedInferBase` 在国内版是同一个 host**
+ * （`gateway.qoder.com.cn`）—— 源码里两者都指向 `wR`。国际版却是两个不同
+ * host（`api2-v2` 公开 / `api2` 加密）。这是**区域间最容易写错的一处**：
+ * 照抄国际版把国内版写成 `api2.qoder.cn` 之类会直接 404。
+ *
+ * ⚠️ **`authBase` 用 `qoder.cn`**（源码 `environments.prod.websiteBaseUrl` /
+ * `authBaseUrl`），不是 `qoder.com.cn`。后者只是 OpenAPI/网关域。
+ *
+ * ⚠️ 两个区域**共用同一个 device-flow client id**：官方客户端的
+ * `authClientIds.prod` 在两家 asar 里都是 `732aef47-…`（本插件沿用
+ * `e883ade2-…`，那是 CLI 侧 `J_a`，两者并存于不同客户端形态）。故此处
+ * 沿用国际版相同值，不臆造新 id。
+ */
+export const QODER_CN: QoderProduct = {
+  id: 'qoder-cn',
+  site: 'cn',
+  displayName: 'Qoder (国内版)',
+  authBase: 'https://qoder.cn',
+  openApiBase: 'https://openapi.qoder.com.cn',
+  // 国内版公开推理与加密推理同 host（源码两者都是 wR = gateway.qoder.com.cn）。
+  inferBase: 'https://gateway.qoder.com.cn',
+  encryptedInferBase: 'https://gateway.qoder.com.cn',
+  clientId: 'e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb',
+  testClientId: 'e93fe488-5778-4c35-a6fc-0f54ed7b3139',
+  clientMetadata: {
+    client_type: '5',
+    business_product: 'cli',
+    business_type: 'agent',
+    scene: 'assistant',
+  },
+  userAgentPrefix: 'qoder',
+  defaultCredentialRef: 'QODER_CN_ACCESS_TOKEN',
+  fallbackModels: QODER_FALLBACK_MODELS,
+}
+
+/**
+ * 全部 Qoder 产品配置。
+ *
+ * 国际版与国内版**分别注册**（provider id 为 `qoder` / `qoder-cn`），
+ * 与 buddy / workbuddy 那对同源产品同一套做法：共用同一个适配器类，
+ * 差异全部由本文件的端点配置承载，互不覆盖对方的账号。
+ */
+export const ALL_QODER_PRODUCTS: readonly QoderProduct[] = [QODER, QODER_CN]
 
 /**
  * 按 provider id 取 Qoder 产品配置；未知 id 返回 undefined。

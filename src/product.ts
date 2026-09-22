@@ -396,15 +396,78 @@ export const WORKBUDDY: BuddyProduct = {
 }
 
 /**
+ * CodeBuddy 国际版（CodeBuddy AI / www.codebuddy.ai）。
+ *
+ * ⚠️ **必须保留这份配置**：客户端 PROVIDERS 列表里有「CodeBuddy (国际版)」面板，
+ * 服务端因此必须为它建实例 —— 否则面板成空壳，账号池里 `buddy-intl` 的账号
+ * 成孤儿（能看见却无法续期/删除）。
+ *
+ * 与 `CODEBUDDY` 同源（同 `BuddyAdapter`），差异在 endpoint
+ * （`www.codebuddy.ai` vs `copilot.tencent.com`）与凭据 ref。
+ */
+export const CODEBUDDY_INTL: BuddyProduct = {
+  id: 'buddy-intl',
+  platform: 'ide',
+  endpoint: 'https://www.codebuddy.ai',
+  apiDomain: 'www.codebuddy.ai',
+  displayName: 'CodeBuddy (国际版)',
+  productCode: 'codebuddy',
+  userAgent: 'CodeBuddyIDE/1.106.1',
+  attributionName: 'CodeBuddy',
+  clientVersion: '1.106.1',
+  cliVersion: '2.137.1',
+  defaultCredentialRef: 'BUDDY_INTL_ACCESS_TOKEN',
+  appendSessionParams: false,
+  fallbackModels: WORKBUDDY_FALLBACK_MODELS,
+}
+
+/**
+ * WorkBuddy 国内版（腾讯 WorkBuddy / copilot.tencent.com）。
+ *
+ * ⚠️ **必须保留**：本机账号池里就有 `provider: 'workbuddy-cn'` 的真实账号；
+ * 客户端也有对应面板。删掉这份配置会让该账号成孤儿。
+ *
+ * 与 `WORKBUDDY`（国际版）同源，差异在 endpoint 与 `appendSessionParams`。
+ */
+export const WORKBUDDY_CN: BuddyProduct = {
+  id: 'workbuddy-cn',
+  platform: 'workbuddy',
+  endpoint: 'https://copilot.tencent.com',
+  apiDomain: 'copilot.tencent.com',
+  displayName: 'WorkBuddy (国内版)',
+  productCode: 'workbuddy',
+  userAgent: 'CodeBuddyIDE/1.106.1',
+  // 归属与客户端版本：与 `WORKBUDDY` 同族（同 `X-Product` / UA 体系），
+  // 取本产品自己声明的 `pluginVersion`（5.5.4）而**不是**国际版的 5.5.2。
+  // ⚠️ 这三个值用于出站归属头，本机没有国内版客户端可实测比对；若腾讯侧
+  // 账单「使用端」归因异常，优先核对这里。
+  attributionName: 'WorkBuddy',
+  clientVersion: '5.5.4',
+  cliVersion: '5.5.4',
+  defaultCredentialRef: 'WORKBUDDY_CN_ACCESS_TOKEN',
+  appendSessionParams: true,
+  pluginVersion: '5.5.4',
+  fallbackModels: CODEBUDDY_FALLBACK_MODELS,
+}
+
+/**
  * 全部产品配置，供按 id 查询与遍历注册使用。
  *
- * ⚠️ 只有两个产品：`buddy`（CodeBuddy）与 `workbuddy`（WorkBuddy 国际版）。
- * 早期的 `buddy-intl` / `workbuddy-cn` 两个变体已**移除** —— 它们是同一后端
- * 协议下的区域副本，差异全部收敛进本文件的 endpoint / UA 分档配置，
- * 不再需要独立的产品条目。客户端 PROVIDERS 列表中的 `buddy-intl` /
- * `workbuddy-cn` 仅作历史 provider id 的展示兼容，注册表不为其建实例。
+ * ⚠️ **四个产品**，与客户端 PROVIDERS 列表**一一对应**：
+ * `buddy` / `buddy-intl` / `workbuddy-cn` / `workbuddy`。
+ *
+ * 合并时曾一度收敛成两个（只留 `buddy` + `workbuddy`），但客户端列表没同步
+ * 收敛，于是 `buddy-intl` 与 `workbuddy-cn` 两个面板成了**空壳**：面板在、
+ * 后端无实例，账号池里对应 provider 的账号成孤儿。现按「客户端列了就必须
+ * 注册」补齐 —— 该约束由 `tests/unit/plugin.spec.ts` 的
+ * 「客户端列出的每个 provider 都有服务端实例」用例守住。
  */
-export const ALL_PRODUCTS: readonly BuddyProduct[] = [CODEBUDDY, WORKBUDDY]
+export const ALL_PRODUCTS: readonly BuddyProduct[] = [
+  CODEBUDDY,
+  CODEBUDDY_INTL,
+  WORKBUDDY_CN,
+  WORKBUDDY,
+]
 
 /** 按 provider id 取产品配置；未知 id 返回 undefined。 */
 export function productById(id: string): BuddyProduct | undefined {

@@ -1,4 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
 import { apply, makeReadImage } from '../../src/index.js'
@@ -198,13 +201,42 @@ describe('WorkBuddy provider 注册', () => {
     const ctx = createMockContext()
     apply(ctx as never)
     const registered = ctx.llm.registeredProviders
+    // 四个 CodeBuddy 系产品都必须注册：客户端 PROVIDERS 列表列了它们，
+    // 不注册就会出现「面板在、后端无实例」的空壳，账号池里对应 provider
+    // 的账号成孤儿（本机 workbuddy-cn 就有真实账号）。
     expect(registered).toContain('buddy')
+    expect(registered).toContain('buddy-intl')
+    expect(registered).toContain('workbuddy-cn')
     expect(registered).toContain('workbuddy')
-    // 早期变体 `buddy-intl` / `workbuddy-cn` 已随产品收敛移除（见 src/product.ts
-    // 的 ALL_PRODUCTS 注释）：它们是同一协议的区域副本，差异全部收敛进
-    // endpoint / UA 分档配置，不再各自注册 provider 路由。
-    expect(registered).not.toContain('buddy-intl')
-    expect(registered).not.toContain('workbuddy-cn')
+  })
+
+  /**
+   * ⚠️ **不变量：客户端列出的每个 provider 都必须有服务端实例。**
+   *
+   * 真实缺陷（本次修复）：客户端 PROVIDERS 列表里有 `buddy-intl` 与
+   * `workbuddy-cn` 两个面板，但服务端 `ALL_PRODUCTS` 一度只留了
+   * `buddy` + `workbuddy` → 两个面板成了**空壳**（面板在、无适配器），
+   * 账号池里 `workbuddy-cn` 的真实账号成**孤儿**：能看见却无法续期/删除。
+   *
+   * 这条断言直接比对「客户端面板列表」与「服务端已注册路由」两个集合，
+   * 任何一侧新增而另一侧漏加都会立刻失败 —— 比逐个 `toContain` 更难绕过。
+   */
+  it('客户端列出的每个 provider 都有服务端实例（防面板空壳）', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const clientSource = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+    const panelIds = [...clientSource.matchAll(/\{\s*id:\s*'([a-z][a-z0-9-]*)',\s*label:/g)].map((m) => m[1]!)
+
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const registered = new Set(ctx.llm.registeredProviders)
+    // 适配器是「能真正收发请求」的那一层，比 configurableProviders 更硬。
+    const adapters = new Set(ctx.llm.adapters)
+
+    expect(panelIds.length).toBeGreaterThan(0)
+    for (const id of panelIds) {
+      expect(registered, `面板 ${id} 没有对应的 provider 路由（空壳）`).toContain(id)
+      expect(adapters, `面板 ${id} 没有对应的适配器（空壳）`).toContain(id)
+    }
   })
 
   it('WorkBuddy 使用独立的凭据 ref', () => {
@@ -274,10 +306,14 @@ describe('WorkBuddy provider 注册', () => {
     expect(ctx.workbuddyAuth.product.id).toBe('workbuddy')
     expect(ctx.buddyAuth.credentialRefName).toBe('BUDDY_ACCESS_TOKEN')
     expect(ctx.workbuddyAuth.credentialRefName).toBe('WORKBUDDY_ACCESS_TOKEN')
-    // 早期变体 `buddy-intl` / `workbuddy-cn` 已随产品收敛移除（见 src/product.ts
-    // 的 ALL_PRODUCTS 注释），不再各自注册独立的 Auth 服务实例。
-    expect(ctx.buddyIntlAuth).toBeUndefined()
-    expect(ctx.workbuddyCnAuth).toBeUndefined()
+    // CodeBuddy 国际版与 WorkBuddy 国内版同样各有独立实例与凭据 ref ——
+    // 它们与各自的同族产品**互不串用**（端点与登录态都不同）。
+    expect(ctx.buddyIntlAuth).toBeInstanceOf(BuddyAuth)
+    expect(ctx.workbuddyCnAuth).toBeInstanceOf(BuddyAuth)
+    expect(ctx.buddyIntlAuth.product.id).toBe('buddy-intl')
+    expect(ctx.workbuddyCnAuth.product.id).toBe('workbuddy-cn')
+    expect(ctx.buddyIntlAuth.credentialRefName).toBe('BUDDY_INTL_ACCESS_TOKEN')
+    expect(ctx.workbuddyCnAuth.credentialRefName).toBe('WORKBUDDY_CN_ACCESS_TOKEN')
   })
 
   it('workbuddyAuth 只读 WorkBuddy 自己的凭据 ref', async () => {

@@ -78,7 +78,10 @@ describe('积分能力矩阵', () => {
     // 客户端 PROVIDERS 列表与能力表必须同步：漏登记的 provider 会静默失去
     // 积分能力（默认关闭），而多登记的条目则是死配置。
     const source = readClientSource()
-    const providerIds = [...source.matchAll(/\{\s*id:\s*'([a-z]+)',\s*label:/g)].map((m) => m[1]!)
+    // ⚠️ id 允许含连字符：区域变体形如 `qoder-cn` / `trae-intl`。
+    // 早期正则只写 `([a-z]+)`，于是这些区域 provider **搜不到** ——
+    // 能力表漏登记也照样通过，同步断言形同虚设。
+    const providerIds = [...source.matchAll(/\{\s*id:\s*'([a-z][a-z0-9-]*)',\s*label:/g)].map((m) => m[1]!)
     expect(providerIds.length).toBeGreaterThan(0)
     for (const id of providerIds) {
       expect(CREDITS_CAPABILITIES, `缺少 ${id} 的能力登记`).toHaveProperty(id)

@@ -39,10 +39,14 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
   it('Jet Hub RPC 传入 qoder 实例与适配器映射', () => {
     // 末尾的 `modelAdapters` 供「显示列表」取不受黑名单影响的全量目录
     // （使被关闭的模型也显示正确的展示名/倍率，而不是退化成裸 id）。
-    expect(index).toContain(
-      'registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters)',
+    //
+    // ⚠️ 两个区域实例（qoder / qoderCn）都必须传：国内版与国际版端点、
+    // 登录态、账号池各自独立，漏传会让国内版面板完全没有后端。
+    expect(index).toMatch(
+      /registerJetHubRpc\(\s*ctx,\s*pool,\s*service,\s*buddy,\s*buddyIntl,\s*workbuddy,\s*workbuddyCn,\s*lobsterai,\s*qoder,\s*qoderCn,\s*trae,\s*traeIntl,\s*modelAdapters,?\s*\)/,
     )
     expect(index, 'qoder 适配器须登记进映射').toContain('qoder: qoderAdapter')
+    expect(index, 'qoder-cn 适配器须登记进映射').toContain("'qoder-cn': qoderCnAdapter")
   })
 
   it('续期调度只看 refreshable，不看 enabled（AGENTS.md 强制约定）', () => {
@@ -68,8 +72,11 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
 
   it('account.create 有 qoder 的两步式分支', () => {
     const code = codeOnly(rpc)
-    expect(code).toContain('QODER.id')
-    expect(code).toContain('qoder.startLogin(')
+    // 区域族统一分派：用 isQoderProvider(provider) 覆盖 qoder 与 qoder-cn，
+    // 再按 product.id 取对应区域的服务实例。
+    expect(code).toContain('isQoderProvider(provider)')
+    expect(code).toContain('qoderAuthForProduct(provider)')
+    expect(code).toContain('startLogin({ refName })')
   })
 
   it('account.refresh 分派包含 qoder', () => {
@@ -85,7 +92,8 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
     const creditsEnd = code.indexOf("case 'model.list'")
     expect(creditsStart).toBeGreaterThan(-1)
     const creditsBlock = code.slice(creditsStart, creditsEnd)
-    expect(creditsBlock).toContain('QODER.id')
+    // 区域族统一分派：isQoderProvider 覆盖 qoder 与 qoder-cn。
+    expect(creditsBlock).toContain('isQoderProvider(req.provider)')
     expect(creditsBlock).toContain('fetchQoderCreditBalance')
   })
 
@@ -101,7 +109,7 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
     const end = code.indexOf("case 'credits.balances'")
     expect(start).toBeGreaterThan(-1)
     const branch = code.slice(start, end)
-    expect(branch).toContain('QODER.id')
+    expect(branch).toContain('isQoderProvider(req.provider)')
     expect(branch).toContain('claimQoderDailyCheckin')
     // Qoder 的领取流程自带活动列表查询 → 必须跳过外部预检，否则重复发一次 GET。
     expect(branch).toContain('precheckStatus: false')

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { QODER, ALL_QODER_PRODUCTS, qoderProductById } from '../../src/qoder-product.js'
+import { QODER, QODER_CN, ALL_QODER_PRODUCTS, qoderProductById } from '../../src/qoder-product.js'
 import { promotionActiveNow, qoderDisplayName } from '../../src/qoder-adapter.js'
 
 describe('Qoder 产品配置', () => {
@@ -109,8 +109,47 @@ describe('Qoder 产品配置', () => {
 
   it('qoderProductById 命中与未命中', () => {
     expect(qoderProductById('qoder')).toBe(QODER)
+    expect(qoderProductById('qoder-cn')).toBe(QODER_CN)
     expect(qoderProductById('nope')).toBeUndefined()
-    expect(ALL_QODER_PRODUCTS).toHaveLength(1)
+    // 国际版 + 国内版两个区域
+    expect(ALL_QODER_PRODUCTS).toHaveLength(2)
+  })
+
+  /**
+   * Qoder CN（国内版）端点，依据本机已装官方客户端的实测逆向结果。
+   *
+   * 两家是**同一代码库的两个构建**（worker runtime 的 `runtime-info.json` 里
+   * version / git.commit 都相同，只有 `build.site` 分 global / cn），
+   * 全部区域差异由源码的 `site` 常量分流：
+   *
+   * ```js
+   * Bke = _o ? "qoder.com.cn"         : "qoder.sh"
+   * wR  = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"   // 推理 + 加密推理
+   * wke = _o ? "openapi.qoder.com.cn" : "openapi.qoder.sh"
+   * ```
+   */
+  it('国内版端点与官方 Qoder CN 客户端一致', () => {
+    expect(QODER_CN.id).toBe('qoder-cn')
+    expect(QODER_CN.site).toBe('cn')
+    // authBase 是 qoder.cn（environments.prod.websiteBaseUrl），不是 qoder.com.cn。
+    expect(QODER_CN.authBase).toBe('https://qoder.cn')
+    expect(QODER_CN.openApiBase).toBe('https://openapi.qoder.com.cn')
+    // ⚠️ 国内版的公开推理与加密推理是**同一个 host**（源码里都是 wR）；
+    // 国际版才是两个（api2-v2 / api2）。照抄国际版会 404。
+    expect(QODER_CN.inferBase).toBe('https://gateway.qoder.com.cn')
+    expect(QODER_CN.encryptedInferBase).toBe('https://gateway.qoder.com.cn')
+    expect(QODER_CN.inferBase).toBe(QODER_CN.encryptedInferBase)
+    // 国际版相反：两个 host 必须不同（这是既有实测结论，防回退）。
+    expect(QODER.inferBase).not.toBe(QODER.encryptedInferBase)
+  })
+
+  it('两个区域的凭据 ref 互不相同（登录态不通，不得串用）', () => {
+    expect(QODER.defaultCredentialRef).toBe('QODER_ACCESS_TOKEN')
+    expect(QODER_CN.defaultCredentialRef).toBe('QODER_CN_ACCESS_TOKEN')
+    expect(QODER.defaultCredentialRef).not.toBe(QODER_CN.defaultCredentialRef)
+    // 区域站点的判别字段必须写对（用于排查时对照官方源码）。
+    expect(QODER.site).toBe('global')
+    expect(QODER_CN.site).toBe('cn')
   })
 
   /**

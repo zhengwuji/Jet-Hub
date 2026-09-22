@@ -17,10 +17,10 @@ import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
 import { AccountPool } from './account-pool.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
-import { ALL_PRODUCTS, CODEBUDDY, WORKBUDDY } from './product.js'
+import { ALL_PRODUCTS, CODEBUDDY, CODEBUDDY_INTL, WORKBUDDY, WORKBUDDY_CN } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
-import { QODER } from './qoder-product.js'
-import { TRAE } from './trae-product.js'
+import { QODER, QODER_CN } from './qoder-product.js'
+import { TRAE, TRAE_INTL } from './trae-product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
@@ -133,7 +133,10 @@ export function apply(ctx: Context): void {
   // `provider.toUpperCase is not a function` 崩溃。
   // antigravity 复用本机 IDE 凭据，同样需要自己的 namespace。
   registerProviderSettings(
-    ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai', 'llm-qoder', 'llm-trae',
+    ctx,
+    'llm-buddy', 'llm-buddy-intl', 'llm-workbuddy-cn', 'llm-workbuddy',
+    'llm-codearts', 'llm-lobsterai',
+    'llm-qoder', 'llm-qoder-cn', 'llm-trae', 'llm-trae-intl',
     `llm-${ANTIGRAVITY_PROVIDER}`,
   )
   const service = new CodeArtsAuth(ctx)
@@ -214,6 +217,31 @@ export function apply(ctx: Context): void {
     product: CODEBUDDY,
   })
 
+  // ===== CodeBuddy 国际版（www.codebuddy.ai）服务 =====
+  // ⚠️ **必须保留**：客户端 PROVIDERS 里有「CodeBuddy (国际版)」面板，
+  // 且合并前的本地版本就注册过它。合并时一度删掉 → 面板成空壳、已有
+  // `buddy-intl` 账号成孤儿。与国际版同源（同 BuddyAdapter），仅 endpoint 不同。
+  const buddyIntl = new BuddyAuth(ctx, { product: CODEBUDDY_INTL })
+  const buddyIntlAdapter = registerBuddyLlm(ctx, {
+    credentialRef: credentialRef(CODEBUDDY_INTL.defaultCredentialRef),
+    resolveCredential: async () => {
+      const available = await pool.getAvailableAccount(CODEBUDDY_INTL.id, '')
+      if (available) return available.credential as BuddyCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(CODEBUDDY_INTL.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as BuddyCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: () => buddyIntl.refresh(),
+    fetchRemoteModels: () => buddyIntl.fetchModels(pool),
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: CODEBUDDY_INTL,
+  })
+
   // ===== WorkBuddy (腾讯 WorkBuddy) 服务 =====
   // 与 CodeBuddy 同源（同后端、同协议），差异全部由 product 配置承载。
   // 服务名由 BuddyAuth 依 product.id 派生，故两个产品分别注册为
@@ -240,6 +268,31 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
     accountPool: pool,
     product: WORKBUDDY,
+  })
+
+  // ===== WorkBuddy 国内版（copilot.tencent.com）服务 =====
+  // ⚠️ **必须保留**：用户账号池里存在 `workbuddy-cn` 账号（历史遗留），
+  // 合并时一度删掉这份注册，导致该面板成空壳、账号成孤儿。
+  // 与国际版同源（同 BuddyAdapter），仅 endpoint 不同。
+  const workbuddyCn = new BuddyAuth(ctx, { product: WORKBUDDY_CN })
+  const workbuddyCnAdapter = registerBuddyLlm(ctx, {
+    credentialRef: credentialRef(WORKBUDDY_CN.defaultCredentialRef),
+    resolveCredential: async () => {
+      const available = await pool.getAvailableAccount(WORKBUDDY_CN.id, '')
+      if (available) return available.credential as BuddyCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(WORKBUDDY_CN.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as BuddyCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: () => workbuddyCn.refresh(),
+    fetchRemoteModels: () => workbuddyCn.fetchModels(pool),
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: WORKBUDDY_CN,
   })
 
   // ===== LobsterAI (有道龙虾) 服务 =====
@@ -292,7 +345,10 @@ export function apply(ctx: Context): void {
   // ===== Qoder (阿里系 AI IDE) 服务 =====
   // 第五个产品线，协议与四者**都不同源**：PKCE 设备码轮询登录
   // （不起本地回调服务器，见 src/qoder-oauth.ts）。
-  // 服务名由产品 id 派生，注册为 ctx.qoderAuth。
+  //
+  // **两个区域分别注册**（国际版 `qoder` / 国内版 `qoder-cn`）：官方是同一代码库
+  // 的两个构建（`build.site` 分 global / cn，见 src/qoder-product.ts 的端注释），
+  // 端点全不同且账号体系独立，故与 buddy / workbuddy 一样各自成实例、互不覆盖。
   // 与其它 provider 一样不注册斜杠命令：入口在 Jet Hub 的 Qoder 面板。
   const qoder = new QoderAuth(ctx)
   const qoderAdapter = registerQoderLlm(ctx, {
@@ -331,6 +387,35 @@ export function apply(ctx: Context): void {
     product: QODER,
   })
 
+  // ===== Qoder 国内版（Qoder CN）服务 =====
+  // 与上面的国际版共用 QoderAdapter，端点差异全部由 product 配置承载。
+  // 服务名由 product.id 派生 → 注册为 ctx['qoder-cnAuth']，与国际版互不覆盖。
+  const qoderCn = new QoderAuth(ctx, { product: QODER_CN })
+  const qoderCnAdapter = registerQoderLlm(ctx, {
+    credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 `qoder-cn` 的账号池取号，回退到国内版自己的单凭据 ref ——
+      // 绝不回退到国际版 ref（两者登录态不通，串用必然 401）。
+      const available = await pool.getAvailableAccount(QODER_CN.id, '')
+      if (available) return available.credential as QoderCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(QODER_CN.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as QoderCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(QODER_CN.id, '')
+      if (available) await qoderCn.refreshAccountCredential(available.entry.credentialRef)
+      else await qoderCn.refresh()
+    },
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: QODER_CN,
+  })
+
   // ===== TRAE（字节 TRAE IDE）服务 =====
   // 第六个产品线，协议与前面几者**完全不同**：认证用 ExchangeToken（轮换 refreshToken），
   // 对话用 Cloud-IDE-JWT 鉴权，载荷需从 OpenAI 格式转换为 SOLO 格式，
@@ -364,6 +449,39 @@ export function apply(ctx: Context): void {
     product: TRAE,
   })
 
+  // ===== TRAE 国际版（Trae / trae.ai）服务 =====
+  // 与国内版是**两个独立客户端**（本机实测 `Trae` 与 `Trae CN` 各一套用户数据），
+  // 协议一致、仅域名不同 —— 共用同一个 TraeAdapter，差异全部由 TRAE_INTL 承载。
+  // 登录态互不相通，故独立 provider 与独立凭据 ref。
+  // 服务名由 product.id 派生 → 注册为 ctx['trae-intlAuth']。
+  const traeIntl = new TraeAuth(ctx, { product: TRAE_INTL })
+  const traeIntlAdapter = registerTraeLlm(ctx, {
+    credentialRef: credentialRef(TRAE_INTL.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 `trae-intl` 的账号池取号，回退到国际版自己的 ref。
+      const available = await pool.getAvailableAccount(TRAE_INTL.id, '')
+      if (available) return available.credential as TraeCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(TRAE_INTL.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as TraeCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(TRAE_INTL.id, '')
+      if (available) await traeIntl.refreshAccountCredential(available.entry.credentialRef)
+      else await traeIntl.refresh()
+    },
+    fetchRemoteModels: () => traeIntl.fetchModels(pool),
+    // 图片能力与国内版一致：按模型判定（远端 display_config.multimodal），
+    // 这里只负责读字节。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: TRAE_INTL,
+  })
+
   // ===== 多账号静默续期调度 =====
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000 // 每 30 分钟检查一次
 
@@ -375,7 +493,13 @@ export function apply(ctx: Context): void {
       await buddy.refreshAll(pool)
     } catch { /* 静默 */ }
     try {
+      await buddyIntl.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
       await workbuddy.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await workbuddyCn.refreshAll(pool)
     } catch { /* 静默 */ }
     try {
       await lobsterai.refreshAll(pool)
@@ -384,7 +508,13 @@ export function apply(ctx: Context): void {
       await qoder.refreshAll(pool)
     } catch { /* 静默 */ }
     try {
+      await qoderCn.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
       await trae.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await traeIntl.refreshAll(pool)
     } catch { /* 静默 */ }
     // ⚠️ Antigravity **刻意不在此列**：它不接账号池、不做限流轮换，续期由 IDE
     // 自己负责（见下方注册处注释）。把它并进 refreshAll 会引入 Google 侧敏感的
@@ -406,10 +536,14 @@ export function apply(ctx: Context): void {
         clearInterval(refreshTimer)
         service.stop()
         buddy.stop()
+        buddyIntl.stop()
         workbuddy.stop()
+        workbuddyCn.stop()
         lobsterai.stop()
         qoder.stop()
+        qoderCn.stop()
         trae.stop()
+        traeIntl.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -418,10 +552,14 @@ export function apply(ctx: Context): void {
   ctx.effect(() => () => {
     service.stop()
     buddy.stop()
+    buddyIntl.stop()
     workbuddy.stop()
+    workbuddyCn.stop()
     lobsterai.stop()
     qoder.stop()
+    qoderCn.stop()
     trae.stop()
+    traeIntl.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== 可配置 provider 目录项：注册即固定，不做动态增删 =====
@@ -477,10 +615,14 @@ export function apply(ctx: Context): void {
     // 服务实例 `service` 不同名，故这里可以简写）。
     codearts,
     buddy: buddyAdapter,
+    'buddy-intl': buddyIntlAdapter,
     workbuddy: workbuddyAdapter,
+    'workbuddy-cn': workbuddyCnAdapter,
     lobsterai: lobsteraiAdapter,
     qoder: qoderAdapter,
+    'qoder-cn': qoderCnAdapter,
     trae: traeAdapter,
+    'trae-intl': traeIntlAdapter,
   }
   // Antigravity 的适配器实例只在它已注册时登记。`getRegisteredAntigravityAdapter()`
   // 类型上是可选的（注册函数返回的是注销函数而非实例），故此处按需取值，
@@ -490,6 +632,9 @@ export function apply(ctx: Context): void {
     modelAdapters[ANTIGRAVITY_PROVIDER] = antigravityAdapter
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters)
+  registerJetHubRpc(
+    ctx, pool, service, buddy, buddyIntl, workbuddy, workbuddyCn,
+    lobsterai, qoder, qoderCn, trae, traeIntl, modelAdapters,
+  )
   ctx.provide('accountPool', pool)
 }

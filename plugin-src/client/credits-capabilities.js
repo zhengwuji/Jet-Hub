@@ -60,16 +60,25 @@
 export const CREDITS_CAPABILITIES = Object.freeze({
   codearts: Object.freeze({ balance: true, dailyCheckin: true }),
   buddy: Object.freeze({ balance: true, dailyCheckin: true }),
+  // CodeBuddy 国际版：与国内版同一套积分协议，仅端点不同（www.codebuddy.ai）。
+  'buddy-intl': Object.freeze({ balance: true, dailyCheckin: true }),
   workbuddy: Object.freeze({ balance: true, dailyCheckin: false }),
+  // WorkBuddy 国内版（copilot.tencent.com）：后端同样**没有**签到接口。
+  'workbuddy-cn': Object.freeze({ balance: true, dailyCheckin: false }),
   lobsterai: Object.freeze({ balance: true, dailyCheckin: true }),
   // Qoder：余额（`sash/api/v2/me/usage`）+ 每日领取
   // （`sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim`，
   // 2026-09-21 由 keylog 解密抓包解出）。
   // 显式登记而非省略 —— 单测要求本表与 PROVIDERS 同步。
   qoder: Object.freeze({ balance: true, dailyCheckin: true }),
+  // Qoder 国内版（Qoder CN）：与上面同一套积分协议，只是端点不同
+  // （openapi.qoder.com.cn / gateway.qoder.com.cn）。登录态独立，故单列。
+  'qoder-cn': Object.freeze({ balance: true, dailyCheckin: true }),
   // TRAE：余额与签到都有（`/trae/api/v2/pay/ide_user_ent_usage` +
   // `checkin_credits/status` → `checkin_credits/claim`，见 `src/trae-credits.ts`）。
   trae: Object.freeze({ balance: true, dailyCheckin: true }),
+  // TRAE 国际版：同一套签到协议，端点走 trae.ai 系。
+  'trae-intl': Object.freeze({ balance: true, dailyCheckin: true }),
   // Antigravity：**两项都没有**。它复用本机 IDE 的登录态，没有独立的积分
   // 账户体系，也不参与签到。显式登记为全 false 而非省略 —— 单测要求本表与
   // PROVIDERS 同步（漏登记会静默失去能力，多登记则是死配置），且显式 false

@@ -23,8 +23,8 @@ import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { QoderAuth } from './qoder-auth.js'
 import type { TraeAuth } from './trae-auth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
-import { QODER } from './qoder-product.js'
-import { TRAE } from './trae-product.js'
+import { QODER, QODER_CN, qoderProductById } from './qoder-product.js'
+import { TRAE, TRAE_INTL, traeProductById } from './trae-product.js'
 import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobsterai.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import { isQoderRefreshable, qoderCredentialExpiresAtMs } from './qoder.js'
@@ -43,7 +43,7 @@ import {
   type ClaimOutcome,
   type CreditBalance,
 } from './credits.js'
-import { CODEBUDDY, productById, type BuddyProduct } from './product.js'
+import { CODEBUDDY, CODEBUDDY_INTL, WORKBUDDY, WORKBUDDY_CN, productById, type BuddyProduct } from './product.js'
 import {
   claimLobsteraiDailyCheckin,
   fetchLobsteraiCreditBalance,
@@ -507,10 +507,14 @@ export function registerJetHubRpc(
   pool: AccountPool,
   codearts: CodeArtsAuth,
   buddy: BuddyAuth,
+  buddyIntl: BuddyAuth,
   workbuddy: BuddyAuth,
+  workbuddyCn: BuddyAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
+  qoderCn: QoderAuth,
   trae: TraeAuth,
+  traeIntl: TraeAuth,
   /**
    * provider → 适配器实例（可选）。
    *
@@ -522,7 +526,8 @@ export function registerJetHubRpc(
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters,
+      connectionCtx as Context, pool, codearts, buddy, buddyIntl, workbuddy, workbuddyCn,
+      lobsterai, qoder, qoderCn, trae, traeIntl, modelAdapters,
     )
   })
 }
@@ -542,10 +547,14 @@ function registerJetHubEndpoints(
   pool: AccountPool,
   codearts: CodeArtsAuth,
   buddy: BuddyAuth,
+  buddyIntl: BuddyAuth,
   workbuddy: BuddyAuth,
+  workbuddyCn: BuddyAuth,
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
+  qoderCn: QoderAuth,
   trae: TraeAuth,
+  traeIntl: TraeAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   /**
@@ -558,12 +567,36 @@ function registerJetHubEndpoints(
    */
   const buddyServices: ReadonlyMap<string, BuddyAuth> = new Map([
     [CODEBUDDY.id, buddy],
-    // WorkBuddy 的产品 id 为 `workbuddy`（国际版）；国内版 `workbuddy-cn`
-    // 由同一实例承载（两者共用 BuddyAuth，仅 product 配置不同）。
-    ['workbuddy', workbuddy],
-    ['workbuddy-cn', workbuddy],
+    [CODEBUDDY_INTL.id, buddyIntl],
+    [WORKBUDDY_CN.id, workbuddyCn],
+    [WORKBUDDY.id, workbuddy],
   ])
   const buddyAuthForProduct = (productId: string): BuddyAuth | undefined => buddyServices.get(productId)
+
+  /**
+   * Qoder 区域族：国际版 `qoder` / 国内版 `qoder-cn`。
+   *
+   * 两者共用 `QoderAdapter` 与 `QoderAuth`，但**各持独立的续期定时器与凭据 ref**，
+   * 且登录态互不相通（官方是两个独立客户端）。故与 CodeBuddy 系同理，必须按
+   * `product.id` 分派，不能共用一个实例。
+   */
+  const qoderServices: ReadonlyMap<string, QoderAuth> = new Map([
+    [QODER.id, qoder],
+    [QODER_CN.id, qoderCn],
+  ])
+  const qoderAuthForProduct = (productId: string): QoderAuth | undefined => qoderServices.get(productId)
+
+  /** TRAE 区域族：国内版 `trae` / 国际版 `trae-intl`。分派理由同 Qoder。 */
+  const traeServices: ReadonlyMap<string, TraeAuth> = new Map([
+    [TRAE.id, trae],
+    [TRAE_INTL.id, traeIntl],
+  ])
+  const traeAuthForProduct = (productId: string): TraeAuth | undefined => traeServices.get(productId)
+
+  /** 该 provider 是否属于 Qoder 区域族。 */
+  const isQoderProvider = (provider: string): boolean => qoderServices.has(provider)
+  /** 该 provider 是否属于 TRAE 区域族。 */
+  const isTraeProvider = (provider: string): boolean => traeServices.has(provider)
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -797,16 +830,18 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
-        } else if (provider === QODER.id) {
+        } else if (isQoderProvider(provider)) {
           // Qoder 与 codearts / lobsterai 同款两步式，但登录机制不同：
           // 它是**设备码轮询**（不开本地回调服务器，见 src/qoder-oauth.ts），
           // 同样必须在用户授权前返回 loginUrl，理由见上面的 codearts 分支。
-          const started = await qoder.startLogin({ refName })
+          // 按 `provider` 取对应区域的服务实例（国际版 / 国内版端点不同）。
+          const qoderAuth = qoderAuthForProduct(provider) as QoderAuth
+          const started = await qoderAuth.startLogin({ refName })
           // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
           // 登录成功后再回填昵称/有效期等真实字段。
           await pool.addAccount({
             id,
-            provider: QODER.id,
+            provider,
             nickname: id,
             enabled: true,
             credentialRef: refName,
@@ -823,19 +858,20 @@ function registerJetHubEndpoints(
               refreshable: credential !== undefined && isQoderRefreshable(credential),
             })
           }).catch((error: unknown) => {
-            ctx.logger.warn(`[jet-hub] background ${QODER.id} login failed for ${id}: ${String(error)}`)
+            ctx.logger.warn(`[jet-hub] background ${provider} login failed for ${id}: ${String(error)}`)
             // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
-        } else if (provider === TRAE.id) {
+        } else if (isTraeProvider(provider)) {
           // TRAE 回调式登录 + 两步式返回（与 LobsterAI / codearts 同因）。
-          const started = await trae.startLogin({ refName })
+          const traeAuth = traeAuthForProduct(provider) as TraeAuth
+          const started = await traeAuth.startLogin({ refName })
           // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
           // 登录成功后再回填昵称/有效期等真实字段。
           await pool.addAccount({
             id,
-            provider: TRAE.id,
+            provider,
             nickname: id,
             enabled: true,
             credentialRef: refName,
@@ -852,7 +888,7 @@ function registerJetHubEndpoints(
               refreshable: credential !== undefined && isTraeRefreshable(credential),
             })
           }).catch((error: unknown) => {
-            ctx.logger.warn(`[jet-hub] background ${TRAE.id} login failed for ${id}: ${String(error)}`)
+            ctx.logger.warn(`[jet-hub] background ${provider} login failed for ${id}: ${String(error)}`)
             // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
             void pool.removeAccount(id).catch(() => {})
           })
@@ -926,8 +962,18 @@ function registerJetHubEndpoints(
             case 'buddy':
               await buddy.refreshAccountCredential(entry.credentialRef)
               break
+            case CODEBUDDY_INTL.id:
+              // ⚠️ 早期漏了这一条：`buddy-intl` 账号的「刷新」会落到 default
+              // 抛 `Unknown provider`。
+              await buddyIntl.refreshAccountCredential(entry.credentialRef)
+              break
             case 'workbuddy':
               await workbuddy.refreshAccountCredential(entry.credentialRef)
+              break
+            case WORKBUDDY_CN.id:
+              // ⚠️ 早期漏了这一条：`workbuddy-cn` 账号卡片的「刷新」按钮会落到
+              // default 分支抛 `Unknown provider`（与 WorkBuddy 那个历史缺陷同类）。
+              await workbuddyCn.refreshAccountCredential(entry.credentialRef)
               break
             case LOBSTERAI.id:
               await lobsterai.refreshAccountCredential(entry.credentialRef)
@@ -935,8 +981,14 @@ function registerJetHubEndpoints(
             case QODER.id:
               await qoder.refreshAccountCredential(entry.credentialRef)
               break
+            case QODER_CN.id:
+              await qoderCn.refreshAccountCredential(entry.credentialRef)
+              break
             case TRAE.id:
               await trae.refreshAccountCredential(entry.credentialRef)
+              break
+            case TRAE_INTL.id:
+              await traeIntl.refreshAccountCredential(entry.credentialRef)
               break
             case ANTIGRAVITY_PROVIDER:
               // Antigravity 不进账号池，凭据由 IDE 自己续期（见 AGENTS.md 约束 5）。
@@ -1078,9 +1130,10 @@ function registerJetHubEndpoints(
             } satisfies RpcCreditsStatusResponse,
           }
         }
-        if (req.provider === TRAE.id) {
+        if (isTraeProvider(req.provider)) {
           // TRAE 有签到状态端点，但需要发起 Ug 请求获取（见 claim 内部的多步流程）。
           // 与 LobsterAI/CodeArts 一样如实返回 null，由 claimAll 自行处理预检。
+          // 国内版与国际版共用同一套签到协议，故按区域族统一分派。
           const accounts = await pool.listAccounts(req.provider)
           return {
             ok: true,
@@ -1105,16 +1158,21 @@ function registerJetHubEndpoints(
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         const accounts = await pool.listAccounts(req.provider)
-        if (req.provider === QODER.id) {
+        if (isQoderProvider(req.provider)) {
           // Qoder 的领取流程**自带活动列表查询**（loadCampaigns → 逐个 claim），
           // 故 precheckStatus: false 跳过外部那次检查 —— 否则会重复发一次 GET
           // （与 LobsterAI 传 false 的理由同类）。
           //
           // ⚠️ Qoder 的幂等判据是响应体的 `replayed:true`（重复领取同样返回
           // HTTP 200），已在 claimQoderCampaign 内部处理。
+          //
+          // ⚠️ 必须按 `req.provider` 取对应区域的产品：两国版端点不同
+          // （国际 openapi.qoder.sh / 国内 openapi.qoder.com.cn），
+          // 用错会打到对方的账号体系上。
+          const qoderProduct = qoderProductById(req.provider) ?? QODER
           const value = await collectClaimResults<QoderCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimQoderDailyCheckin(credential, QODER),
+            claim: (credential) => claimQoderDailyCheckin(credential, qoderProduct),
             precheckStatus: false,
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
@@ -1147,7 +1205,9 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
         }
-        if (req.provider === TRAE.id) {
+        if (isTraeProvider(req.provider)) {
+          // 国内版与国际版共用同一套签到协议，仅端点不同，故按区域取产品配置。
+          const traeProduct = traeProductById(req.provider) ?? TRAE
           const value = await collectClaimResults<TraeCredential, undefined>(accounts, undefined, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             // ⚠️ **必须开启状态预检**（`precheckStatus` 默认为 true，不要传 false）。
@@ -1159,11 +1219,11 @@ function registerJetHubEndpoints(
             // 被报成「领取成功」（用户报障：显示成功但 +0 积分）。
             // 判据只能是 status 端点的 `checked_in`。
             fetchStatus: (credential) =>
-              fetchTraeCheckinStatus(credential as TraeCredential, TRAE, fetch),
+              fetchTraeCheckinStatus(credential as TraeCredential, traeProduct, fetch),
             claim: (credential, _product, entry) =>
               claimTraeDailyCheckin(
                 credential as TraeCredential,
-                TRAE,
+                traeProduct,
                 fetch,
                 pool.traeCheckinDeviceGenerationFor(entry.id),
                 (next) => pool.updateTraeCheckinDeviceGeneration(entry.id, next),
@@ -1230,11 +1290,13 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
-        if (req.provider === QODER.id) {
+        if (isQoderProvider(req.provider)) {
           // 余额来自 `GET /sash/api/v2/me/usage`（实测只需 Bearer +
           // Cosy-ClientType，**不需要**模型列表那样的 WASM 签名）。
           // `fetchQoderCreditBalance` 只吃 QoderCredential，故这里不用
           // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
+          // 按区域取产品：两国版余额端点不同（openapi.qoder.sh / .com.cn）。
+          const qoderProduct = qoderProductById(req.provider) ?? QODER
           const values: RpcCreditsBalancesResponse['accounts'] = []
           for (const account of accounts) {
             const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
@@ -1255,7 +1317,7 @@ function registerJetHubEndpoints(
               })
               continue
             }
-            const balance = await fetchQoderCreditBalance(credential, QODER)
+            const balance = await fetchQoderCreditBalance(credential, qoderProduct)
             values.push({
               accountId: account.id,
               nickname: account.nickname,
@@ -1266,8 +1328,10 @@ function registerJetHubEndpoints(
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
-        if (req.provider === TRAE.id) {
-          const values = await collectCreditBalances(accounts, TRAE, {
+        if (isTraeProvider(req.provider)) {
+          // 按区域取产品：两国版积分端点不同（api.trae.cn / api.trae.ai）。
+          const traeProduct = traeProductById(req.provider) ?? TRAE
+          const values = await collectCreditBalances(accounts, traeProduct, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential, product) => fetchTraeCreditBalance(credential as TraeCredential, product),
             warn: (msg) => ctx.logger?.warn?.(msg),

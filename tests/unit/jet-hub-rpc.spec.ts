@@ -638,10 +638,12 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     registerJetHubRpc(
       ctx as never, pool as never,
       makeAuth('codearts') as never,
-      {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never,
       makeAuth('lobsterai') as never,
       makeAuth('qoder') as never,
+      {} as never,
       makeAuth('trae') as never,
+      {} as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -721,7 +723,13 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         }
       },
     }
-    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never, {} as never)
+    // 参数顺序：ctx, pool, codearts, buddy, buddyIntl, workbuddy, workbuddyCn,
+    //           lobsterai, qoder, qoderCn, trae, traeIntl
+    registerJetHubRpc(
+      ctx as never, pool as never, auth as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never,
+    )
     const response = await handler!(new Request('http://localhost/api/jet-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -772,8 +780,10 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
     }
     registerJetHubRpc(
       ctx as never, pool as never,
-      {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never,
       failingAuth as never,
+      {} as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -927,8 +937,12 @@ describe('model.list / model.setDisabled 端点', () => {
       logger: { warn: () => {}, info: () => {} },
     }
 
+    // 参数顺序：ctx, pool, codearts, buddy, buddyIntl, workbuddy, workbuddyCn,
+    //           lobsterai, qoder, qoderCn, trae, traeIntl, modelAdapters
     registerJetHubRpc(
-      ctx as never, pool, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      ctx as never, pool,
+      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never,
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -1192,7 +1206,11 @@ describe('积分端点的 provider 能力边界', () => {
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(
+      ctx as never, pool as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never,
+    )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
@@ -1366,7 +1384,11 @@ describe('account.reorder 端点', () => {
       logger: { warn: () => {}, info: () => {} },
       credentials: { resolve: async () => undefined },
     }
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(
+      ctx as never, pool as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never,
+    )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     const call = async (method: string, payload: unknown) => {

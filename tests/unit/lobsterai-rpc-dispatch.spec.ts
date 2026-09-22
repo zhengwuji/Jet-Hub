@@ -80,15 +80,21 @@ async function callRefresh(
 ): Promise<{ calls: RefreshCall[]; value: { success: boolean; error?: string } }> {
   const calls: RefreshCall[] = []
   const { ctx, getHandler } = makeCtx(accounts)
+  // 参数顺序：ctx, pool, codearts, buddy, buddyIntl, workbuddy, workbuddyCn,
+  //           lobsterai, qoder, qoderCn, trae, traeIntl
   registerJetHubRpc(
     ctx as never,
     makePool(accounts) as never,
     makeServiceStub('codearts', calls) as never,
     makeServiceStub('buddy', calls) as never,
+    makeServiceStub('buddy-intl', calls) as never,
     makeServiceStub('workbuddy', calls) as never,
+    makeServiceStub('workbuddy-cn', calls) as never,
     makeServiceStub('lobsterai', calls) as never,
     makeServiceStub('qoder', calls) as never,
+    makeServiceStub('qoder-cn', calls) as never,
     makeServiceStub('trae', calls) as never,
+    makeServiceStub('trae-intl', calls) as never,
   )
   const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
     method: 'POST',

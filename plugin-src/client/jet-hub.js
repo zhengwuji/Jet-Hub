@@ -77,8 +77,14 @@ const PROVIDERS = Object.freeze([
   { id: 'workbuddy-cn', label: 'WorkBuddy (国内版)', icon: WORKBUDDY_ICON, logoClass: 'workbuddy' },
   { id: 'workbuddy', label: 'WorkBuddy (国际版)', icon: WORKBUDDY_ICON, logoClass: 'workbuddy' },
   { id: 'lobsterai', label: 'LobsterAI (有道)', icon: LOBSTERAI_ICON, logoClass: 'lobsterai' },
-  { id: 'qoder', label: 'Qoder', icon: QODER_ICON, logoClass: 'qoder' },
-  { id: 'trae', label: 'TRAE (字节)', icon: TRAE_ICON, logoClass: 'trae' },
+  // Qoder 分国际/国内两版：官方是同一代码库的两个构建，端点与账号体系完全独立
+  // （见 src/qoder-product.ts 的 QODER_CN 注释）。两侧模型池不同，故各占一个面板。
+  { id: 'qoder', label: 'Qoder (国际版)', icon: QODER_ICON, logoClass: 'qoder' },
+  { id: 'qoder-cn', label: 'Qoder (国内版)', icon: QODER_ICON, logoClass: 'qoder' },
+  // TRAE 同理：国内版（trae.cn）与国际版（trae.ai）是两个独立客户端，
+  // 登录态互不相通，故各占一个面板。
+  { id: 'trae', label: 'TRAE (国内版)', icon: TRAE_ICON, logoClass: 'trae' },
+  { id: 'trae-intl', label: 'TRAE (国际版)', icon: TRAE_ICON, logoClass: 'trae' },
   { id: 'antigravity', label: 'Antigravity (Google)', icon: ANTIGRAVITY_ICON, logoClass: 'antigravity', reuse: true },
 ]);
 
