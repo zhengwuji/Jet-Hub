@@ -7,6 +7,7 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { isCodeArtsBenefitModel } from './models.js'
 import { signRequestHuawei } from './sign.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
@@ -15,17 +16,22 @@ export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/a
 export const PROVIDER = 'codearts'
 
 // DeepSeek V4（CodeArts Agent 模型列表新增，UI 标注"每日 1000 万免费 Tokens"福利）：
-// e2e 实测（2026-08-20，对齐 deveco-code 62834ff6）后端实际注册的模型 ID：
-// - deepseek-v4-flash（无日期后缀）✅ 可直接收发消息
-// - deepseek-v4-flash-0731（IDE 列表显示的带日期后缀 ID）❌ 后端返回
-//   InferHub.002002009.404 "The model is not registered"——后端未注册此 ID
-// - deepseek-v4-pro ✅ 可直接收发消息
-// 结论：IDE 模型列表显示的 flash ID 与后端实际注册 ID 不一致，使用无后缀的 deepseek-v4-flash。
+//
+// 修正（2026-09-23，对齐 deveco-code-rust fb1b4a2）：早期注释称
+// 「deepseek-v4-flash-0731 后端未注册」，该结论**有误** —— 实测它返回 404 的
+// 真实原因是**缺少 `maas_type: benefit` 头**；带上该头即成功。带日期后缀与
+// 无后缀是后端上两个不同的模型，均有注册，不能互相替代：
+//   - deepseek-v4-flash-0731 / deepseek-v4-pro-0813 → benefit 模型（需 maas_type）
+//   - deepseek-v4-flash / deepseek-v4-pro（无后缀）  → 非 benefit（带该头会
+//     `unsupported model`）
+// gateway/config 返回的是 benefit 那组，故下方静态表保留无后缀形态
+// （无后缀始终可用，不依赖 benefit 头），而 deepseek-v4.1-flash 只有 benefit 形态。
 const DEFAULT_MODELS: readonly string[] = [
   'GLM-5.2', 'GLM-5.1', 'GLM-5',
   'glm-5.3-flash',
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
   'deepseek-v4-flash', 'deepseek-v4-pro',
+  'deepseek-v4.1-flash',
 ]
 
 /**
@@ -33,6 +39,8 @@ const DEFAULT_MODELS: readonly string[] = [
  * - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
  * - glm-5.3-flash：1048576（1M，逆向自 IDE gateway/config，对齐 deveco-code-rust 90aeb17d）。
  * - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
+ * - deepseek-v4.1-flash：1000000（对齐 IDE 下发的 inferhub-provider 模型配置，
+ *   2026-09 kernel 日志；对齐 deveco-code-rust fb1b4a2）。
  * - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
@@ -40,16 +48,8 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['glm-5.3-flash', 1_048_576],
   ['deepseek-v4-flash', 1048576],
   ['deepseek-v4-pro', 1048576],
+  ['deepseek-v4.1-flash', 1_000_000],
 ])
-
-/**
- * glm-5.3-flash（CodeArts Agent 后端新增模型，2026-08 加入）是 benefit（免费额度）
- * 模型：chat 请求必须携带 `maas_type: benefit` 请求头且参与 SDK-HMAC-SHA256
- * 签名，否则后端返回 InferHub.002002009.404 "model is not registered"。
- * 逆向自 CodeArts Agent IDE mitmproxy 抓包（snap-access/api/v2/chat/completions），
- * 对齐 deveco-code-rust 90aeb17d（codearts.rs chat_stream signer + e2e 实测）。
- */
-const MAAS_TYPE_BENEFIT_MODELS: ReadonlySet<string> = new Set(['glm-5.3-flash'])
 
 export interface CodeArtsAdapterOptions {
   credentialRef: CredentialRef
@@ -932,12 +932,21 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 因限流已尝试过的账号 id：保证每个账号只试一次，试完才判定"全部受限"。
     const rateLimitTried = new Set<string>()
     if (currentAccountId) rateLimitTried.add(currentAccountId)
+    // benefit（免费额度）模型判定在重试循环外先算好：它要读 benefit 集合缓存
+    // （`~/.cache/deveco/codearts_benefit_models.json`），不宜每轮重试都做 IO。
+    // 集合来自 gateway/config 的模型清单 ∪ 静态兜底（见 isCodeArtsBenefitModel），
+    // 使后端新增 benefit 模型时无需改代码即可自动识别。
+    const isBenefitModel = isCodeArtsBenefitModel(options.model)
     for (;;) {
-      // glm-5.3-flash 是 benefit（免费额度）模型，后端要求 maas_type: benefit
-      // 头参与 SDK-HMAC-SHA256 签名，否则返回 InferHub.002002009.404
-      // "model not registered"（逆向自 CodeArts Agent IDE 抓包，见
-      // MAAS_TYPE_BENEFIT_MODELS 注释）。
-      const extraSignedHeaders = MAAS_TYPE_BENEFIT_MODELS.has(options.model) ? { maas_type: 'benefit' } : undefined
+      // benefit（免费额度）模型（glm-5.3-flash、deepseek-v4.1-flash 等）后端要求
+      // maas_type: benefit 头参与 SDK-HMAC-SHA256 签名，否则返回
+      // InferHub.002002009.404 "model is not registered"。
+      //
+      // 判定必须是**动态**的：早期只硬编码 glm-5.3-flash 一个模型，导致
+      // deepseek-v4.1-flash 等其它 benefit 模型调用失败（用户报障：
+      // 发消息后报 Insufficient Balance / QUOTA —— 缺该头时后端按非 benefit
+      // 通道处理该模型）。实证见 CODEARTS_BENEFIT_FALLBACK 注释。
+      const extraSignedHeaders = isBenefitModel ? { maas_type: 'benefit' } : undefined
       const signed = await signRequestHuawei(
         credential.access_key_id,
         credential.secret_access_key,

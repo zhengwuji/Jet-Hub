@@ -2,6 +2,7 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { CHAT_API_BASE, CodeArtsAdapter, QUEUE_STATUS_BASE } from '../../src/llm-adapter.js'
+import { setBenefitMemoryCache } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 const CREDENTIAL_REF = credentialRef('CODEARTS_ACCESS_TOKEN')
@@ -73,14 +74,17 @@ describe('CodeArtsAdapter', () => {
     // 后端 /v1/default/models 下发的 model_id 为全小写。
     // DeepSeek V4（对齐 deveco-code 62834ff6）：CodeArts Agent 模型列表新增
     // deepseek-v4-flash / deepseek-v4-pro（UI 标注每日 1000 万免费 Tokens 福利）。
-    // e2e 实测确认后端实际注册的 flash ID 是 deepseek-v4-flash（无 -0731 后缀），
-    // IDE 显示的 deepseek-v4-flash-0731 后端返回 404 not registered。
+    // ⚠️ 早期注释称「deepseek-v4-flash-0731 后端未注册」，该结论**有误**
+    // （2026-09-23 修正，对齐 deveco-code-rust fb1b4a2）：它返回 404 的真实原因是
+    // **缺少 maas_type: benefit 头**，带上即成功；带日期后缀与无后缀是后端上两个
+    // 不同的模型，不能互相替代。
     const models = await makeAdapter().listModels('codearts')
     const ids = models.map(model => model.id)
     expect(ids).toContain('openpangu-2.0-flash')
     expect(ids).toContain('openpangu-2.0-pro')
     expect(ids).toContain('deepseek-v4-flash')
     expect(ids).toContain('deepseek-v4-pro')
+    expect(ids).toContain('deepseek-v4.1-flash')
     const flash = models.find(model => model.id === 'openpangu-2.0-flash')
     const pro = models.find(model => model.id === 'openpangu-2.0-pro')
     const dsFlash = models.find(model => model.id === 'deepseek-v4-flash')
@@ -95,7 +99,8 @@ describe('CodeArtsAdapter', () => {
 
   it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
     // GLM-5.2：202752；glm-5.3-flash：1048576（1M，对齐 deveco-code-rust 90aeb17d）；
-    // deepseek-v4-flash/pro：1048576（1M）。
+    // deepseek-v4-flash/pro：1048576（1M）；deepseek-v4.1-flash：1000000
+    // （对齐 IDE 下发的 inferhub-provider 模型配置，2026-09 kernel 日志）。
     // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
     const adapter = makeAdapter()
     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
@@ -106,6 +111,8 @@ describe('CodeArtsAdapter', () => {
     expect(dsFlash.context).toEqual({ contextWindow: 1048576 })
     const dsPro = await adapter.resolveModel('codearts', 'deepseek-v4-pro')
     expect(dsPro.context).toEqual({ contextWindow: 1048576 })
+    const dsV41Flash = await adapter.resolveModel('codearts', 'deepseek-v4.1-flash')
+    expect(dsV41Flash.context).toEqual({ contextWindow: 1_000_000 })
     const glm51 = await adapter.resolveModel('codearts', 'GLM-5.1')
     expect(glm51.context).toBeUndefined()
     const pangu = await adapter.resolveModel('codearts', 'openpangu-2.0-pro')
@@ -206,6 +213,51 @@ describe('CodeArtsAdapter', () => {
     const adapter = makeAdapter({ fetchImpl })
     for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
     expect(fetchImpl).toHaveBeenCalled()
+  })
+
+  it('signs deepseek-v4.1-flash with maas_type: benefit（真实缺陷回归）', async () => {
+    // 真实缺陷（用户报障，2026-09-23）：deepseek-v4.1-flash 是 benefit 模型，
+    // 必须带 maas_type: benefit，而早期实现把该集合硬编码为只有 glm-5.3-flash
+    // → 发消息后调用失败（实测不带该头返回 InferHub.002002009.404
+    // "The model is not registered"，带上即成功）。
+    // 对齐 deveco-code-rust fb1b4a2 的动态判定。
+    setBenefitMemoryCache([]) // 隔离磁盘缓存，只走静态兜底集合
+    try {
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers)
+        expect(headers.get('maas_type')).toBe('benefit')
+        // 必须参与 SDK-HMAC-SHA256 签名（出现在 SignedHeaders 中），
+        // 否则服务端验签失败。
+        expect(headers.get('Authorization') ?? '').toContain('maas_type')
+        return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+      })
+      const adapter = makeAdapter({ fetchImpl })
+      const texts: string[] = []
+      for await (const chunk of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) {
+        if (chunk.type === 'text-delta') texts.push(chunk.text)
+      }
+      expect(texts).toEqual(['ok'])
+    } finally {
+      setBenefitMemoryCache(undefined)
+    }
+  })
+
+  it('does not send maas_type for the suffix-less deepseek-v4-flash', async () => {
+    // 无后缀 deepseek-v4-flash 是**非 benefit** 模型（带 maas_type 反而
+    // `unsupported model`）；它是 gateway 的 -0731 形态经归一化后的 id，
+    // 而 -0731 才是 benefit —— 两者是后端上不同的模型，不能混为一谈。
+    setBenefitMemoryCache([])
+    try {
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        expect(new Headers(init?.headers).get('maas_type')).toBeNull()
+        return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+      })
+      const adapter = makeAdapter({ fetchImpl })
+      for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4-flash' } as never)) { /* drain */ }
+      expect(fetchImpl).toHaveBeenCalled()
+    } finally {
+      setBenefitMemoryCache(undefined)
+    }
   })
 
   it('refreshes the credential once when the chat request fails with APIG.0602 and retries successfully', async () => {

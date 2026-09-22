@@ -472,7 +472,56 @@ IDE 按 name 归并，我们按 id 列出。二者是**不同区域的独立计�
 计费字段）、`scripts/probe-promotions.mjs`（`credits` 全量与促销结构）、
 `scripts/probe-lobsterai-cost.mjs`（LobsterAI 倍率归属）、
 `scripts/probe-lobsterai-dupes.mjs`（LobsterAI 同名检查）、
+`scripts/probe-codearts-benefit.mjs`（CodeArts benefit 集合与判定）、
 `scripts/verify-description.mjs`（端到端打印**切换菜单实际渲染的 name**）
+
+## ⚠️ CodeArts benefit（免费额度）模型：集合必须动态判定，不能硬编码模型名
+
+CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**：benefit
+（免费额度）与非 benefit。**benefit 模型的 chat 请求必须带 `maas_type: benefit`
+请求头，且该头必须参与 SDK-HMAC-SHA256 签名**，否则后端返回
+`InferHub.002002009.404 The model is not registered`（HTTP 200 + SSE 内嵌错误）。
+反过来，给**非** benefit 模型带该头会被拒（`unsupported model`）。
+
+**真实缺陷**（用户报障，2026-09-23）：用 `deepseek-v4.1-flash` 发消息后失败
+（`Insufficient Balance` / `QUOTA`）。根因是 `src/llm-adapter.ts` 早期把 benefit
+集合**硬编码**为 `new Set(['glm-5.3-flash'])` —— `deepseek-v4.1-flash` 是
+2026-09 新增的 benefit 模型，因此从不带该头，后端按非 benefit 通道处理它。
+
+实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`）：
+
+| 模型 id | 来源 | 不带 maas_type | 带 maas_type |
+|---|---|---|---|
+| `glm-5.3-flash` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4-flash-0731` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4-pro-0813` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4-flash`（无后缀） | 静态表 / 归一化结果 | ✓ 成功 | ✗ unsupported |
+| `deepseek-v4-pro`（无后缀） | 静态表 / 归一化结果 | ✓ 成功 | ✗ unsupported |
+| `GLM-5.2` | model/builtin | ✓ 成功 | ✗ unsupported |
+
+结论：**`gateway/config` 返回的模型即 benefit 集合**，无需靠模型名硬编码。
+
+要点：
+
+- 判定 `isCodeArtsBenefitModel`（`src/models.ts`）：远端拉取并缓存的集合
+  （`~/.cache/deveco/codearts_benefit_models.json`）∪ 静态兜底
+  `CODEARTS_BENEFIT_FALLBACK`（`glm-5.3-flash` / `deepseek-v4.1-flash`）。
+  远端集合优先，后端新增 benefit 模型**无需改代码**
+- ⚠️ **只记录「归一化未改写」的 id**：gateway 下发的是
+  `deepseek-v4-flash-0731`，而 `normalizeModelId` 会把它改写成
+  `deepseek-v4-flash` —— 两者在后端是**不同模型、benefit 属性相反**，
+  记录改写后的 id 会让无后缀模型多带 `maas_type` 而失败
+- ⚠️ **判定必须在 `stream()` 的重试循环外算一次**（要读缓存文件，不宜每轮 IO）
+- ⚠️ **缓存读写必须用顶层 `import { … } from 'node:fs'`，不能用 `require`** ——
+  本包是 ESM（`package.json` 的 `"type": "module"`），`require` 未定义、抛
+  ReferenceError 后被 `catch` 静默吞掉，表现为「写不进也读不回」（`loadModelsCache`
+  的模型列表磁盘缓存曾因此长期失效）
+- `deepseek-v4.1-flash` 的上下文窗口按 IDE 下发的 inferhub-provider 配置声明为
+  **1000000**（与无后缀 v4-flash/pro 的 1048576 不同）
+- 回归用例：`tests/unit/models.spec.ts`（集合判定 / 落盘不含改写 id / 缓存往返）、
+  `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
+  v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
 ## 模型黑名单（Jet Hub「显示列表」开关）
 

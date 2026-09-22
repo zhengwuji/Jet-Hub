@@ -7,15 +7,21 @@ import type { CodeArtsCredential } from '../../src/types.js'
 // 默认跳过，以免 CI 和普通 `pnpm test` 触发真实后端调用。
 const E2E = process.env.DSH_CODEARTS_E2E === '1'
 
-// e2e 实测（2026-08-20，对齐 deveco-code 62834ff6）确认的后端可用模型 ID：
+// e2e 实测确认的后端可用模型 ID：
 // - deepseek-v4-flash（无日期后缀）✅ 后端已注册，可收发消息
-// - deepseek-v4-flash-0731（IDE 列表显示的带日期后缀 ID）❌ 后端返回
-//   InferHub.002002009.404 "The model is not registered"
 // - deepseek-v4-pro ✅ 后端已注册，可收发消息
-// provider.ts 只注册无后缀的 deepseek-v4-flash，本用例验证两个可用模型能正常收发消息。
+// - deepseek-v4.1-flash ✅ benefit（免费额度）模型，**必须带 maas_type: benefit**
+//
+// ⚠️ 修正（2026-09-23，对齐 deveco-code-rust fb1b4a2）：早期注释称
+// 「deepseek-v4-flash-0731 后端未注册」，该结论**有误** —— 它返回
+// InferHub.002002009.404 的真实原因是**缺少 maas_type: benefit 头**，带上即成功。
+// 带日期后缀与无后缀是后端上两个不同的模型（benefit 属性相反），不能互相替代：
+// gateway/config 下发的 benefit 组（-0731 / -0813 / deepseek-v4.1-flash）必须带该头，
+// 而无后缀的 deepseek-v4-flash / -pro 带上反而报 `unsupported model`。
 const V4_MODELS = [
   { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
   { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
 ] as const
 
 /**
