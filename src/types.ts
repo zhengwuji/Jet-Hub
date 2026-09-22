@@ -58,6 +58,20 @@ export interface ProviderAccountEntry {
   refreshable: boolean
   /** 每个模型的重置时间，key=模型ID（毫秒时间戳） */
   modelRateLimits?: Record<string, number>
+  /**
+   * TRAE 签到设备轮换代次（仅 `trae` provider 使用）。
+   *
+   * 业务码 `9074`（签到人数过多）的限流范围是 **device_id 而非账号**：
+   * 命中后把代次 +1，即可由 `device_id` 派生出一个全新的签到设备号绕开它
+   * （见 `src/trae.ts` 的 `deriveCheckinDeviceId`）。
+   *
+   * 这里只存**整数代次**而不是新设备号本身：派生结果由
+   * `(credential.device_id, generation)` 唯一决定，故无需改写凭据本体
+   * （登录凭据里的 `device_id` 是设备指纹，动它会牵涉风控）。
+   *
+   * 缺省/0 = 使用凭据原始 `device_id`，既有账号行为完全不变。
+   */
+  traeCheckinDeviceGeneration?: number
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -71,6 +85,12 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
 /** Jet Hub 在 ctx.settings 中的 schema */
 export interface JetHubConfig {
   accounts: ProviderAccountEntry[]
+  /**
+   * 模型黑名单：provider id → 模型 id → true。
+   *
+   * **黑名单制**：只有键存在且为 true 的模型被隐藏，未记录的模型默认打开。
+   */
+  disabledModels?: Record<string, Record<string, boolean>>
 }
 
 /** RPC 端点请求/响应类型 */
@@ -106,6 +126,18 @@ export interface RpcUpdateAccountRequest {
 
 export interface RpcDeleteAccountRequest {
   accountId: string
+}
+
+/**
+ * RPC: 重排某 provider 的账号顺序（Jet Hub 拖拽排序）。
+ *
+ * 传该 provider **全部**账号 id 的目标顺序；服务端据此重写数组顺序，
+ * 该顺序即自动选号/限流换号的候选优先级（见 `AccountPool.reorderAccounts`）。
+ */
+export interface RpcReorderAccountsRequest {
+  provider: string
+  /** 该 provider 全部账号 id，按目标顺序排列。 */
+  orderedIds: string[]
 }
 
 export interface RpcRefreshAccountRequest {
@@ -219,6 +251,82 @@ export interface RpcCreditsClaimSummary {
 export interface RpcCreditsClaimAllResponse {
   results: RpcCreditsClaimAccountResult[]
   summary: RpcCreditsClaimSummary
+}
+
+/**
+ * ========================================
+ * 积分余额（Credits Balance）
+ * ========================================
+ */
+
+/** RPC: 查询某 provider 下全部账号的积分余额请求 */
+export interface RpcCreditsBalancesRequest {
+  provider: string
+}
+
+/**
+ * 单个账号的积分余额。
+ *
+ * 与签到状态的设计取舍不同：余额**带回每个包的明细**而不只是总数 ——
+ * 用户看到「347.87」时通常还想知道它由哪些包构成、各自何时到期（实测一个
+ * 账号常同时有「Bonus Pack」与「Free Plan Subscription」两个周期不同的包）。
+ * 明细只有几项，一次带回比让前端再发一次请求更划算。
+ */
+export interface RpcCreditsBalanceAccount {
+  accountId: string
+  nickname: string
+  /** 余额查询失败（网络/凭据/响应异常）时为 null —— 与「余额为 0」严格区分。 */
+  balance: import('./credits.js').CreditBalance | null
+  /** 查询失败的原因，供 UI 提示（成功时为 undefined）。 */
+  error?: string
+}
+
+/** RPC: 查询积分余额响应 */
+export interface RpcCreditsBalancesResponse {
+  accounts: RpcCreditsBalanceAccount[]
+}
+
+/**
+ * ========================================
+ * 模型列表可见性（黑名单开关）
+ * ========================================
+ */
+
+/** RPC: 列出某 provider 的模型请求 */
+export interface RpcModelListRequest {
+  provider: string
+}
+
+/**
+ * 单个模型在设置页的展示条目。
+ *
+ * `disabled` 由服务端按黑名单回填，`name` 是适配器播报的展示名 ——
+ * 两者都取自**权威来源**（适配器的 listModels），而不是前端自己再拼一份
+ * 模型清单，否则远端模型池变化时设置页与对话框会显示两套不同的列表。
+ */
+export interface RpcModelListEntry {
+  id: string
+  name: string
+  /** true = 已关闭（不出现在对话框的模型选择里）。 */
+  disabled: boolean
+}
+
+/** RPC: 列出某 provider 的模型响应 */
+export interface RpcModelListResponse {
+  models: RpcModelListEntry[]
+}
+
+/** RPC: 打开/关闭某个模型请求 */
+export interface RpcModelSetDisabledRequest {
+  provider: string
+  modelId: string
+  disabled: boolean
+}
+
+/** RPC: 打开/关闭某个模型响应（回传写入后的完整黑名单，便于前端校验） */
+export interface RpcModelSetDisabledResponse {
+  provider: string
+  disabledModels: Record<string, boolean>
 }
 
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */

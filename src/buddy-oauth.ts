@@ -38,6 +38,7 @@ import {
   isRefreshable,
   parseAccountData,
   parseModelsFromConfig,
+  parsePromotions,
   parseTokenData,
 } from './buddy.js'
 import type { BuddyAccount, BuddyCredential, BuddyRemoteModel, BuddyToken } from './buddy.js'
@@ -373,7 +374,25 @@ export async function fetchModels(
   // 返回 500 或空列表），故失败时回退到 /v3/config，仍失败则由调用方回退
   // 静态目录。三层回退保证任何一层可用都能给出模型列表。
   const scoped = await requestScopedModels(credential, headers, fetcher, signal, product)
-  if (scoped !== undefined) return scoped
+  if (scoped !== undefined) {
+    // ⚠️ **两个端点下发的模型 id 集合不同，必须取并集。**
+    //
+    // 实测（2026-09-21，账号 3C656A62）：
+    //   scoped    → `hy4-preview`、`hy4-preview-x`（30 个模型）
+    //   /v3/config→ **`hy4-preview-f`**（22 个模型）
+    // 而「限时免费」促销的 `modelIds` 只写着 `["hy4-preview-f"]`
+    // —— 挂在我们**没有采用**的那个 id 上。
+    //
+    // 早期实现只返回 scoped，于是该促销永远对不上，界面显示 `x0.29`
+    // 而 IDE 显示免费（用户报障「hy4 preview 现在 ide 是免费我们还是 0.29」）。
+    //
+    // 故这里补取 `/v3/config` 并**合并两个端点的模型**（同 id 以 scoped 为准，
+    // 它带更完整的元数据），同时取其促销表。任何失败都不影响模型列表 ——
+    // 促销与补充模型都只是增强。
+    const config = await requestConfig(headers, fetcher, signal, product)
+    const merged = mergeRemoteModels(scoped, config.models)
+    return config.promotions.size === 0 ? merged : applyPromotions(merged, config.promotions)
+  }
 
   // 第二优先：/v3/config（结果同样是 data.models / data.agents 结构）
   const url = `${product.endpoint}${CONFIG_PATH}`
@@ -386,6 +405,68 @@ export async function fetchModels(
   } catch {
     return []
   }
+}
+
+/**
+ * 按 id 合并两个端点的模型列表。
+ *
+ * 同名 id 以 **`primary`（scoped 端点）为准** —— 它带更完整的元数据，
+ * 且与既有策略一致（「采信实际命中的那个端点，不做跨端点取大」）。
+ * `extra` 里 primary 没有的 id **追加在后**，从而既保留主目录的顺序与权威性，
+ * 又不会丢掉只在另一个端点下发的变体（如 `hy4-preview-f`）。
+ */
+function mergeRemoteModels(
+  primary: readonly BuddyRemoteModel[],
+  extra: readonly BuddyRemoteModel[],
+): BuddyRemoteModel[] {
+  const known = new Set(primary.map((model) => model.id))
+  return [...primary, ...extra.filter((model) => !known.has(model.id))]
+}
+
+/** `/v3/config` 的解析结果：模型 + 促销表。 */
+interface BuddyConfigSnapshot {
+  models: BuddyRemoteModel[]
+  promotions: Map<string, string>
+}
+
+/**
+ * 取 `/v3/config` 的模型与促销表。
+ *
+ * 只用于给 scoped 端点补「另一套 id 的模型」与促销信息（该端点两者都不全）。
+ * 任何失败都返回空快照 —— 它们是展示增强，不该让整个模型列表失败。
+ */
+async function requestConfig(
+  headers: Record<string, string>,
+  fetcher: typeof fetch,
+  signal: AbortSignal | undefined,
+  product: BuddyProduct,
+): Promise<BuddyConfigSnapshot> {
+  const empty: BuddyConfigSnapshot = { models: [], promotions: new Map() }
+  try {
+    const { status, body } = await request('GET', `${product.endpoint}${CONFIG_PATH}`, headers, {
+      fetcher, timeoutMs: REQUEST_TIMEOUT_MS, ...signal !== undefined ? { signal } : {},
+    })
+    if (status !== 200 || typeof body !== 'object' || body === null) return empty
+    const data = (body as Record<string, unknown>).data
+    if (typeof data !== 'object' || data === null) return empty
+    return {
+      models: parseModelsFromConfig(body),
+      promotions: parsePromotions(data as Record<string, unknown>),
+    }
+  } catch {
+    return empty
+  }
+}
+
+/** 把促销表并入模型列表（只补 `discountedCreditsRate`，其余字段不动）。 */
+function applyPromotions(
+  models: BuddyRemoteModel[],
+  promotions: Map<string, string>,
+): BuddyRemoteModel[] {
+  return models.map((model) => {
+    const discounted = promotions.get(model.id)
+    return discounted === undefined ? model : { ...model, discountedCreditsRate: discounted }
+  })
 }
 
 /** 企业模型端点的 scope 段：个人账号用字面量 `personal`。 */

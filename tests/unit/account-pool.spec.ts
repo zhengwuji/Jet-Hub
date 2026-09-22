@@ -12,22 +12,32 @@ import type { ProviderAccountEntry } from '../../src/types.js'
  */
 function createMockContext(
   initialAccounts: ProviderAccountEntry[] = [],
-  options: { staleReads?: boolean } = {},
+  options: { staleReads?: boolean; initialDisabledModels?: Record<string, Record<string, boolean>> } = {},
 ) {
-  let stored: { accounts?: ProviderAccountEntry[] } = { accounts: initialAccounts }
+  let stored: { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, Record<string, boolean>> } = {
+    accounts: initialAccounts,
+    ...options.initialDisabledModels !== undefined ? { disabledModels: options.initialDisabledModels } : {},
+  }
   // 滞后读：get() 返回的这个值只在"下一次 replace 之后"才追平
-  let visible: { accounts?: ProviderAccountEntry[] } = stored
+  let visible = stored
   const replaceCalls: Array<ProviderAccountEntry[]> = []
+  // 每次 replace 的完整载荷：用于断言「写账号时没有把黑名单抹掉」这类
+  // 整体替换语义带来的数据丢失。
+  const replacePayloads: Array<Record<string, unknown>> = []
   const mockSettings = {
     register: (_ns: string, _schema: unknown) => ({
       get: () => (options.staleReads ? visible : stored),
-      replace: async (value: { accounts?: ProviderAccountEntry[] }) => {
+      replace: async (value: {
+        accounts?: ProviderAccountEntry[]
+        disabledModels?: Record<string, Record<string, boolean>>
+      }) => {
         if (options.staleReads) {
           // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
           visible = stored
         }
         stored = value
         replaceCalls.push(value.accounts ?? [])
+        replacePayloads.push(value as Record<string, unknown>)
       },
     }),
     describe: () => [{ ns: 'jet-hub', value: stored }],
@@ -35,6 +45,7 @@ function createMockContext(
   const mockCredentials = new Map<string, string>()
   return {
     replaceCalls,
+    replacePayloads,
     logger: { warn: () => {}, info: () => {} },
     get: (key: string) => key === 'settings' ? mockSettings : undefined,
     credentials: {
@@ -181,6 +192,125 @@ describe('AccountPool', () => {
     expect(list[0].modelRateLimits?.['deepseek-v4-flash']).toBeUndefined()
     expect(list[0].modelRateLimits?.['deepseek-v4-pro']).toBeDefined()
   })
+
+  // ── 手动排序（Jet Hub 拖拽）──
+  // 顺序即 getAvailableAccount 的候选优先级，故这些用例同时守「持久化」与
+  // 「真的影响选号」两件事 —— 只测前者会让拖拽退化成 UI 装饰。
+  describe('reorderAccounts', () => {
+    /** 建三个同 provider 账号，凭据齐备，便于验证选号结果。 */
+    async function seedThree(ids: string[]): Promise<void> {
+      for (const id of ids) {
+        const ref = `BUDDY_ACCOUNT_${id.toUpperCase()}`
+        await ctx.credentials.set(credentialRef(ref), JSON.stringify({ access_token: id }))
+        await pool.addAccount(makeMockAccount({ id, credentialRef: ref }))
+      }
+    }
+
+    it('重排后 listAccounts 顺序随之改变', async () => {
+      await seedThree(['a', 'b', 'c'])
+      await pool.reorderAccounts('buddy', ['c', 'a', 'b'])
+      const list = await pool.listAccounts('buddy')
+      expect(list.map(a => a.id)).toEqual(['c', 'a', 'b'])
+    })
+
+    it('重排真正影响 getAvailableAccount 的选号结果', async () => {
+      await seedThree(['a', 'b', 'c'])
+      // 默认顺序取第一个
+      expect((await pool.getAvailableAccount('buddy', ''))?.entry.id).toBe('a')
+      // 把 c 拖到首位后，自动选号应改用 c
+      await pool.reorderAccounts('buddy', ['c', 'b', 'a'])
+      expect((await pool.getAvailableAccount('buddy', ''))?.entry.id).toBe('c')
+    })
+
+    it('手动顺序优先于「限流重置时间更早」的账号', async () => {
+      // 这是本次改动的**核心语义**。早期实现按「重置时间最早到期」重排候选，
+      // 会让手动顺序形同虚设。
+      //
+      // ⚠️ 构造要点（前两版都写错了，说明保留于此）：
+      // 1. 查询的 modelId 必须**正是**账号带限流标记的那个模型 ——
+      //    否则 `ra - rb` 恒为 0，旧排序根本不换位，测试恒通过；
+      // 2. 两个账号都必须**已过限流期**（`Date.now() >= resetAt`），
+      //    否则会被候选过滤掉，根本进不了排序。
+      const past = Date.now() - 10_000
+      const pastLater = Date.now() - 5_000
+      await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_A'), JSON.stringify({ access_token: 'a' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'a', credentialRef: 'BUDDY_ACCOUNT_A',
+        // a 的限流重置时间**更晚**（但都已过期）
+        modelRateLimits: { 'deepseek-v4-flash': pastLater },
+      }))
+      await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_B'), JSON.stringify({ access_token: 'b' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'b', credentialRef: 'BUDDY_ACCOUNT_B',
+        // b 更早 → 旧排序会把 b 排到 a 前面
+        modelRateLimits: { 'deepseek-v4-flash': past },
+      }))
+
+      // 两者限流均已过期 → 都进候选。手动顺序 a→b，故应取 a；
+      // 旧排序按重置时间升序会把 b 提到前面。
+      expect((await pool.getAvailableAccount('buddy', 'deepseek-v4-flash'))?.entry.id).toBe('a')
+      await pool.reorderAccounts('buddy', ['b', 'a'])
+      expect(
+        (await pool.getAvailableAccount('buddy', 'deepseek-v4-flash'))?.entry.id,
+        '手动顺序未生效：选号仍按限流重置时间重排',
+      ).toBe('b')
+    })
+
+    it('限流期内的账号被跳过，即使它排在最前（限流豁免）', async () => {
+      const limited = Date.now() + 3600000
+      await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_A'), JSON.stringify({ access_token: 'a' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'a', credentialRef: 'BUDDY_ACCOUNT_A',
+        modelRateLimits: { 'deepseek-v4-flash': limited },
+      }))
+      await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_B'), JSON.stringify({ access_token: 'b' }))
+      await pool.addAccount(makeMockAccount({ id: 'b', credentialRef: 'BUDDY_ACCOUNT_B' }))
+
+      // a 排首位但对目标模型限流中 → 应跳到 b
+      await pool.reorderAccounts('buddy', ['a', 'b'])
+      expect((await pool.getAvailableAccount('buddy', 'deepseek-v4-flash'))?.entry.id).toBe('b')
+    })
+
+    it('不影响其他 provider 账号的相对位置与下标', async () => {
+      // 账号存在一个全局数组里，而设置页按 provider 分组渲染。
+      // 拖 CodeArts 不应顺带改动 Buddy 账号的位置。
+      await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_B1'), JSON.stringify({ access_token: 'b1' }))
+      await pool.addAccount(makeMockAccount({ id: 'b1', credentialRef: 'BUDDY_ACCOUNT_B1' }))
+      await ctx.credentials.set(credentialRef('CODEARTS_ACCOUNT_C1'), JSON.stringify({ access_key_id: 'c1' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'c1', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_C1',
+      }))
+      await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_B2'), JSON.stringify({ access_token: 'b2' }))
+      await pool.addAccount(makeMockAccount({ id: 'b2', credentialRef: 'BUDDY_ACCOUNT_B2' }))
+
+      await pool.reorderAccounts('codearts', ['c1'])
+      const all = await pool.listAllAccounts()
+      // Buddy 两个账号仍在各自原本的下标（0 与 2），未被挪动
+      expect(all.map(a => a.id)).toEqual(['b1', 'c1', 'b2'])
+    })
+
+    it('id 集合不一致时抛错且不改动数据（前端列表过期）', async () => {
+      await seedThree(['a', 'b', 'c'])
+      // 少一个
+      await expect(pool.reorderAccounts('buddy', ['a', 'b'])).rejects.toThrow()
+      // 多一个未知 id
+      await expect(pool.reorderAccounts('buddy', ['a', 'b', 'c', 'zzz'])).rejects.toThrow()
+      // 重复 id
+      await expect(pool.reorderAccounts('buddy', ['a', 'a', 'b'])).rejects.toThrow()
+      // 数据未被破坏
+      const list = await pool.listAccounts('buddy')
+      expect(list.map(a => a.id)).toEqual(['a', 'b', 'c'])
+    })
+
+    it('重排只写账号字段，不抹掉模型黑名单', async () => {
+      // writeAccounts 是整体 replace，漏带 disabledModels 会把它清空。
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      await seedThree(['a', 'b', 'c'])
+      await pool.reorderAccounts('buddy', ['c', 'b', 'a'])
+      expect([...pool.disabledModelsFor('buddy')]).toEqual(['glm-5.2'])
+    })
+  })
+
 
   it('should list all accounts', async () => {
     await pool.addAccount(makeMockAccount())
@@ -530,5 +660,259 @@ describe('pruneAccountsWithForeignDomain', () => {
     const left = await pool.listAllAccounts()
     expect(left).toHaveLength(1)
     expect(left[0]!.id).toBe('workbuddy_account_b')
+  })
+})
+
+/**
+ * 模型黑名单（Jet Hub 的「显示列表」开关）。
+ *
+ * 语义核心是**黑名单制**：只有被显式关闭的模型会隐藏，未记录的模型
+ * 一律默认打开。这保证服务端新增模型时不需要任何配置就能出现在选择器里
+ * —— 白名单制会把新模型静默挡在门外，是这套开关最容易踩的坑。
+ */
+describe('AccountPool 模型黑名单', () => {
+  it('未配置时没有任何模型被关闭（默认全开）', () => {
+    const pool = new AccountPool(createMockContext() as never)
+    expect(pool.disabledModelsFor('buddy').size).toBe(0)
+    expect(pool.listDisabledModels('buddy')).toEqual({})
+  })
+
+  it('关闭模型后该模型进入黑名单，其余模型不受影响', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+
+    const disabled = pool.disabledModelsFor('buddy')
+    expect(disabled.has('glm-5.2')).toBe(true)
+    // 没被关掉的模型默认打开 —— 黑名单制的关键断言
+    expect(disabled.has('deepseek-v4-flash')).toBe(false)
+    expect(disabled.has('hy3')).toBe(false)
+  })
+
+  it('重新打开时删除条目，而不是写入 false', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.setModelDisabled('buddy', 'glm-5.2', false)
+
+    expect(pool.disabledModelsFor('buddy').size).toBe(0)
+    // 打开后 provider 表变空，应当整体从配置里消失（不留 { buddy: {} } 噪音）
+    const last = ctx.replacePayloads.at(-1)!
+    expect(last.disabledModels).toEqual({})
+  })
+
+  it('不同 provider 的黑名单互不影响', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.setModelDisabled('workbuddy', 'gpt-5.4', true)
+
+    expect([...pool.disabledModelsFor('buddy')]).toEqual(['glm-5.2'])
+    expect([...pool.disabledModelsFor('workbuddy')]).toEqual(['gpt-5.4'])
+    expect(pool.disabledModelsFor('codearts').size).toBe(0)
+  })
+
+  it('关闭多个模型后全部保留', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.setModelDisabled('buddy', 'hy3', true)
+    await pool.setModelDisabled('buddy', 'kimi-k2.6', true)
+
+    expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'hy3', 'kimi-k2.6'])
+  })
+
+  it('从已有配置载入黑名单', () => {
+    const pool = new AccountPool(createMockContext([], {
+      initialDisabledModels: { buddy: { 'glm-5.2': true } },
+    }) as never)
+    const disabled = pool.disabledModelsFor('buddy')
+    expect(disabled.has('glm-5.2')).toBe(true)
+    expect(disabled.size).toBe(1)
+  })
+
+  /**
+   * 回归：settings 的 replace() 是**整体替换**。写账号列表时若不带上
+   * disabledModels，用户刚设置的模型开关会被下一次账号操作（新增/删除/
+   * 限流标记）静默清空。
+   */
+  it('写账号列表时不会抹掉已有的黑名单', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    await pool.addAccount({
+      id: 'buddy-x', provider: 'buddy', nickname: 'X', enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_X', createdAt: Date.now(), refreshable: true,
+    })
+
+    expect(ctx.replacePayloads.at(-1)!.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+    expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+  })
+
+  /** 反向回归：写黑名单时若丢掉账号列表，账号池会被清空。 */
+  it('写黑名单时不会抹掉账号列表', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.addAccount({
+      id: 'buddy-y', provider: 'buddy', nickname: 'Y', enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_Y', createdAt: Date.now(), refreshable: true,
+    })
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+
+    expect(ctx.replacePayloads.at(-1)!.accounts).toHaveLength(1)
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  it('配置文件里的脏数据被忽略而不是抛错', () => {
+    // 模拟手工编辑过的/老版本的配置文件：数组、字符串、false 都应被丢弃
+    const pool = new AccountPool(createMockContext([], {
+      initialDisabledModels: {
+        buddy: { 'glm-5.2': true, 'hy3': false, 'bad': 'yes' } as never,
+        broken: ['glm-5.2'] as never,
+      },
+    }) as never)
+
+    // 只有显式 true 的条目生效
+    expect([...pool.disabledModelsFor('buddy')]).toEqual(['glm-5.2'])
+    // 结构非法的 provider 整层丢弃
+    expect(pool.disabledModelsFor('broken').size).toBe(0)
+  })
+
+  it('无 settings scope 时降级为内存态，不抛错', async () => {
+    const pool = new AccountPool({ get: () => undefined, logger: { warn: () => {}, info: () => {} } } as never)
+    await pool.setModelDisabled('buddy', 'glm-5.2', true)
+    expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+  })
+})
+
+describe('AccountPool · TRAE 签到设备轮换代次', () => {
+  let ctx: ReturnType<typeof createMockContext>
+  let pool: AccountPool
+
+  function makeTraeAccount(overrides: Partial<ProviderAccountEntry> = {}): ProviderAccountEntry {
+    return {
+      id: 'trae-1',
+      provider: 'trae',
+      nickname: 'trae-user',
+      enabled: true,
+      credentialRef: 'TRAE_ACCOUNT_T1',
+      createdAt: Date.now(),
+      refreshable: true,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    ctx = createMockContext()
+    pool = new AccountPool(ctx as never)
+  })
+
+  it('默认代次为 0（既有账号行为不变）', async () => {
+    await pool.addAccount(makeTraeAccount())
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(0)
+  })
+
+  it('写入后读回新代次', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 3)
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(3)
+  })
+
+  it('只接受更大的代次（防止乱序回调把代次写回小值）', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 5)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 2)
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(5)
+  })
+
+  it('非法代次（0 / 负数 / NaN）被忽略', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 0)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', -1)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', Number.NaN)
+    expect(pool.traeCheckinDeviceGenerationFor('trae-1')).toBe(0)
+  })
+
+  it('账号不存在时不抛错', async () => {
+    await expect(pool.updateTraeCheckinDeviceGeneration('nope', 1)).resolves.toBeUndefined()
+    expect(pool.traeCheckinDeviceGenerationFor('nope')).toBe(0)
+  })
+
+  it('不破坏同一账号条目的其它字段（modelRateLimits 等）', async () => {
+    await pool.addAccount(makeTraeAccount())
+    await pool.updateModelRateLimit('trae-1', 'glm-5.2', Date.now() + 60_000)
+    await pool.updateTraeCheckinDeviceGeneration('trae-1', 2)
+
+    const entry = (await pool.listAccounts('trae')).find(a => a.id === 'trae-1')!
+    expect(entry.traeCheckinDeviceGeneration).toBe(2)
+    expect(entry.modelRateLimits?.['glm-5.2']).toBeGreaterThan(0)
+  })
+
+  /**
+   * `hasLoggedInAccount` —— 「没有已登录账号就不显示该 provider 的模型」的判据。
+   *
+   * 必须由这个测试锁死三条语义（都容易被改错）：
+   * 1. 判据是**凭据能否解析**，不是「有没有条目」（`logout()` 只清凭据、留条目）；
+   * 2. **不看 `enabled`**（停用只影响自动选号，与是否已登录无关）；
+   * 3. CodeArts 的**单凭据 ref** 必须能作为额外判据传入。
+   */
+  describe('hasLoggedInAccount（模型目录门控判据）', () => {
+    it('没有账号条目时返回 false', async () => {
+      expect(await pool.hasLoggedInAccount('trae')).toBe(false)
+    })
+
+    it('有账号且凭据可解析时返回 true', async () => {
+      await pool.addAccount(makeTraeAccount())
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_T1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+    })
+
+    it('⚠️ 有条目但凭据读不到（已登出）时返回 false', async () => {
+      // `Auth.logout()` 只 unset 凭据、**保留账号条目**，故不能只看「有条目」，
+      // 否则用户登出后模型仍然显示，门控形同虚设。
+      await pool.addAccount(makeTraeAccount())
+      // 故意不写凭据（等价于 logout 之后的状态）
+      expect(await pool.hasLoggedInAccount('trae')).toBe(false)
+    })
+
+    it('⚠️ 账号被停用（enabled=false）但凭据仍在时**仍返回 true**', async () => {
+      // 停用只影响「自动选号」，不代表「未登录」。若这里返回 false，
+      // 把所有账号停用的用户会发现整个 provider 的模型凭空消失 ——
+      // 与「续期只看 refreshable、不看 enabled」是同一条既有约定。
+      await pool.addAccount(makeTraeAccount({ enabled: false }))
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_T1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+    })
+
+    it('只统计本 provider 的账号（不串号）', async () => {
+      await pool.addAccount(makeTraeAccount())
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_T1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+      expect(await pool.hasLoggedInAccount('lobsterai')).toBe(false)
+    })
+
+    it('多账号时任一凭据可用即为 true', async () => {
+      await pool.addAccount(makeTraeAccount())
+      await pool.addAccount(makeTraeAccount({ id: 'trae-2', credentialRef: 'TRAE_ACCOUNT_2' }))
+      // 只有第二个账号的凭据可用
+      await ctx.credentials.set(credentialRef('TRAE_ACCOUNT_2'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('trae')).toBe(true)
+    })
+
+    it('⚠️ 只认账号池条目，不再有「单凭据 ref」例外', async () => {
+      // CodeArts 早期的单凭据模式（固定 ref `CODEARTS_ACCESS_TOKEN`）已移除：
+      // 即便该 ref 下有凭据，账号池为空时也应返回 false —— 六个 provider 判据一致。
+      await ctx.credentials.set(credentialRef('CODEARTS_ACCESS_TOKEN'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('codearts')).toBe(false)
+      // 在账号池里登记后才是「已登录」。
+      await pool.addAccount({
+        id: 'codearts-1',
+        provider: 'codearts',
+        nickname: 'ca',
+        enabled: true,
+        credentialRef: 'CODEARTS_ACCOUNT_1',
+        createdAt: Date.now(),
+        refreshable: true,
+      })
+      await ctx.credentials.set(credentialRef('CODEARTS_ACCOUNT_1'), '{"access_token":"AT"}')
+      expect(await pool.hasLoggedInAccount('codearts')).toBe(true)
+    })
   })
 })

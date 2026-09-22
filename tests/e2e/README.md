@@ -11,12 +11,18 @@
 | `buddy-cache-probe.e2e.spec.ts` | `DSH_BUDDY_E2E=1` + `DSH_BUDDY_E2E_CONFIRM=yes` | 直连 `/v2/chat/completions`，发 3 组前缀做缓存对比 |
 | `buddy-pool-probe.e2e.spec.ts` | `DSH_BUDDY_POOL_E2E=1` + `DSH_BUDDY_POOL_E2E_CONFIRM=yes` | 用账号池凭据走完整 LLM 链路 |
 | `buddy-ratelimit-probe.e2e.spec.ts` | `DSH_BUDDY_RATELIMIT_E2E=1` + `DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes` | 对记录「限额重置」的账号实发一次请求，**判定是否真限流** |
+| `trae-channels-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | 拉真实多通道目录，并用**真实适配器**对 `glm-5.1`（agent 通道）与 `glm-5-turbo`（work 通道）各发一条最短消息 —— **验证「模型只在列出它的通道里可调用」**。消耗 2 次极小额度 |
 | `antigravity-local.e2e.spec.ts` | `DSH_ANTIGRAVITY_E2E=1` + `DSH_ANTIGRAVITY_E2E_CONFIRM=yes` | 走 IDE 本地私有通道发一条真实消息并取回回复。请求由 IDE 自己发出，但**确实计费**，故默认不执行 |
+
+> LobsterAI **没有**发 chat 请求的 e2e —— 它的对话链路可在 Jet Hub 里人工验证
+> （选一个模型发一句话即可），单独写探针的边际价值低于维护成本。
+> 认证与签到已有只读探针（见下表）。
 
 ## 不消耗模型积分
 
 | 文件 | 闸门 | 说明 |
 |------|------|------|
+| `qoder-chat-probe.e2e.spec.ts` | `DSH_QODER_CHAT_E2E=1` + `DSH_QODER_CHAT_E2E_CONFIRM=yes` | 发一次推理请求验证 SSE，并**验证续期接受本插件生成的 `machine_id`**。默认模型 `qmodel_38max`（**免费额度**）；设 `DSH_QODER_MODEL` 可换付费模型（那时会消耗积分） |
 | `v4-models.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | deepseek-v4-flash / pro（**每日 1000 万免费 Tokens**） |
 | `v4-large-write.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | deepseek-v4-flash 大文件写入（同上，免费额度） |
 | `login.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | 只走 CodeArts 浏览器登录与凭据换取 |
@@ -24,6 +30,13 @@
 | `workbuddy-claim-probe.e2e.spec.ts` | `DSH_WORKBUDDY_CLAIM_E2E=1` + `DSH_WORKBUDDY_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（不改模型额度，但会改动账号当日签到状态） |
 | `antigravity.e2e.spec.ts` | `DSH_ANTIGRAVITY_E2E=1`（只读）<br>`+ DSH_ANTIGRAVITY_E2E_CONFIRM=yes`（发出站请求） | 读本机 IDE 凭据 → 官方客户端续期 → `loadCodeAssist` 认证。**两级闸门**：默认只跑只读用例（零网络） |
 | `antigravity-local.e2e.spec.ts` | `DSH_ANTIGRAVITY_E2E=1`（只读）<br>`+ DSH_ANTIGRAVITY_E2E_CONFIRM=yes`（消耗配额） | 发现 language_server → 拉模型清单 → 建会话。**第一级全部打向 `127.0.0.1`，零出站流量**；只有第二级才真实推理 |
+| `lobsterai-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` | **只读**：凭据结构、客户端版本号动态解析、签到槽位/上下文、积分余额。**不签到、不发模型请求** |
+| `lobsterai-claim-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` + `DSH_LOBSTERAI_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
+| `codearts-credits-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | **只读**：凭据结构、**账户类型检测**（`is_credit_package`）、积分余额、活动列表。**绝不领取** |
+| `codearts-claim-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` + `DSH_CODEARTS_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（会改动当日领取状态；**不消耗模型积分**，重复运行幂等） |
+| `qoder-probe.e2e.spec.ts` | `DSH_QODER_E2E=1` | **只读**：凭据结构（含 `machine_id`）、令牌对 `/api/v1/userinfo` 的有效性、静态兜底模型表。**不发模型请求、不续期** |
+| `trae-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | **只读**：凭据结构（含 machine_id / device_id）、积分余额、签到状态、远端模型列表。**不签到、不发模型请求** |
+| `trae-claim-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` + `DSH_TRAE_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -61,12 +74,49 @@ pnpm test:e2e:antigravity:full     # 追加：token 续期 + Cloud Code 端点�
 # 前提：Antigravity IDE 必须正在运行
 pnpm test:e2e:antigravity-local      # 只读：发现进程 + 模型清单 + 建会话（全打 127.0.0.1，零出站）
 pnpm test:e2e:antigravity-local:full # ⚠️ 追加：真实发一条消息（消耗账号配额）
-```
 
 > **两条 Antigravity 测试的区别**：`antigravity` 系列验证**方案 A**（插件直连
 > Google 公共 API，本机实测 403 `SUBSCRIPTION_REQUIRED`）；`antigravity-local`
 > 系列验证**方案 B**（借用 IDE 自己的 language_server 发请求，实测可用）。
 > 插件运行时默认走 B，A 仅作可选降级。
+
+# 安全：LobsterAI 只读探针（凭据/版本号/签到槽位/余额，不签到）
+pnpm test:e2e:lobsterai
+
+# ⚠️ 会真实签到（改动当日签到状态；不消耗模型积分，重复运行幂等）
+pnpm test:e2e:lobsterai-claim
+
+# 安全：CodeArts 只读探针（凭据/账户类型/积分余额/活动列表，绝不领取）
+pnpm test:e2e:codearts-credits
+
+# ⚠️ 会真实领取积分（改动当日领取状态；不消耗模型积分，重复运行幂等）
+pnpm test:e2e:codearts-claim
+
+# 安全：Qoder 只读探针（凭据结构/令牌有效性/模型表，不发模型请求、不续期）
+pnpm test:e2e:qoder
+
+# ⚠️ 发一次 Qoder 推理请求（默认 qmodel_38max（Qwen3.8-Max）**免费**，不消耗积分）
+pnpm test:e2e:qoder-chat
+
+# 安全：TRAE 只读探针（凭据/余额/签到状态/远端模型列表，不签到）
+pnpm test:e2e:trae
+
+# ⚠️ 会真实签到（改动当日签到状态；不消耗模型积分，重复运行幂等）
+pnpm test:e2e:trae-claim
+
+# ⚠️ 会消耗极小额度：验证多通道目录与「按模型路由通道」
+pnpm test:e2e:trae-channels
+```
+
+> **CodeArts 凭据必须新鲜**：其 `refresh_token` 是**一次性轮换**的（用一次即
+> 作废，服务端回 `STS5.1806 the refresh token has been used`）。两个 CodeArts
+> 积分探针都**只读凭据、不刷新**，因此凭据过期时会如实报签名请求失败 ——
+> 此时请在 Jet Hub 重新登录，或等续期调度跑过一轮，**不要**为此给探针加刷新逻辑。
+
+> **Qoder 探针要先看续期**：`qoder-chat-probe` 里「续期」用例比「推理」更重要。
+> Qoder 官方客户端用**硬件指纹**派生 `machine_id`，而本插件用**随机 UUID**
+> （见设计文档 §8）。若续期返回 4xx（非 401），说明服务端校验了设备标识，
+> 该假设被推翻 —— 此时必须改用硬件指纹派生，否则用户每天都要重新登录。
 
 ## 限流真实性判定
 

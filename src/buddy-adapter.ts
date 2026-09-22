@@ -12,22 +12,24 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   attributionHeaders,
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  isContextWindowExceededError,
   LlmAdapter, LlmError,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
-  BUDDY_DEPLOYMENT_TYPE,
   HTTP_HEADER_DOMAIN,
   HTTP_HEADER_PRODUCT,
   HTTP_HEADER_PRODUCT_CODE,
   credentialExpiresAtMs,
+  formatCreditsRate,
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
-import { CODEBUDDY, type BuddyFallbackModel, type BuddyProduct } from './product.js'
+import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
 /**
@@ -38,6 +40,19 @@ import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reso
  * （www.workbuddy.ai），故不能再用本常量拼接请求 URL。
  */
 export const CHAT_API_BASE = 'https://copilot.tencent.com/v2'
+
+/**
+ * 是否为 DeepSeek 系模型（前缀匹配，不区分大小写）。
+ *
+ * 对齐 workbuddy2api-panel `thinking.go` 的 `isDeepSeekModel` 判定口径与
+ * 官方客户端 `thinkingFormat:"deepseek"` 标记：deepseek 系模型「开思考」
+ * 必须显式带 `thinking:{type:"enabled"}` + `reasoning_effort` 档位，缺任一
+ * 上游都按不思考应答（`reasoning_content` 为空/缺失）。glm/kimi 等其他模型
+ * 走各自 thinkingFormat（默认开或 `enable_thinking`），不需要此开关。
+ */
+function isDeepSeekModel(model: string): boolean {
+  return /^deepseek/i.test(model.trim())
+}
 /**
  * CodeBuddy 的 provider 路由名（历史常量，保留导出以兼容既有导入方）。
  *
@@ -101,8 +116,10 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
 const IMAGE_MODELS: ReadonlySet<string> = new Set([
   'deepseek-v4-flash',
   'deepseek-v4.1-flash',
+  'deepseek-v4.1-flash-sg',
   'deepseek-v4-pro',
   'hy4-preview',
+  'hy4-preview-f',
   'hy4-preview-x',
   'hy3',
   'hy3-x',
@@ -111,7 +128,9 @@ const IMAGE_MODELS: ReadonlySet<string> = new Set([
   'glm-5.2',
   'glm-5.1',
   'glm-5v-turbo',
+  'kimi-k3',
   'kimi-k3-1',
+  'kimi-k2.8-preview',
   'kimi-k2.7',
   'kimi-k2.6',
   'minimax-m3',
@@ -160,10 +179,15 @@ export interface BuddyAdapterOptions {
   /**
    * 读取一张图片的原始字节（图片输入必需）。
    *
-   * 由调用方桥接 `ctx.attachments.readImage(ref)`；未提供时收到图片会报
-   * UNSUPPORTED_CONTENT，而不是把图片静默丢掉。
+   * 由调用方桥接 `ctx.attachments.readImage(ref)`。**失败必须抛错**：
+   * 未提供本回调时适配器会报 UNSUPPORTED_CONTENT；提供了但读不到字节时
+   * 也必须抛错（不要返回 undefined），否则图片会被静默丢弃、线上请求
+   * 退化成纯文本，而用户看不到任何原因。
+   *
+   * 返回类型刻意不含 `undefined`——早期契约允许返回 undefined 表示
+   * 「读不到」，调用方据此 `continue`，正是静默丢图的源头。
    */
-  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string }>
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号） */
   accountPool?: AccountPool
@@ -201,11 +225,27 @@ function contentToText(content: unknown): string {
  *   ——与 codearts 的 deepseek-v4 校验一致；
  * - 正文为空且带 tool_calls 时 `content` 必须为 `null`（对齐 openai_chat.rs）。
  */
+/** 工具结果内嵌图片的载体文本（与官方 deepseek 适配器同名同义）。 */
+const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
+
 function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
   imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
+
+  // 工具结果内嵌图片（read_image 等）不能并入 `role:'tool'` 消息：OpenAI 兼容
+  // 协议要求每条 tool 消息紧跟其 assistant tool_call，中间插入任何消息都会 400。
+  // 故与官方 deepseek 适配器一致：挂起到其后的独立 user 消息统一发出。
+  let pendingToolImages: Array<Record<string, unknown>> = []
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
+    })
+    pendingToolImages = []
+  }
 
   // ── 孤儿工具调用清理（会话续命的关键）──
   // OpenAI 兼容协议要求：带 `tool_calls` 的 assistant 消息，其**每一个**
@@ -240,6 +280,9 @@ function serializeMessages(
         .map((block) => String(block.text))
         .join('')
       const text = contentToText(content)
+      // 挂起的工具结果图片必须在 assistant 之前发出（对齐官方适配器）：
+      // 否则它们会漂到这条 assistant 之后，与产生它们的工具调用脱节。
+      flushToolImages()
       wire.push({
         role: 'assistant',
         // 正文为空且有工具调用时 content 必须为 null（对齐 openai_chat.rs）。
@@ -250,6 +293,7 @@ function serializeMessages(
       continue
     }
     if (message.role === 'system') {
+      flushToolImages()
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
@@ -258,23 +302,58 @@ function serializeMessages(
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
     const text = contentToText(message.content)
+    // 工具结果之外的常规内容（含顶层图片）。
+    const regular = content.filter((block) =>
+      !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
     // 含图片时 content 升级为 OpenAI 多模态 parts（CodeBuddy 唯一接受的图片
     // 形态；{type:'image'} 会以 `unsupported content type ... image` 400）。
-    const parts = imageUrls === undefined || imageUrls.size === 0
+    //
+    // 注意：这里**不能**把「空 Map」也降级为 undefined。`imageUrls` 为 undefined
+    // 只发生在整个请求都没有图片时；若图片存在但全部读取失败，map 是**空的**
+    // 而非 undefined。降级成 undefined 会让 `[image unavailable]` 占位符也被跳过，
+    // 图片静默消失；只有部分失败时（map 非空）才会出现占位符 —— 同一故障两种
+    // 表现。保留空 Map 可让 `userContentParts` 统一产出占位符。
+    const regularImageUrls = imageUrls
+    const parts = regularImageUrls === undefined
       ? undefined
-      : userContentParts(content, imageUrls)
-    if (parts !== undefined) wire.push({ role: 'user', content: parts })
-    else if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+      : userContentParts(regular, regularImageUrls)
+    if (parts !== undefined) {
+      flushToolImages()
+      wire.push({ role: 'user', content: parts })
+    } else if (text.length > 0 || toolResults.length === 0) {
+      flushToolImages()
+      wire.push({ role: 'user', content: text })
+    }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 其结果同样会让后端 400。
       if (!keepResultIds.has(String(result.toolCallId))) continue
+      // 工具结果内嵌的图片（read_image 等）单独收集：文本继续走 `role:'tool'`，
+      // 图片挂起到其后的 user 消息 —— 与原实现相比，这里补上了递归分支，
+      // 否则图片会被 contentToText 静默丢弃（只留元数据文本）。
+      let resultText = '(no output)'
+      if (regularImageUrls !== undefined && Array.isArray(result.content)) {
+        const resultParts = userContentParts(result.content, regularImageUrls)
+        if (resultParts !== undefined) {
+          pendingToolImages.push(...resultParts.filter((part) => part.type !== 'text'))
+          const joined = resultParts
+            .filter((part) => part.type === 'text')
+            .map((part) => String(part.text))
+            .join('')
+          if (joined.length > 0) resultText = joined
+        } else {
+          resultText = contentToText(result.content) || '(no output)'
+        }
+      } else {
+        resultText = contentToText(result.content) || '(no output)'
+      }
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
+        content: resultText,
       })
     }
   }
+  flushToolImages()
   return wire
 }
 
@@ -304,11 +383,40 @@ function errorDetail(body: string): string {
   return body
 }
 
-/** 将 HTTP 状态码映射为 harness 错误码。 */
-function httpErrorCode(status: number): string {
+/**
+ * 将 HTTP 状态码映射为 harness 错误码。
+ *
+ * 400 需要看**响应体**才能区分「上下文超限」与「普通请求错误」：前者必须归为
+ * CONTEXT_WINDOW_EXCEEDED，才能触发 DSH 的 context-overflow 自动压缩恢复
+ * （dsh-compaction-basic 监听 `agent/request-error`，只对
+ * `failure.code === CONTEXT_WINDOW_EXCEEDED` 的失败压缩上下文并重试）；
+ * 若一律标成 INVALID_REQUEST，长会话一旦越过窗口就会直接把裸错误抛给用户。
+ *
+ * 实测报文（国际版 WorkBuddy，deepseek-v4.1-flash）：
+ * ```
+ * {"code":11115,"msg":"prompt is too long: 1061554 tokens > 1048576 maximum",
+ *  "extError":{"code":"context_length_exceeded","type":"invalid_request_error",...},
+ *  "displayMsg":{"en":"The request exceeds the model context limit. ..."}}
+ * ```
+ * 注意该报文的 `msg` 是「prompt is too long」措辞、`extError.code` 是
+ * `context_length_exceeded`，两者都能被 `isContextWindowExceededError` 识别。
+ *
+ * 与 CodeArts 适配器（llm-adapter.ts 的 httpErrorCode）同一判定口径，但
+ * **传入原始 body 而非 errorDetail(body)**：`errorDetail` 在能提取到
+ * `error.*` / `message` 时会返回拼接后的短文本，从而丢掉 `extError`、
+ * `displayMsg` 等字段——实测「仅 msg 文本」这种输入会被
+ * `isContextWindowExceededError` 漏判（其正则要求出现 context/for-the-model
+ * 字样），而完整 body 因含 `extError.code = context_length_exceeded` 能稳定命中。
+ * 判定看完整报文、展示用归一化文本，两者职责不同。
+ */
+function httpErrorCode(status: number, body: string): string {
   if (status === 401 || status === 403) return 'AUTH'
   if (status === 429) return 'RATE_LIMIT'
-  if (status === 400) return 'INVALID_REQUEST'
+  if (status === 400) {
+    // 先判上下文超限，再退回通用 INVALID_REQUEST。
+    if (isContextWindowExceededError(body)) return CONTEXT_WINDOW_EXCEEDED_CODE
+    return 'INVALID_REQUEST'
+  }
   if (status >= 500) return 'SERVER'
   return `HTTP_${status}`
 }
@@ -354,6 +462,12 @@ function isTransportError(error: unknown): boolean {
 /**
  * 把 user 消息内容块转为 OpenAI 多模态 parts；无图片时返回 undefined，
  * 让调用方保持原有的纯字符串路径（无图请求的线上格式不变，避免破坏前缀缓存）。
+ *
+ * `tool-result` 分支为**递归**，与 `collectImages()` 的递归深度保持一致：
+ * 二者若不对称，出现在深层工具结果里的图片会被 collectImages 收进 refs、
+ * 却因这里只走一层而在序列化阶段被静默丢弃（连 `[image unavailable]`
+ * 占位符都没有）。实测 harness 目前只产生一层嵌套，但既然收集侧已经是
+ * 任意深度，序列化侧就必须同样递归，否则是一处埋着的静默丢图。
  */
 function userContentParts(
   content: readonly unknown[],
@@ -363,7 +477,12 @@ function userContentParts(
   let hasImage = false
   for (const raw of content) {
     if (typeof raw !== 'object' || raw === null) continue
-    const block = raw as { type?: unknown; text?: unknown; attachment?: { attachmentId?: unknown } }
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
     if (block.type === 'text') {
       const text = String(block.text ?? '')
       if (text.length > 0) parts.push({ type: 'text', text })
@@ -378,6 +497,20 @@ function userContentParts(
       parts.push(url === undefined
         ? { type: 'text', text: '[image unavailable]' }
         : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      // 递归取内层 parts：内层只要出现图片，hasImage 即为真，
+      // 从而让整条消息升级为多模态形态。
+      const inner = userContentParts(block.content, imageUrls)
+      if (inner !== undefined) {
+        hasImage = true
+        parts.push(...inner)
+      } else {
+        // 内层无图：保留其文本，避免内容丢失。
+        const text = contentToText(block.content)
+        if (text.length > 0) parts.push({ type: 'text', text })
+      }
     }
   }
   return hasImage && parts.length > 0 ? parts : undefined
@@ -501,15 +634,25 @@ export class BuddyAdapter extends LlmAdapter {
    *
    * 有产品兜底表时以它为准：
    * - 只保留兜底表里声明的 id（远端多出来的别名/内部模型被丢弃）；
-   * - 兜底表声明但远端缺失的模型补进来（用兜底表的元数据）。
+   * - 兜底表声明但远端缺失的模型补进来（用兜底表的元数据）；
+   * - ⚠️ **例外：被 agent 引用的模型即使不在兜底表也保留**（见下）。
    *
-   * 没有产品兜底表（如 CodeBuddy）时原样返回远端结果，保持既有行为。
+   * ⚠️ **为什么需要那个例外**：两个端点下发的 id 集合**不同**，而兜底表是
+   * 编译期快照、只覆盖其中一套。实测（2026-09-21）`hy4-preview-f`
+   * —— 新用户限时免费变体 —— **只由 `/v3/config` 下发**，且被
+   * `craft`/`ask`/`plan` 三个 agent 引用（即服务端声明「对话里可选」），
+   * 但**不在兜底表**里。白名单重建会把它丢掉，于是用户看不到那个免费变体，
+   * 而 IDE 里能看到（用户报障「hy4 preview 现在 ide 是免费我们还是 0.29」）。
+   *
+   * 判据用 `agentReferenced`（服务端自己的「可选」信号）而非猜测 id 后缀 ——
+   * 后缀规则不统一（`-f` / `-x` / `-sg` / `-ioa` 含义各异），猜错会放进
+   * 不可用的模型。未标记的内部别名（如 `default`）不会被误留。
    */
   private reconcileWithFallback(models: readonly BuddyRemoteModel[]): BuddyRemoteModel[] {
     const fallback = this.product.fallbackModels
     if (fallback === undefined || fallback.length === 0) return [...models]
     const remoteById = new Map(models.map((model) => [model.id, model]))
-    return fallback.map((entry) => {
+    const reconciled = fallback.map((entry) => {
       const remote = remoteById.get(entry.id)
       // 远端元数据优先（更权威），缺失的字段用兜底表补齐
       return {
@@ -517,6 +660,11 @@ export class BuddyAdapter extends LlmAdapter {
         name: remote?.name ?? entry.name,
         ...entry.contextWindow !== undefined || remote?.contextWindow !== undefined
           ? { contextWindow: remote?.contextWindow ?? entry.contextWindow }
+          : {},
+        // 输出上限同样「远端优先、兜底补位」：远端不下发时兜底表给保守值，
+        // 两边都没有则留 undefined（不编造，见 resolveModel 的说明）。
+        ...entry.maxOutputTokens !== undefined || remote?.maxOutputTokens !== undefined
+          ? { maxOutputTokens: remote?.maxOutputTokens ?? entry.maxOutputTokens }
           : {},
         ...entry.supportsImages !== undefined || remote?.supportsImages !== undefined
           ? { supportsImages: remote?.supportsImages ?? entry.supportsImages }
@@ -527,15 +675,60 @@ export class BuddyAdapter extends LlmAdapter {
         ...entry.defaultReasoningEffort !== undefined || remote?.defaultReasoningEffort !== undefined
           ? { defaultReasoningEffort: remote?.defaultReasoningEffort ?? entry.defaultReasoningEffort }
           : {},
+        // 计费倍率只可能来自远端（兜底表是编译期快照，价格会变，不写死）。
+        // 注意本函数是**白名单式重建**：不在这里显式搬运的字段会被静默丢弃，
+        // 新增远端字段时必须同步加一行，否则 listModels 看不到它。
+        ...remote?.creditsRate !== undefined ? { creditsRate: remote.creditsRate } : {},
+        ...remote?.discountedCreditsRate !== undefined
+          ? { discountedCreditsRate: remote.discountedCreditsRate }
+          : {},
       }
     })
+    // ⚠️ 追加「被 agent 引用但不在兜底表」的模型（见本方法注释的例外说明）。
+    //
+    // 放在**末尾**：兜底表里的模型保持原有顺序与权威性，补充的变体排在后面，
+    // 不打乱用户已熟悉的列表顺序。
+    const known = new Set(reconciled.map((model) => model.id))
+    for (const model of models) {
+      if (model.agentReferenced !== true || known.has(model.id)) continue
+      known.add(model.id)
+      reconciled.push({ ...model })
+    }
+    return reconciled
   }
 
-  /** 模型接受的输入模态：远端 supportsImages 优先，静态表兜底。 */
+  /**
+   * 远端能力字段被实测证伪、需要强制覆盖为「支持图片」的模型。
+   *
+   * 为什么需要它：上游两个模型端点对同一模型的能力声明会互相矛盾。
+   * 实测 `glm-5.1`（2026-09）：
+   * - scoped 端点 `/console/enterprises/personal/models` → `supportsImages: false`
+   * - `/v3/config` → `supportsImages: true`
+   * - 真实请求（纯红图 + 问颜色）→ 答出「红色」，**确实能看到图片**
+   *
+   * 由于 `fetchModels` 优先采用 scoped 端点，若不覆盖，`glm-5.1` 会被判成
+   * 纯文本，用户贴图时直接吃 host 的 `MODEL_DOES_NOT_SUPPORT_IMAGES` 拒绝
+   * （前端文案「当前模型不支持图片」），而图片根本到不了上游。
+   *
+   * 为什么用显式白名单而不是「兜底表 true 优先」这类通用规则：通用规则会让
+   * 兜底表永久压过远端，一旦某模型真的下线或能力变更，用户会被放行后被上游
+   * 400 拒绝 —— 错误更晚、更难懂。白名单只覆盖已实测确认的个案，新增条目
+   * 必须先有真实请求证据。
+   */
+  private static readonly IMAGE_CAPABILITY_OVERRIDES: ReadonlySet<string> = new Set([
+    // scoped 端点误报 false，实测能看图。
+    'glm-5.1',
+  ])
+
+  /**
+   * 模型接受的输入模态：远端 supportsImages 优先，静态表兜底；
+   * {@link IMAGE_CAPABILITY_OVERRIDES} 中的模型强制为支持图片。
+   */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    const supportsImages = this.remoteMeta.get(model)?.supportsImages
-      ?? this.productFallbackMeta.get(model)?.supportsImages
-      ?? IMAGE_MODELS.has(model)
+    const supportsImages = BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES.has(model)
+      || (this.remoteMeta.get(model)?.supportsImages
+        ?? this.productFallbackMeta.get(model)?.supportsImages
+        ?? IMAGE_MODELS.has(model))
     return supportsImages ? ['text', 'image'] : ['text']
   }
 
@@ -548,6 +741,18 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   /**
+   * 模型声明的默认思考等级（远端 `reasoning.defaultEffort` 优先，产品兜底表次之）。
+   *
+   * 用途：composer 未选档位时补 `reasoning_effort`（deepseek 系不带档位 = 不思考）。
+   * 若声明值不在该模型的支持档内（远端数据不一致）则视为未声明，由调用方回退。
+   */
+  private defaultEffortFor(model: string): string | undefined {
+    const declared = this.remoteMeta.get(model)?.defaultReasoningEffort
+      ?? this.productFallbackMeta.get(model)?.defaultReasoningEffort
+    return declared !== undefined && this.effortsFor(model).includes(declared) ? declared : undefined
+  }
+
+  /**
    * 产品级兜底模型目录（`product.fallbackModels`）。
    *
    * 用于远端不可用或远端未覆盖到该模型时。与 `remoteMeta` 分开存放，
@@ -557,15 +762,40 @@ export class BuddyAdapter extends LlmAdapter {
     return this.productFallbackIndex
   }
 
+  /**
+   * 完整模型目录（**不应用用户黑名单**），含最终展示名（倍率 + 同名消歧）。
+   *
+   * 设置页（Jet Hub「显示列表」）必须把**被关闭的**模型也渲染出来，否则用户
+   * 无法重新打开；而 `listModels` 会按黑名单过滤掉它们，RPC 层只能凭黑名单的
+   * key（裸 id）补回 —— 那条路径拿不到展示名，只能退化成裸 id，**倍率随之丢失**
+   * （用户报障：「关闭的就没有显示倍率」）。
+   *
+   * ⚠️ 同名消歧必须基于**未过滤**的全量集合：`displayNameFor(model, source)`
+   * 而非 `listed`。用过滤后的集合会让「关掉其中一个同名模型」改变另一个的
+   * 变体标记，名字随开关跳变。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const source = this.remoteModels ?? this.staticFallbackModels()
+    return source.map((model) => ({ id: model.id, name: displayNameFor(model, source) }))
+  }
+
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    const cred = await this.options.resolveCredential?.()
-    if (!cred) return []
+    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+    // 不必拉。返回空数组 → DSH 的 `buildModelCatalog` 把整个 provider 分组隐藏。
+    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`）。
+    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? this.staticFallbackModels()
-    return source.map((model) => ({
+    // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
+    // 按本适配器的产品 id 取表，CodeBuddy 与 WorkBuddy 的开关互不影响。
+    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+    const listed = disabled === undefined || disabled.size === 0
+      ? source
+      : source.filter((model) => !disabled.has(model.id))
+    return listed.map((model) => ({
       provider: this.product.id,
       id: model.id,
-      name: model.name,
+      name: displayNameFor(model, listed),
       inputModalities: this.inputModalitiesFor(model.id),
     }))
   }
@@ -606,6 +836,23 @@ export class BuddyAdapter extends LlmAdapter {
       inputModalities: this.inputModalitiesFor(model),
     }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
+    // 单次输出上限：远端 maxOutputTokens（实测 deepseek-v4.1-flash = 128000）
+    // 优先，产品兜底表次之。
+    //
+    // **为什么必须声明**：DSH 在 `resolveCallWithInfo` 里只在调用方未显式给值时
+    // 用 `defaultMaxTokens` 兜底，适配器不声明就等于把这个值永久交给网关默认
+    // （实测网关默认仅 32000 —— 见远端 `auto` 模型的 maxOutputTokens）。结果是
+    // 大文件写入 / 长回答在 32000 处被截断成 finish_reason:'length'，UI 报
+    // 「已达到输出 token 上限」。这与 codearts 适配器显式发 max_tokens 的做法
+    // （llm-adapter.ts）本应一致。
+    //
+    // 远端与兜底表都没有该模型的值时**保持 undefined**，交给网关默认值：
+    // 编造一个偏大的值会让服务端 400 拒绝（参考 codearts 131072 被拒的实测），
+    // 偏小则无谓截断用户输出。
+    const maxOutputTokens = positiveMaxTokens(
+      this.remoteMeta.get(model)?.maxOutputTokens ?? this.productFallbackMeta.get(model)?.maxOutputTokens,
+    )
+    if (maxOutputTokens !== undefined) resolved.defaultMaxTokens = maxOutputTokens
     // 思考等级：这是"思考强度"选择器出现在模型选择里的唯一入口——composer
     // 读取 resolveModel().reasoning。无等级可选的模型不声明该字段，UI 显示
     // "当前模型未提供推理等级"。
@@ -699,8 +946,28 @@ export class BuddyAdapter extends LlmAdapter {
       }
       imageUrls = new Map()
       for (const [id, ref] of imageRefs) {
-        const image = await this.options.readImage(ref)
-        if (image === undefined) continue
+        let image: { data: Uint8Array; mediaType: string } | undefined
+        try {
+          image = await this.options.readImage(ref)
+        } catch (error) {
+          // 读取抛错必须冒泡成明确的 LlmError：早先这里会把异常吞掉，
+          // 最终表现为「图片凭空消失、模型答非所问」，排查成本极高。
+          throw new LlmError(
+            `buddy: 读取图片附件失败（${id}）：${errorMessage(error)}`,
+            'UNSUPPORTED_CONTENT',
+            { cause: error as Error },
+          )
+        }
+        if (image === undefined) {
+          // 契约要求：读不到字节时报错，绝不静默丢弃整张图。
+          // 返回 undefined 的典型成因是附件服务未就绪或对象已被清理；
+          // 若此处 continue，线上请求会退化成纯文本，用户只看到模型
+          // 「看不到图」而没有任何错误提示。
+          throw new LlmError(
+            `buddy: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`,
+            'UNSUPPORTED_CONTENT',
+          )
+        }
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }
     }
@@ -733,11 +1000,46 @@ export class BuddyAdapter extends LlmAdapter {
     if (tools !== undefined && tools.length > 0) bodyObj.tools = tools
     if (options.temperature !== undefined) bodyObj.temperature = options.temperature
     if (options.stop !== undefined && options.stop.length > 0) bodyObj.stop = options.stop
+    // 单次请求输出上限。此前**完全没有**下发该字段，导致上限由网关默认值决定
+    // （实测仅 32000），大文件写入会在中途被截断成 `finish_reason:'length'`，
+    // UI 报「已达到输出 token 上限」，且本地无从调整。
+    //
+    // 取值优先级：调用方显式给的 options.maxTokens（DSH 会先注入 resolveModel
+    // 声明的 defaultMaxTokens）→ 远端 maxOutputTokens → 产品兜底表。
+    // 三者皆无则不发该字段，保持网关默认（不编造，理由见 resolveModel）。
+    const maxTokens = positiveMaxTokens(
+      options.maxTokens
+        ?? this.remoteMeta.get(options.model)?.maxOutputTokens
+        ?? this.productFallbackMeta.get(options.model)?.maxOutputTokens,
+    )
+    if (maxTokens !== undefined) bodyObj.max_tokens = maxTokens
+    // DeepSeek 思维链开关（逆向官方 codebuddy.js，对齐 workbuddy2api-panel
+    // thinking.go）。**实测关键结论（2026-09，直连三站点对照）**：
+    //   - 裸请求（无 reasoning_effort、无 thinking）→ reasoning_content 恒为 0；
+    //   - 仅带 reasoning_effort:high → 返回思考（148~250 字符）；
+    //   - 仅带 thinking:{type:'enabled'} → 仍为 0（该字段单独无效）；
+    //   - 两者都带 → 返回思考。
+    // 即 **reasoning_effort 是真正的开关**，thinking 字段单独不生效（保留它是
+    // 为对齐官方客户端出站形态，并覆盖未来后端按它判定的情形）。
+    // 三站点（workbuddy 国际/中国 UA、codebuddy）行为一致 → endpoint/UA 无关。
+    const deepseek = isDeepSeekModel(options.model)
+    if (deepseek) {
+      bodyObj.thinking = { type: 'enabled' }
+    }
     // 思考强度：composer 选中的等级透传为 `reasoning_effort`（实测
     // low/high/max 会显著改变返回的 reasoning_content 长度，服务端真实生效）。
     // 只在该模型确实支持该等级时才发，否则服务端会因非法参数 400。
-    if (options.reasoningEffort !== undefined && this.effortsFor(options.model).includes(options.reasoningEffort)) {
+    const efforts = this.effortsFor(options.model)
+    if (options.reasoningEffort !== undefined && efforts.includes(options.reasoningEffort)) {
       bodyObj.reasoning_effort = options.reasoningEffort
+    } else if (deepseek && efforts.length > 0) {
+      // composer 未选档位（历史请求可能 `adapterDefaults: undefined`）或所选
+      // 档位不被支持时，必须补一个档位——否则请求体里只剩 thinking，上游仍按
+      // 不思考应答（实测）。回退顺序：声明默认档 → high（对齐官方客户端
+      // REASONING_SUPPLEMENTS.defaultEffort 与 thinking.go 的兜底）→ 最低支持档
+      // （绝不臆造模型未声明的档位，否则服务端 400）。
+      bodyObj.reasoning_effort = this.defaultEffortFor(options.model)
+        ?? (efforts.includes('high') ? 'high' : efforts[0])
     }
     const body = JSON.stringify(bodyObj)
 
@@ -771,8 +1073,14 @@ export class BuddyAdapter extends LlmAdapter {
             )
           }
           // 取下一个未尝试过的可用账号（同样按本产品 id 过滤，否则 WorkBuddy
-          // 永远取不到候选账号，限流后无法自动切换）
-          const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model)
+          // 永远取不到候选账号，限流后无法自动切换）。
+          //
+          // 必须把 `tried` 传给池：见 `AccountPool.getAvailableAccount` 的说明 ——
+          // 池按「重置时间最早到期」排序，刚失败的账号可能仍排第一，
+          // 不排除就会拿回同一个、命中下面的 `tried.has` 而立即 break。
+          const next = await this.options.accountPool.getAvailableAccount(
+            this.product.id, options.model, tried,
+          )
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
           credential = next.credential as BuddyCredential
@@ -785,12 +1093,12 @@ export class BuddyAdapter extends LlmAdapter {
           errorText = await response.text().catch(() => '')
           if (!isRateLimited(errorText)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
-            throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+            throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }
         }
         throw new LlmError(`buddy: 模型 ${options.model} 所有账号均受限，请稍后再试`, 'QUOTA_EXCEEDED')
       }
-      throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
+      throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
     }
 
     // 5. 消费 SSE 流
@@ -808,12 +1116,19 @@ export class BuddyAdapter extends LlmAdapter {
     headers.set('Accept', 'text/event-stream')
     headers.set('Content-Type', 'application/json')
     headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? this.product.apiDomain)
-    // X-Product 是**部署类型**（SaaS），各产品共用同一取值，
-    // 故保持常量；随产品变化的身份标识是 X-Product-Code 与 User-Agent。
-    headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE)
     headers.set(HTTP_HEADER_PRODUCT_CODE, this.product.productCode)
-    // User-Agent 必须伪装为对应产品的 IDE 客户端（后端以此识别客户端）。
-    headers.set('User-Agent', this.product.userAgent)
+    // 用量归属头族：后台「使用端」列按这组头归因，缺任一个都会显示为 `-`。
+    // 注意 X-Product 是**归属名**（产品名），不是部署类型 —— 历史实现发成
+    // `SaaS` 导致后台归因不到产品。
+    headers.set('X-Agent-Purpose', 'conversation')
+    headers.set('X-IDE-Name', this.product.attributionName)
+    headers.set('X-IDE-Type', this.product.attributionName)
+    headers.set('X-IDE-Version', this.product.clientVersion)
+    headers.set(HTTP_HEADER_PRODUCT, this.product.attributionName)
+    // User-Agent 按模型族分档：不同模型线归属不同客户端形态，后台据此分列。
+    // 必须用 set 覆盖（attributionHeaders() 注入的框架 UA 键为小写，
+    // 但 Headers 键大小写不敏感，set 能正常覆盖）。
+    headers.set('User-Agent', resolveUserAgent(this.product, options.model))
     try {
       return await this.fetchImpl(`${this.product.endpoint}/v2/chat/completions`, {
         method: 'POST',
@@ -891,7 +1206,7 @@ export class BuddyAdapter extends LlmAdapter {
             break
           }
           let data: {
-            error?: { message?: string }
+            error?: { message?: string; msg?: string; code?: string | number; type?: string; extError?: unknown }
             choices?: Array<{
               delta?: {
                 content?: string
@@ -925,7 +1240,18 @@ export class BuddyAdapter extends LlmAdapter {
             continue
           }
           if (data.error !== undefined) {
-            throw new LlmError(`buddy: ${data.error.message ?? 'unknown error'}`, 'SERVER')
+            // ⚠️ SSE 内联错误体同样可能是**上下文超限**：buddy 有时把 400 错误
+            // 塞进一个 HTTP 200 的正常 SSE 帧里（走不到 `httpErrorCode` 那条路）。
+            // 若此处一律归为 SERVER，压缩子系统收不到溢出信号
+            // （它只认 `CONTEXT_WINDOW_EXCEEDED`），会话将在越过窗口后**永久卡死**。
+            // 因此这里复用 HTTP 分支同一套判据：完整报文交给
+            // `isContextWindowExceededError`（它认得 `context_length_exceeded`、
+            // `prompt is too long` 等），展示仍用归一化文本。
+            const inlineDetail = JSON.stringify(data.error)
+            const inlineCode = isContextWindowExceededError(inlineDetail)
+              ? CONTEXT_WINDOW_EXCEEDED_CODE
+              : 'SERVER'
+            throw new LlmError(`buddy: ${data.error.message ?? 'unknown error'}`, inlineCode)
           }
           const choice = data.choices?.[0]
           const delta = choice?.delta
@@ -1067,6 +1393,82 @@ function isCredentialExpired(credential: BuddyCredential): boolean {
 }
 
 /**
+ * 生成模型选择器里显示的名字，承载**两类**信息：计费倍率与同名消歧。
+ *
+ * ⚠️ **必须写进 `name` 而不是 `description`**：composer 的模型切换菜单只渲染
+ * `name`（见 ModelSelect 的 `children: model.name`），`description` 仅用于
+ * `/model` 弹窗。用户报障「消耗倍率没有显示在切换模型列表的后面」正是因为
+ * 早期版本放在了 `description`。
+ *
+ * 安全性：`name` **纯属展示** —— DSH 的选择与持久化只用 `id`
+ * （见 `selectionOf` 返回 `model: model.id`），故在名字里附加价格不会污染会话。
+ *
+ * 形如 `Deepseek-V4.1-Flash · x0.03`；有促销时 `· x0.17→x0.50`（用箭头而
+ * 不是「（促销 …）」，避免在窄菜单里过长）。同名撞车时再加变体标记。
+ */
+function displayNameFor(model: BuddyRemoteModel, all: readonly BuddyRemoteModel[]): string {
+  const suffix = displaySuffix(model, all)
+  return suffix.length > 0 ? `${model.name} · ${suffix}` : model.name
+}
+
+/** 组装展示名的后缀部分：倍率 + 同名变体标记。 */
+function displaySuffix(model: BuddyRemoteModel, all: readonly BuddyRemoteModel[]): string {
+  const parts: string[] = []
+  // 倍率：有促销时用 `原价→促销价` 一眼看出折扣幅度。
+  const rate = formatCreditsRate(model.creditsRate, model.discountedCreditsRate)
+  if (rate !== undefined) parts.push(rate)
+  // 同名消歧：只在**确实撞车**时追加，避免影响其它模型。
+  const variant = variantLabelFor(model, all)
+  if (variant.length > 0) parts.push(variant)
+  return parts.join(' ')
+}
+
+/**
+ * 判断该模型是否需要变体标记，需要时返回标记文本。
+ *
+ * 远端会给**不同 id 配同一个 name**（实测 `deepseek-v4.1-flash` /
+ * `deepseek-v4.1-flash-sg` 都是 "Deepseek-V4.1-Flash"；`hy3`/`hy3-x` 都是
+ * "Hy3"），而选择器按 name 展示 → 出现无法区分的重复条目。
+ *
+ * 用**公共前缀**切分而非硬编码 `-sg`：撞车组随服务端上新变化（本次实测三组
+ * 里只有一组带 `-sg`）；也不用「取 id 最后一段」（会把 `gpt-5.6-sol` 的
+ * `sol` 当变体）。公共前缀只在撞车时才计算，不影响其它模型。
+ */
+function variantLabelFor(model: BuddyRemoteModel, all: readonly BuddyRemoteModel[]): string {
+  const group = all.filter((candidate) => candidate.name === model.name)
+  if (group.length <= 1) return ''
+  const prefix = commonPrefix(group.map((candidate) => candidate.id))
+  const variant = model.id.slice(prefix.length).replace(/^-+/, '')
+  return variant.toUpperCase()
+}
+
+/** 求一组字符串的公共前缀（逐字符比较）。 */
+function commonPrefix(values: readonly string[]): string {
+  if (values.length === 0) return ''
+  let prefix = values[0]!
+  for (const value of values.slice(1)) {
+    let i = 0
+    while (i < prefix.length && i < value.length && prefix[i] === value[i]) i++
+    prefix = prefix.slice(0, i)
+    if (prefix.length === 0) break
+  }
+  return prefix
+}
+
+/**
+ * 把候选输出上限规整为「可安全下发的正整数」，否则返回 undefined。
+ *
+ * 为什么必须过滤：DSH 的 `LlmRuntime.resolveModelInfoFor` 对适配器声明的
+ * `defaultMaxTokens` 有硬校验 —— 非安全整数或 ≤0 会直接抛
+ * `adapter returned invalid default maxTokens`（INVALID_MODEL_MAX_TOKENS），
+ * 整轮对话起不来。远端是外部输入，`0` / 负数 / `NaN` 都可能出现，
+ * 不能在适配器里假设它合法。
+ */
+function positiveMaxTokens(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+/**
  * 在 ctx.llm 上注册 CodeBuddy 系产品的 provider 路由与适配器。
  *
  * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
@@ -1075,12 +1477,16 @@ function isCredentialExpired(credential: BuddyCredential): boolean {
  * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
  * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
  */
-export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): void {
+export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? CODEBUDDY
   if (!options.skipConfigurableRegistration) {
     ctx.llm.registerConfigurableProviders([
       { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
     ])
   }
-  ctx.llm.registerAdapter([product.id], new BuddyAdapter(options))
+  const adapter = new BuddyAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
+  // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
+  return adapter
 }

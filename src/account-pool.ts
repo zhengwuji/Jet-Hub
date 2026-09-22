@@ -18,9 +18,20 @@ declare module '@deepseek-ai/cordis' {
 /** Jet Hub schema namespace（必须在 ctx.settings 中注册后才能读写） */
 export const JET_HUB_NS = 'jet-hub'
 
+/**
+ * 模型黑名单：provider id → **被关闭**的模型 id 列表。
+ *
+ * 采用**黑名单制**：只有出现在这里、且 `disabled` 为 true 的模型会被隐藏，
+ * 未记录的模型一律视为默认打开。这样服务端新增模型时无需任何配置即自动可见，
+ * 不会像白名单那样把新模型静默挡在门外。
+ */
+export type ModelDisableMap = Record<string, Record<string, boolean>>
+
 /** 账号池在 settings 中存储的值结构。 */
 interface JetHubSettingsValue {
   accounts?: ProviderAccountEntry[]
+  /** 模型黑名单（见 {@link ModelDisableMap}）。 */
+  disabledModels?: ModelDisableMap
 }
 
 /** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
@@ -52,7 +63,49 @@ interface SettingsServiceLike {
  */
 const jetHubSchema = Schema.object({
   accounts: Schema.array(Schema.any()).default([]),
+  // 模型黑名单：对象（provider id → 模型 id → boolean）而非数组。
+  //
+  // 为什么用 `Schema.dict(Schema.any())` 而不是 `Schema.array(...)`：与账号
+  // 列表同理，单项字段由 AccountPool 自身在读写时保证；这里只需让 settings
+  // 的 schema 校验不把动态结构（任意 provider、任意模型 id）拒之门外。
+  //
+  // 为什么带 `.default({})`：namespace 首次注册时配置文件里没有该字段，
+  // 没有默认值的话 `scope.get()` 会返回 undefined，需在读取处层层判空。
+  disabledModels: Schema.dict(Schema.any()).default({}),
 })
+
+/**
+ * 空黑名单的共享只读实例。
+ *
+ * 适配器的 `listModels` 每次都会被模型目录调用，绝大多数 provider/时刻都
+ * 没有黑名单；共享同一个冻结集合可以避免每次调用都分配一个新 Set。
+ */
+const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
+
+/**
+ * 把 settings 里读到的原始值归一化为 {@link ModelDisableMap}。
+ *
+ * 配置文件可能被手工编辑过，也可能残留老版本格式（如数组），因此这里
+ * 逐层校验：任何一层不是对象就丢弃那一层，只保留"provider → 模型 → true"
+ * 这种合法结构，其余一律忽略而不是抛错——设置页读不出黑名单不该让整个
+ * 账号管理功能不可用。
+ */
+function sanitizeDisabledModels(raw: unknown): ModelDisableMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: ModelDisableMap = {}
+  for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const perProvider: Record<string, boolean> = {}
+    for (const [modelId, flag] of Object.entries(value as Record<string, unknown>)) {
+      // 只把显式 true 视为"关闭"；false / 其他值既不算关闭，也不写回内存，
+      // 避免 `disabledModelsFor` 的判定与配置文件内容产生分歧。
+      if (flag === true) perProvider[modelId] = true
+    }
+    // 空表不保留：让配置文件里不留 `{ provider: {} }` 这类无意义噪音。
+    if (Object.keys(perProvider).length > 0) result[provider] = perProvider
+  }
+  return result
+}
 
 /**
  * AccountPool —— 多账号管理核心
@@ -81,6 +134,11 @@ export class AccountPool {
    * 都没有）。因此首次从 scope 载入后，这份副本即为唯一读源。
    */
   private cache: ProviderAccountEntry[] = []
+  /**
+   * 模型黑名单的**权威进程内副本**（与 {@link cache} 同理：settings 的
+   * resolved 快照在 replace() 后未必立即更新，因此加载一次后即以本副本为准）。
+   */
+  private modelCache: ModelDisableMap = {}
   /** 是否已从 settings scope 完成首次载入。 */
   private loaded = false
   private listeners: Array<() => void | Promise<void>> = []
@@ -131,6 +189,9 @@ export class AccountPool {
         `[jet-hub] 账号列表首次载入为空（scope 返回 ${JSON.stringify(value)}）`,
       )
     }
+    // 黑名单是后来才加入的字段：老配置文件里没有它，缺失时保持空表
+    // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
+    this.modelCache = sanitizeDisabledModels(value?.disabledModels)
   }
 
   /** 读取账号列表（进程内权威副本）。 */
@@ -139,7 +200,12 @@ export class AccountPool {
     return this.cache
   }
 
-  /** 持久化账号列表（同时更新进程内权威副本）。 */
+  /**
+   * 持久化账号列表（同时更新进程内权威副本）。
+   *
+   * **必须连同黑名单一起写回**：settings 的 `replace()` 是整体替换，
+   * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels` 抹掉。
+   */
   private async writeAccounts(accounts: ProviderAccountEntry[]): Promise<void> {
     this.cache = accounts
     this.loaded = true
@@ -148,7 +214,62 @@ export class AccountPool {
       await this.notifyAccountsChanged()
       return
     }
-    await this.scope.replace({ accounts })
+    await this.scope.replace({ accounts, disabledModels: this.modelCache })
+    await this.notifyAccountsChanged()
+  }
+
+  /**
+   * 读取某 provider 的模型黑名单（被关闭的模型 id 集合）。
+   *
+   * 适配器只调用这一个方法，因此进程内副本就是它们的读源：设置页改开关
+   * 后，下一次 `listModels` 立即生效，无需重启或重新注册适配器。
+   */
+  disabledModelsFor(provider: string): ReadonlySet<string> {
+    this.ensureLoaded()
+    const perProvider = this.modelCache[provider]
+    if (perProvider === undefined) return EMPTY_MODEL_SET
+    const disabled = Object.keys(perProvider).filter((id) => perProvider[id] === true)
+    return disabled.length > 0 ? new Set(disabled) : EMPTY_MODEL_SET
+  }
+
+  /**
+   * 列出某 provider 的模型黑名单，供设置页渲染开关。
+   *
+   * 返回**全部键**（含显式设为 false 的），以便 UI 区分"从未设置过"与
+   * "曾被关闭又打开"——两者对用户都是"开"，但保留记录便于排查。
+   */
+  listDisabledModels(provider: string): Record<string, boolean> {
+    this.ensureLoaded()
+    return { ...(this.modelCache[provider] ?? {}) }
+  }
+
+  /**
+   * 打开/关闭某个模型。
+   *
+   * 关闭时写入 `true`；打开时**删除该键**而不是写 `false` —— 保持黑名单
+   * 里只留真正被关闭的模型，`disabledModelsFor` 的语义因此始终是
+   * "键存在且为 true 即隐藏"，配置文件也不会随开关操作无限膨胀。
+   */
+  async setModelDisabled(provider: string, modelId: string, disabled: boolean): Promise<void> {
+    const next: ModelDisableMap = { ...this.modelCache }
+    const perProvider = { ...(next[provider] ?? {}) }
+    if (disabled) perProvider[modelId] = true
+    else delete perProvider[modelId]
+    if (Object.keys(perProvider).length === 0) delete next[provider]
+    else next[provider] = perProvider
+    await this.writeModels(next)
+  }
+
+  /** 持久化模型黑名单（同时更新进程内权威副本）。 */
+  private async writeModels(disabledModels: ModelDisableMap): Promise<void> {
+    this.modelCache = disabledModels
+    this.loaded = true
+    if (!this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，模型黑名单变更未持久化')
+      return
+    }
+    // 与 writeAccounts 对称：整体 replace 必须携带账号列表，否则会被清空。
+    await this.scope.replace({ accounts: this.cache, disabledModels })
     await this.notifyAccountsChanged()
   }
 
@@ -242,6 +363,71 @@ export class AccountPool {
   }
 
   /**
+   * 重排某 provider 下账号的顺序（Jet Hub 拖拽排序）。
+   *
+   * ## 为什么顺序有实际意义
+   *
+   * 账号列表的数组顺序就是 {@link getAvailableAccount} 的**候选优先级**：
+   * 自动选号、限流后的换号重试都按这个顺序取「第一个可用账号」。
+   * 因此拖拽不是 UI 装饰，它直接决定实际用哪个账号发请求。
+   *
+   * ## 只动本 provider 的槽位
+   *
+   * 账号存在**一个全局数组**里（各 provider 混排，靠 `provider` 字段区分），
+   * 而设置页是按 provider 分组渲染的。因此这里取「该 provider 账号原本占用的
+   * 那些下标」，把新顺序填回这些下标 —— 其他 provider 的账号**位置不变**。
+   *
+   * 不这么做（例如把该 provider 的账号整体挪到数组头部）会让拖拽 CodeArts
+   * 的顺序顺带改变 Buddy 账号的相对位置，属于跨面板的意外副作用。
+   *
+   * ## 校验：必须是同一集合的一个排列
+   *
+   * `orderedIds` 必须恰好包含该 provider 的**全部**账号 id（顺序可变、集合不可变）。
+   * 不满足就抛错而不是「尽力而为」：
+   * - 少了某个 id（前端列表过期，期间账号被别处新增）→ 若静默忽略，那个账号
+   *   会莫名其妙掉到末尾，用户看到的是"顺序自己变了"；
+   * - 多了未知 id → 说明前端状态与服务端不一致。
+   * 两种情况都让用户刷新重试，比悄悄改数据安全。
+   *
+   * @param provider - provider id
+   * @param orderedIds - 该 provider 全部账号 id 的目标顺序
+   */
+  async reorderAccounts(provider: string, orderedIds: readonly string[]): Promise<void> {
+    const accounts = this.readAccounts()
+    const indices: number[] = []
+    const currentIds: string[] = []
+    accounts.forEach((entry, index) => {
+      if (entry.provider === provider) {
+        indices.push(index)
+        currentIds.push(entry.id)
+      }
+    })
+
+    // 集合一致性校验（顺序无关）。
+    const expected = new Set(currentIds)
+    const got = new Set(orderedIds)
+    const sameSet = orderedIds.length === currentIds.length
+      && got.size === orderedIds.length
+      && orderedIds.every(id => expected.has(id))
+    if (!sameSet) {
+      throw new Error(
+        `账号列表已变化，请刷新后重试（期望 ${currentIds.length} 个账号，收到 ${orderedIds.length} 个）`,
+      )
+    }
+
+    const next = [...accounts]
+    // 按新顺序回填到该 provider 原本占用的下标上。
+    indices.forEach((accountIndex, position) => {
+      const id = orderedIds[position]
+      const source = accounts.find(a => a.id === id)
+      // 上面的集合校验已保证 source 必定存在；这里的判断只为类型收窄。
+      if (source !== undefined) next[accountIndex] = source
+    })
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[jet-hub] 已重排 ${provider} 账号顺序: ${orderedIds.join(', ')}`)
+  }
+
+  /**
    * 按凭据内容反查账号 id（供适配器记录"当前用的是哪个账号"）。
    *
    * 适配器不持有 ctx，也不该直接访问本类的私有凭据存储，
@@ -284,6 +470,39 @@ export class AccountPool {
   /** 列出某 provider 的全部账号（含已停用），供「重测所有 / 重置所有」使用。 */
   listAccountsByProvider(provider: string): ProviderAccountEntry[] {
     return this.readAccounts().filter(a => a.provider === provider)
+  }
+
+  /**
+   * 该 provider 是否**至少有一个已登录（凭据可用）的账号**。
+   *
+   * 供适配器的 `listModels` 做门控：没有已登录账号时返回空目录，让 DSH 的
+   * `buildModelCatalog` 把整个 provider 分组隐藏（它显式
+   * `.filter(group => group.models.length > 0)`），从而显著减少模型选择
+   * 列表里用不上的条目（用户需求：「没有已登录账号就不显示该供应商的所有
+   * 模型」）。
+   *
+   * ## 为什么判据是「凭据可解析」而不是「有条目」
+   *
+   * 1. **`logout()` 只清凭据、保留账号条目**（删除条目是另一条路径
+   *    `removeAccount`）。若只看「有没有条目」，用户登出后模型仍会显示，
+   *    门控形同虚设。
+   * 2. **不看 `enabled`**：停用只应影响「自动选号」，与「是否已登录」无关。
+   *    这与续期调度器「只按 `refreshable` 过滤、不看 `enabled`」是同一条
+   *    既有约定（停用账号同样参与积分领取），故这里保持一致。
+   *
+   * ⚠️ **这是异步的**：需要逐个解析凭据。但只解析到**第一个可用账号**即返回
+   * （短路），多账号场景下通常第一次就命中。
+   *
+   * ⚠️ **本方法只用于「目录展示」的门控**，绝不能用于路由判定 ——
+   * DSH 约定 `listModels` 结果仅供参考，隐藏目录不等于拒绝请求
+   * （被隐藏的模型仍可 `resolveModel` / 正常收发）。
+   */
+  async hasLoggedInAccount(provider: string): Promise<boolean> {
+    for (const entry of this.listAccountsByProvider(provider)) {
+      const credential = await this.resolveCredentialByRef(entry.credentialRef)
+      if (credential !== undefined) return true
+    }
+    return false
   }
 
   /**
@@ -350,13 +569,29 @@ export class AccountPool {
    * resolveCredential 入口）此时还不知道要发哪个模型，只能退化为
    * "任取一个启用账号"。但 `enabled` 过滤在任何情况下都生效：
    * 停用账号绝不参与自动选择，空 modelId 也不例外。
+   *
+   * @param provider - provider id（`this.product.id`，不要写死字面量）
+   * @param modelId - 目标模型；空串表示不按模型过滤
+   * @param excludeAccountIds - 需要跳过的账号 id。
+   *
+   * **为什么需要 `excludeAccountIds`**：调用方在「请求级轮换」时会逐个换号
+   * 重试，必须能拿到**下一个**账号而不是每次都拿回同一个。
+   * 本池默认按「重置时间最早到期」排序，当失败类别**不写限流标记**时
+   * （如 5xx / 请求错误 —— 它们不是限流，不该留徽章），
+   * 刚失败的账号仍是排序第一，调用方若不排除它就会原地打转、
+   * 换号形同虚设。Go 侧对应的是 `PickExcluding(tried)`（`pool.go:131`）。
+   *
+   * 在池这一层排除（而非让调用方自己跳过）是必要的：调用方只能拿到
+   * 「池认为最优的一个」，无法枚举候选自己去重。
    */
   async getAvailableAccount(
     provider: string,
     modelId: string,
+    excludeAccountIds?: ReadonlySet<string>,
   ): Promise<{ entry: ProviderAccountEntry; credential: CodeArtsCredential | BuddyCredential } | null> {
     const candidates = this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
+      .filter(a => excludeAccountIds === undefined || !excludeAccountIds.has(a.id))
       .filter(a => {
         // 空 modelId（未知目标模型）：无可比对的键，保持候选不变。
         if (modelId.length === 0) return true
@@ -365,12 +600,17 @@ export class AccountPool {
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
       })
     if (candidates.length === 0) return null
-    // 优先选择无限制或限制最早到期的
-    candidates.sort((a, b) => {
-      const ra = a.modelRateLimits?.[modelId] ?? 0
-      const rb = b.modelRateLimits?.[modelId] ?? 0
-      return ra - rb
-    })
+    // 候选顺序即**用户在 Jet Hub 拖拽设定的手动顺序**（`reorderAccounts` 写入）。
+    //
+    // 为什么不再按「限流重置时间最早到期」重排（早期实现如此）：
+    // 那个排序会让手动顺序形同虚设 —— 用户把某账号拖到首位，只要另一个
+    // 账号的限流重置时间更早，实际选中的仍是后者，拖拽变成纯 UI 装饰。
+    // 现在的语义是「手动顺序优先，限流豁免」：顺序完全由用户决定，
+    // 而当前正处于限流期的账号已被上面的 filter 排除，不会选到。
+    //
+    // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
+    // 顺序，故这里天然就是手动顺序，无需任何排序。
+    //
     // 逐个尝试解析凭据，跳过占位/损坏条目（并记录原因，避免静默失败）
     const failures: string[] = []
     for (const entry of candidates) {
@@ -450,4 +690,104 @@ export class AccountPool {
     })
     if (changed) await this.writeAccounts(next)
   }
+
+  /**
+   * 记录 TRAE 签到设备轮换代次（命中 9074 后由积分领取流程调用）。
+   *
+   * 与 {@link updateModelRateLimit} 同款：在**最新快照**上做局部合并后整体
+   * 写回，避免与并发的账号操作互相覆盖。
+   *
+   * 只接受比现值**更大**的代次，防止乱序/重复回调把代次写回小值而让同一个
+   * 被限流的设备号复活。
+   */
+  async updateTraeCheckinDeviceGeneration(accountId: string, generation: number): Promise<void> {
+    if (!Number.isFinite(generation) || generation <= 0) return
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] updateTraeCheckinDeviceGeneration: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const current = accounts[idx]!.traeCheckinDeviceGeneration ?? 0
+    if (generation <= current) return
+    const next = [...accounts]
+    next[idx] = { ...next[idx]!, traeCheckinDeviceGeneration: generation }
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[jet-hub] 账号 ${accountId} 签到设备代次 → ${generation}`)
+  }
+
+  /** 读取 TRAE 签到设备轮换代次（未设置时为 0）。 */
+  traeCheckinDeviceGenerationFor(accountId: string): number {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    const value = entry?.traeCheckinDeviceGeneration
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+  }
+}
+
+/**
+ * `listModels` 的门控：**该 provider 是否应在模型目录中展示**。
+ *
+ * ## 需求来源
+ *
+ * 「如果某供应商没有已登录的账号，就不显示该供应商的所有模型 —— 这样对大多数
+ * 用户来说模型选择选项卡臃肿的问题能改善很多。」
+ *
+ * ## 为什么可行：DSH 原生支持「空目录即隐藏」
+ *
+ * `dsh-api-session-controller` 的 `buildModelCatalog` 显式做了
+ * `.filter(group => group.models.length > 0)`（注释：*"successful non-empty
+ * provider groups"*）。因此适配器返回 `[]` 就能让整个 provider 分组从模型
+ * 选择器中消失 —— **无需任何前端改动**。
+ *
+ * ⚠️ **必须返回空数组，不能抛错**：`buildModelCatalog` 的 `catch` 会把抛错
+ * 归入 `failures`，界面上会多出一条 provider 报错，比「不显示」更糟。
+ *
+ * ⚠️ **不影响路由**：`catalog.routableProviders` 由 `listProviders()` 单独
+ * 生成（不经过该 filter），且 DSH 明确约定 *"Catalog membership is advisory
+ * and never changes routing"* —— 隐藏目录不等于拒绝请求，已持久化的模型
+ * 仍能 `resolveModel` / 正常收发。
+ *
+ * ## 判定语义
+ *
+ * - **默认开启**（`DSH_HIDE_MODELS_WITHOUT_ACCOUNT=0` 可关）：与
+ *   `DSH_TRAE_MAX_MODE` 同为「默认开、显式假值才关」的语义，故单列解析函数。
+ * - `accountPool` 缺失（headless / CLI / 单测）或替身未实现
+ *   `hasLoggedInAccount` 时**视为可见** —— 门控是**展示优化而非安全边界**，
+ *   判定不可用时宁多勿少（否则会让整个 provider 的模型凭空消失）。
+ * - **六个 provider 判据完全一致**：都只看账号池。早期 CodeArts 有一个「单凭据
+ *   例外」（额外认固定 ref `CODEARTS_ACCESS_TOKEN`），该模式已移除，故
+ *   `extraCredentialRefs` 参数也一并删除，避免留下无人使用的分支。
+ *
+ * @param accountPool - 适配器的账号池（可能为 undefined）。
+ * @param provider - provider id。
+ */
+export async function providerCatalogVisible(
+  accountPool: AccountPool | undefined,
+  provider: string,
+): Promise<boolean> {
+  if (!resolveHideWithoutAccountFlag(process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT)) return true
+  if (accountPool === undefined) return true
+  // 能力检测：单测替身通常只 mock 了 disabledModelsFor 等少量方法。
+  if (typeof accountPool.hasLoggedInAccount !== 'function') return true
+  try {
+    return await accountPool.hasLoggedInAccount(provider)
+  } catch {
+    // 读凭据异常（存储损坏等）时保守展示：宁可多显示，也不要让用户
+    // 因为一次读取抖动而「所有模型都不见了」且无从排查。
+    return true
+  }
+}
+
+/**
+ * 解析 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`；**默认开启**。
+ *
+ * 只有显式假值（`0` / `false` / `no` / `off`）才关闭。与 `isTruthyFlag`
+ * 的「默认关」语义相反，故单列一个函数，**不要混用**。
+ */
+function resolveHideWithoutAccountFlag(raw: string | undefined): boolean {
+  if (raw === undefined) return true
+  const value = raw.trim().toLowerCase()
+  return !(value === '0' || value === 'false' || value === 'no' || value === 'off')
 }

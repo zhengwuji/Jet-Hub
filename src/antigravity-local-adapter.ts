@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Antigravity (Google) LlmAdapter —— **方案 B：借用 IDE 本地私有通道**
  *
  * ════════════════════════════════════════════════════════════════════════
@@ -513,6 +513,32 @@ export class AntigravityLocalAdapter extends LlmAdapter {
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * 完整模型目录（**不应用用户黑名单**）。
+   *
+   * Jet Hub 的「显示列表」需要它：设置页必须能渲染被关掉的模型，否则用户
+   * 无法把模型重新打开。`listModels` 会按用户黑名单过滤，故不能复用。
+   *
+   * ⚠️ Antigravity **刻意不接入模型黑名单体系**（它不进账号池，见 AGENTS.md
+   * 防封号约束），因此本方法与 `listModels` 的差别仅在于去掉黑名单过滤 ——
+   * 当前实现里 Antigravity 本就不套黑名单，两者输出一致；单独提供此方法是
+   * 为了满足 Jet Hub `modelAdapters` 的结构化契约（缺了它「显示列表」按钮
+   * 对该 provider 会取不到目录）。
+   *
+   * **必须是同步方法**：契约（`ModelCatalogSource`）如此定义，与 `buddy` /
+   * `codearts` 等适配器一致。因此这里只读 {@link modelConfigs} 这个
+   * **已有缓存**，不发任何网络请求 —— 远端目录由 `listModels` /
+   * `probeChannels` 负责预热。缓存尚未建立时回退到静态 `FALLBACK_MODELS`，
+   * 保证设置页首次打开也有内容可渲染。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const configs = this.modelConfigs
+    if (configs !== undefined && configs.length > 0) {
+      return configs.map((config) => ({ id: config.id, name: config.label }))
+    }
+    return FALLBACK_MODELS.map((model) => ({ id: model.id, name: model.name }))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {

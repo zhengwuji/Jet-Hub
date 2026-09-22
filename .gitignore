@@ -1,4 +1,4 @@
-﻿docs/superpowers
+docs/superpowers
 node_modules/
 lib/
 *.tsbuildinfo
@@ -15,3 +15,25 @@ stderr.log']
 commit-msg.tmp
 
 ide-models.json
+
+# Qoder 私有签名体系的复现脚本（研究工具，仅本地保留）
+#
+# 它含 Qoder 内嵌 WASM（`qoder_auth_wasm`）的 wasm-bindgen glue 与
+# 私有签名接口的调用代码（`generate_runtime_auth_fields` /
+# `qodercontext_prepareRequest` / `model_cache_decrypt`），用于从本机
+# Qoder 安装提取并在线拉取真实模型列表。
+#
+# ⚠️ **不是运行时依赖**：`src/` 不 import 它，`lib/` 不含任何 WASM。
+# 登录 / 续期 / 推理 / 积分余额都只需 Bearer，与它无关；
+# 它唯一的作用是「模型表过时时重新采集数据」。故刻意不入库。
+docs/qoder-wasm-signing-bridge.mjs
+
+# Qoder 加密推理的逆向分析（内部文档，仅本地保留）
+#
+# 含 WASM glue 约定、请求体字段结构、COSY 签名载荷、目录缓存解密、
+# 端点清单，以及 `qfmodel` 路由排查的完整记录。
+#
+# ⚠️ 这是**知识库**而非运行时依赖：`src/` 不引用它。
+# README / AGENTS.md 只保留行为契约与运维指针，不含逆向细节；
+# 需要这些细节时读本文件（Qoder 升级后重新采集尤其需要它）。
+docs/qoder-encryption-notes.md

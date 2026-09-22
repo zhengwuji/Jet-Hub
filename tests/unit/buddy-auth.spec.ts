@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from '../../src/buddy-auth.js'
 import { RefreshTokenExpiredError, runBuddyLoginFlow } from '../../src/buddy-oauth.js'
 import type { BuddyCredential } from '../../src/buddy.js'
-import { WORKBUDDY } from '../../src/product.js'
+import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
 
 vi.mock('../../src/buddy-oauth.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/buddy-oauth.js')>()
@@ -284,8 +284,8 @@ describe('BuddyAuth silent refresh', () => {
     }), { status: 200 })) as unknown as typeof fetch
     const service = newService(ctx, { fetcher })
     expect(await service.fetchModels()).toEqual([
-      { id: 'glm-5.3', name: 'GLM-5.3' },
-      { id: 'kimi-k3-1', name: 'Kimi K3-1' },
+      { id: 'glm-5.3', name: 'GLM-5.3', agentReferenced: true },
+      { id: 'kimi-k3-1', name: 'Kimi K3-1', agentReferenced: true },
     ])
   })
 })
@@ -419,6 +419,64 @@ describe('产品参数化', () => {
     // 只查自己的 provider，且无 refresh_token 的账号被标记为不可续期。
     expect(listed).toEqual(['workbuddy'])
     expect(updated).toEqual(['wb-1'])
+  })
+
+  /**
+   * 真实缺陷（用户报障）：两个**曾停用**的 CodeBuddy 账号显示「凭证过期」，
+   * 且领取积分时报 `Unexpected token '<'`（服务端返回 HTML 错误页）。
+   *
+   * 根因是 `refreshAll` 里的 `if (!entry.enabled || ...) continue`：
+   * **停用账号被跳过续期**，refresh_token 一路放到失效，用户重新启用后
+   * 拿到的是死凭据，只能重新登录。
+   *
+   * 停用只应影响「账号池的自动选号」，与「凭据是否需要保持新鲜」无关 ——
+   * 停用账号同样会出现在 Jet Hub 里并参与积分领取。
+   */
+  it('refreshAll 也续期已停用账号（停用不等于放弃凭据）', async () => {
+    const ctx = createMockContext()
+    await ctx.credentials.set(
+      credentialRef('BUDDY_ACCOUNT_D1'),
+      JSON.stringify(makeCredential()),
+    )
+    const updated: string[] = []
+    const pool = {
+      listAccounts: async (provider: string) => [
+        { id: 'enabled-1', provider, enabled: true, refreshable: true, credentialRef: 'BUDDY_ACCOUNT_E1' },
+        // 停用但可续期 —— 必须同样被续期
+        { id: 'disabled-1', provider, enabled: false, refreshable: true, credentialRef: 'BUDDY_ACCOUNT_D1' },
+      ],
+      updateAccount: async (id: string) => { updated.push(id) },
+    }
+    // 两个账号的凭据都写入，确保续期路径真的被走到。
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_E1'), JSON.stringify(makeCredential()))
+    const auth = new BuddyAuth(ctx as never, { product: CODEBUDDY, fetcher: refreshFetcher() })
+    services.push(auth)
+
+    await auth.refreshAll(pool as never)
+
+    expect(
+      updated,
+      '停用账号未被续期：refreshAll 不该按 enabled 过滤',
+    ).toContain('disabled-1')
+  })
+
+  it('refreshAll 仍跳过不可续期账号（refreshable 为 false）', async () => {
+    // 与上一条互补：去掉 enabled 过滤不等于不过滤 —— 真正不可续期的
+    // （无 refresh_token）仍应跳过，否则每个周期都白跑一次网络请求。
+    const ctx = createMockContext()
+    const updated: string[] = []
+    const pool = {
+      listAccounts: async (provider: string) => [
+        { id: 'no-refresh', provider, enabled: true, refreshable: false, credentialRef: 'BUDDY_ACCOUNT_N1' },
+      ],
+      updateAccount: async (id: string) => { updated.push(id) },
+    }
+    const auth = new BuddyAuth(ctx as never, { product: CODEBUDDY, fetcher: refreshFetcher() })
+    services.push(auth)
+
+    await auth.refreshAll(pool as never)
+
+    expect(updated).toEqual([])
   })
 
   it('WorkBuddy 的 refresh 只续期自己的凭据', async () => {

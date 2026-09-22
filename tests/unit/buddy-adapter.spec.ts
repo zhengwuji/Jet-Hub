@@ -3,7 +3,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { describe, expect, it } from 'vitest'
 import { CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, registerBuddyLlm } from '../../src/buddy-adapter.js'
 import type { BuddyCredential, BuddyRemoteModel } from '../../src/buddy.js'
-import { CODEBUDDY, CODEBUDDY_INTL, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
+import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
 
 const CREDENTIAL_REF = credentialRef('BUDDY_ACCESS_TOKEN')
 
@@ -38,6 +38,32 @@ function sseResponse(body: string): Response {
   return new Response(stream, { status: 200 })
 }
 
+/**
+ * 上下文超限的 400 响应体（用户报障原文，国际版 WorkBuddy + deepseek-v4.1-flash）。
+ *
+ * 关键字段：`msg` 用「prompt is too long」措辞、`extError.code` 为
+ * `context_length_exceeded`。两者都是 DSH `isContextWindowExceededError` 的
+ * 识别依据，适配器必须据此把它归为 CONTEXT_WINDOW_EXCEEDED 而非 INVALID_REQUEST。
+ */
+const CONTEXT_OVERFLOW_BODY = JSON.stringify({
+  code: 11115,
+  msg: 'prompt is too long: 1061554 tokens > 1048576 maximum',
+  requestId: '9dc0e856-3dae-431c-a8bd-87a2ab63e8d9',
+  extError: {
+    code: 'context_length_exceeded',
+    message: 'prompt is too long: 1061554 tokens > 1048576 maximum',
+    param: '',
+    type: 'invalid_request_error',
+    StatusCode: 400,
+    Request: null,
+    Response: null,
+  },
+  displayMsg: {
+    en: 'The request exceeds the model context limit. Please shorten the conversation or remove attachments.',
+    zh: '对话内容超出模型长度上限，请精简对话或减少附件后重试。',
+  },
+})
+
 function makeAdapter(overrides: {
   credential?: BuddyCredential | undefined
   refresh?: () => Promise<void>
@@ -45,9 +71,17 @@ function makeAdapter(overrides: {
   postRefreshCredential?: BuddyCredential | undefined
   fetchImpl?: typeof fetch
   fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
+  /**
+   * 刻意比生产类型宽松（允许多返回 `undefined`）：用于模拟「旧版桥接」
+   * 或版本错配时传入的 readImage——适配器的运行时守卫必须能挡住它，
+   * 而不是依赖类型系统保证。生产侧 `BuddyAdapterOptions.readImage`
+   * 已不含 undefined。
+   */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；不传时由 BuddyAdapter 回退到 CodeBuddy。 */
   product?: BuddyProduct
+  /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
+  accountPool?: unknown
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : makeCredential()
   const refresh = overrides.refresh ?? (async () => {})
@@ -63,6 +97,7 @@ function makeAdapter(overrides: {
     ...overrides.fetchRemoteModels !== undefined ? { fetchRemoteModels: overrides.fetchRemoteModels } : {},
     ...overrides.readImage !== undefined ? { readImage: overrides.readImage } : {},
     ...overrides.product !== undefined ? { product: overrides.product } : {},
+    ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
   })
 }
 
@@ -107,6 +142,154 @@ describe('BuddyAdapter', () => {
     expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
   })
 
+  it('兜底表白名单保留「被 agent 引用」的模型（真实缺陷回归：hy4-preview-f）', async () => {
+    // ⚠️ 真实缺陷（用户报障「hy4 preview 现在 ide 是免费我们还是 0.29」）：
+    // 两个端点下发的 id 集合不同，而「限时免费」促销只挂在
+    // `/v3/config` 独有的 `hy4-preview-f` 上，它**不在产品兜底表**里。
+    // 白名单式重建会把它丢弃 → 用户看不到那个免费变体，而 IDE 里能看到。
+    //
+    // 判据用 `agentReferenced`（服务端自己的「可选」信号），
+    // 而不是猜 id 后缀（`-f`/`-x`/`-sg` 含义各异，猜错会放进不可用的模型）。
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        // 不在兜底表、但服务端说可选 → 必须保留
+        { id: 'hy4-preview-f', name: 'Hy4 preview', creditsRate: 'x0.29', discountedCreditsRate: '免费', agentReferenced: true },
+        // 不在兜底表、服务端也没说可选（内部别名）→ 仍应丢弃
+        { id: 'internal-alias', name: 'Internal' },
+      ],
+    })
+    const ids = (await adapter.listModels('buddy')).map((m) => m.id)
+    expect(ids).toContain('hy4-preview-f')
+    expect(ids).not.toContain('internal-alias')
+    // 追加在末尾，不打乱兜底表原有顺序
+    expect(ids.slice(0, CODEBUDDY.fallbackModels!.length))
+      .toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+    expect(ids.at(-1)).toBe('hy4-preview-f')
+    // 展示名带促销价与变体标记（与既有 hy3/hy3-x 同款消歧）
+    const name = (await adapter.listModels('buddy')).find((m) => m.id === 'hy4-preview-f')?.name
+    expect(name).toContain('免费')
+    expect(name).toContain('F')
+  })
+
+  // ── 计费倍率与同名区分（写进 name）──
+  //
+  // ⚠️ **必须写进 `name`，不是 `description`**：composer 的模型切换菜单只渲染
+  // `name`（见 dsh-client-ui-model-selection 的 ModelSelect：`children: model.name`），
+  // `description` 仅用于 `/model` 弹窗。用户报障「消耗倍率没有显示在切换模型
+  // 列表的后面」正是因为早期版本放在了 `description`。
+  //
+  // 安全性：`name` 纯属展示 —— DSH 的选择与持久化只用 `id`
+  // （`selectionOf` 返回 `model: model.id`）。
+  describe('listModels 的计费倍率与同名区分', () => {
+    it('把 credits 追加到 name 后面', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'glm-5.3', name: 'GLM-5.3', creditsRate: 'x0.79' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models[0]?.name).toBe('GLM-5.3 · x0.79')
+    })
+
+    it('有促销时显示 原价→促销价', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4-flash', name: 'DS', creditsRate: 'x0.17', discountedCreditsRate: 'x0.50' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models[0]?.name).toBe('DS · x0.17→x0.50')
+    })
+
+    it('无倍率信息时 name 保持原样', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [{ id: 'mystery', name: 'M' }],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models[0]?.name).toBe('M')
+    })
+
+    // 真实问题（用户报障）：国际版 `deepseek-v4.1-flash` 与
+    // `deepseek-v4.1-flash-sg` 的远端 name **完全相同**，而 IDE 只显示一个。
+    // 两者是不同区域/计费的实体（credits x0.00 vs x0.03），不能简单丢弃其一，
+    // 故对撞车的 name 追加变体标记。
+    it('同名模型追加变体标记以区分', async () => {
+      const adapter = makeAdapter({
+        product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.00' },
+          { id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.03' },
+        ],
+      })
+      const models = await adapter.listModels('workbuddy')
+      expect(models.map((m) => m.name)).toEqual([
+        'Deepseek-V4.1-Flash · x0.00',
+        'Deepseek-V4.1-Flash · x0.03 SG',
+      ])
+      // 唯一性：选择器里不会再出现两个无法区分的条目。
+      expect(new Set(models.map((m) => m.name)).size).toBe(2)
+    })
+
+    // 实测另有 hy3/hy3-x 与 hy4-preview-f/hy4-preview 两组撞车，
+    // 硬编码 `-sg` 会漏掉它们，故用公共前缀的通用算法。
+    it('非 -sg 的同名组同样被区分（公共前缀算法）', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'hy3', name: 'Hy3' },
+          { id: 'hy3-x', name: 'Hy3' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models.map((m) => m.name)).toEqual(['Hy3', 'Hy3 · X'])
+    })
+
+    it('三个以上同名 id 仍能全部区分', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'gpt-5.6', name: 'GPT-5.6' },
+          { id: 'gpt-5.6-sol', name: 'GPT-5.6' },
+          { id: 'gpt-5.6-luna', name: 'GPT-5.6' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(new Set(models.map((m) => m.name)).size).toBe(3)
+    })
+
+    it('不同名的模型不追加变体标记', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' },
+          { id: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
+        ],
+      })
+      const models = await adapter.listModels('buddy')
+      expect(models.map((m) => m.name)).toEqual(['GPT-5.6-Sol', 'GPT-5.6-Luna'])
+    })
+
+    // 真实回归：初版把倍率与变体标记写进 description，导致
+    // 「计费 x0.00 · 」（孤立分隔符）与重复的「SG」，而且**在切换模型列表里
+    // 根本看不到**（用户报障）。
+    it('倍率不进 description（否则切换菜单看不到）', async () => {
+      const adapter = makeAdapter({
+        product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'a', name: 'Same', creditsRate: 'x0.10' },
+          { id: 'a-sg', name: 'Same', creditsRate: 'x0.20' },
+        ],
+      })
+      const models = await adapter.listModels('workbuddy')
+      for (const model of models) expect(model).not.toHaveProperty('description')
+      expect(models[0]?.name).toBe('Same · x0.10')
+      expect(models[1]?.name).toBe('Same · x0.20 SG')
+    })
+  })
+
   it('resolveModel reports the known context window', async () => {
     const resolved = await makeAdapter().resolveModel('buddy', 'deepseek-v4-flash')
     expect(resolved).toMatchObject({ provider: 'buddy', id: 'deepseek-v4-flash', context: { contextWindow: 1_000_000 } })
@@ -122,6 +305,108 @@ describe('BuddyAdapter', () => {
     expect((await adapter.resolveModel('buddy', 'glm-5.1')).context).toEqual({ contextWindow: 200_000 })
     expect((await adapter.resolveModel('buddy', 'minimax-m3')).context).toEqual({ contextWindow: 512_000 })
     expect((await adapter.resolveModel('buddy', 'kimi-k2.6')).context).toEqual({ contextWindow: 256_000 })
+  })
+
+  // ── 单次输出上限（maxOutputTokens）──
+  //
+  // 用户报障：deepseek-v4.1-flash 在 32000 token 处被截断，turn/end 为
+  // `{kind:'max-tokens'}`。根因是适配器**从未下发 max_tokens**，上限完全由
+  // 网关默认值决定（实测网关对 auto 等模型正是 32000）；而远端早已下发权威的
+  // maxOutputTokens（实测 deepseek-v4.1-flash = 128000）。
+  describe('单次输出上限', () => {
+    it('远端 maxOutputTokens 映射为 defaultMaxTokens', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'DS', maxOutputTokens: 128_000 },
+        ],
+      })
+      expect((await adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).defaultMaxTokens).toBe(128_000)
+    })
+
+    it('远端与兜底表都没有该值时保持 undefined（不编造）', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [{ id: 'mystery', name: 'M' }],
+      })
+      expect((await adapter.resolveModel('buddy', 'mystery')).defaultMaxTokens).toBeUndefined()
+    })
+
+    it('远端缺失时用产品兜底表的实测值补位', async () => {
+      // deepseek-v4.1-flash 在 CodeBuddy 兜底表中已按实测填 128000。
+      const resolved = await makeAdapter().resolveModel('buddy', 'deepseek-v4.1-flash')
+      expect(resolved.defaultMaxTokens).toBe(128_000)
+    })
+
+    it('stream 把上限写进请求体的 max_tokens', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(128_000)
+    })
+
+    it('调用方显式给出的 maxTokens 优先于远端与兜底表', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 4_096,
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(4_096)
+    })
+
+    it('远端下发的值优先于兜底表', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'DS', maxOutputTokens: 7_000 },
+        ],
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(7_000)
+    })
+
+    it('workbuddy 的 deepseek-v4.1-flash 同样默认 128000', async () => {
+      // 国际版实测 /v3/config 下发 128000，兜底表与之对齐。
+      const adapter = makeAdapter({ product: WORKBUDDY })
+      expect((await adapter.resolveModel('workbuddy', 'deepseek-v4.1-flash')).defaultMaxTokens).toBe(128_000)
+    })
+
+    it('非法/非正的远端值被忽略', async () => {
+      const adapter = makeAdapter({
+        product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'zero', name: 'Z', maxOutputTokens: 0 },
+          { id: 'neg', name: 'N', maxOutputTokens: -5 },
+        ],
+      })
+      expect((await adapter.resolveModel('buddy', 'zero')).defaultMaxTokens).toBeUndefined()
+      expect((await adapter.resolveModel('buddy', 'neg')).defaultMaxTokens).toBeUndefined()
+    })
   })
 
   it('resolveModel prefers the remote maxInputTokens over the static table', async () => {
@@ -300,6 +585,111 @@ describe('BuddyAdapter credential handling', () => {
     }
   })
 
+  /**
+   * 上下文超限必须归为 CONTEXT_WINDOW_EXCEEDED，而不是笼统的 INVALID_REQUEST。
+   *
+   * 为什么这条错误码至关重要：DSH 的自动压缩恢复（dsh-compaction-basic）监听
+   * `agent/request-error`，**只对 `failure.code === CONTEXT_WINDOW_EXCEEDED`**
+   * 的失败压缩上下文并重试。若标成 INVALID_REQUEST，长会话一旦越过窗口就会把
+   * 裸错误直接抛给用户，用户看到的是：
+   *
+   *   buddy: {"code":11115,"msg":"prompt is too long: 1061554 tokens > 1048576 maximum", ...}
+   *
+   * 这正是用户报障的现象（国际版 WorkBuddy，deepseek-v4.1-flash）。CodeArts
+   * 适配器早已做此归类（llm-adapter.ts 的 httpErrorCode），buddy 此前遗漏。
+   *
+   * 报文取自真实报障原文：`msg` 为「prompt is too long」措辞、
+   * `extError.code` 为 `context_length_exceeded`，两者都应被识别。
+   */
+  it('stream 把上下文超限的 400 归为 CONTEXT_WINDOW_EXCEEDED（触发自动压缩）', async () => {
+    const adapter = makeAdapter({
+      fetchImpl: async () => new Response(CONTEXT_OVERFLOW_BODY, { status: 400 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).failure.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    // 错误消息仍须保留可读原因（用户/日志据此定位），不能被错误码改写掉
+    expect((error as LlmError).message).toContain('prompt is too long')
+  })
+
+  it('上下文超限的 400 不被误判为限流（不触发账号切换）', async () => {
+    // 区分「窗口超限」与「用量限流」很重要：前者换账号也没用（同样的上下文
+    // 会再次超限），必须走压缩；后者才该切换账号。若误判为限流，适配器会白试
+    // 一遍所有账号，最后仍以 QUOTA_EXCEEDED 掩盖真实原因。
+    //
+    // 这里用自包含的 pool 替身（该 describe 内的 makePool 定义在另一块中）。
+    const recorded: Array<{ accountId: string }> = []
+    const sentTokens: string[] = []
+    const pool = {
+      async findAccountIdByCredential() { return 'acct-1' },
+      async updateModelRateLimit(accountId: string) { recorded.push({ accountId }) },
+      async getAvailableAccount() {
+        return { entry: { id: 'acct-2' }, credential: makeCredential({ access_token: 'AT2' }) }
+      },
+    }
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        sentTokens.push(auth.replace('Bearer ', ''))
+        return new Response(CONTEXT_OVERFLOW_BODY, { status: 400 })
+      },
+    })
+
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+
+    expect((error as LlmError).failure.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    // 只发了当前账号：没有因误判限流而去轮询其余账号
+    expect(sentTokens).toEqual(['AT1'])
+    // 也不应写入任何限流标记
+    expect(recorded).toEqual([])
+  })
+
+  /**
+   * 对照：同为中国版/国际版常见的 400 错误，只要不含超限措辞，仍须是
+   * INVALID_REQUEST —— 避免为了修上下文超限而把所有 400 都当成可压缩错误
+   * （那会让真正的请求错误被反复压缩重试，浪费额度且掩盖原因）。
+   */
+  it('普通 400（模型不存在 / 参数非法）仍归为 INVALID_REQUEST', async () => {
+    const cases = [
+      '{"error":{"message":"model not found"}}',
+      '{"code":11102,"msg":"service info not found"}',
+      '{"error":{"type":"invalid_request_error","message":"unsupported parameter"}}',
+    ]
+    for (const body of cases) {
+      const adapter = makeAdapter({ fetchImpl: async () => new Response(body, { status: 400 }) })
+      const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+      expect((error as LlmError).failure.code, body).toBe('INVALID_REQUEST')
+    }
+  })
+
+  /**
+   * 判定必须看**完整 body**，不能只看 errorDetail 归一化后的短文本。
+   *
+   * `errorDetail` 在能提取到 `error.*` / `data.message` 时会返回拼接文本，
+   * 从而丢掉 `extError` / `displayMsg`。若把判定建立在它之上，服务端一旦
+   * 把 `msg` 改名成 `message`（或补上 `error.code`），`extError.code =
+   * context_length_exceeded` 这个最强信号就会被丢弃，超限随即漏判成
+   * INVALID_REQUEST、自动压缩再次失效。
+   *
+   * 这里构造「error.code 为字符串 + msg 为超限措辞」的变体：errorDetail 会
+   * 返回 `"some_error prompt is too long: ..."`（丢失 extError），但完整 body
+   * 仍含 `context_length_exceeded`，故必须仍判为超限。
+   */
+  it('判定基于完整 body：extError 在 errorDetail 中被丢弃时仍能识别超限', async () => {
+    const variant = JSON.stringify({
+      error: { code: 'some_error', message: 'prompt is too long: 1061554 tokens > 1048576 maximum' },
+      extError: { code: 'context_length_exceeded' },
+    })
+    const adapter = makeAdapter({ fetchImpl: async () => new Response(variant, { status: 400 }) })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
   it('stream sends the required CodeBuddy headers', async () => {
     let seen: Headers | undefined
     const adapter = makeAdapter({
@@ -340,11 +730,35 @@ describe('BuddyAdapter credential handling', () => {
     expect(await captureBody({ reasoningEffort: 'max' })).toMatchObject({ reasoning_effort: 'max' })
   })
 
-  it('stream omits reasoning_effort when none is selected or it is unsupported', async () => {
-    expect(await captureBody()).not.toHaveProperty('reasoning_effort')
+  // 实测（2026-09，直连 workbuddy 国际/中国 UA 与 codebuddy 三站点对照）：
+  //   - 裸请求（无 reasoning_effort、无 thinking）→ reasoning_content 恒为 0；
+  //   - 仅 reasoning_effort:high → 返回思考；仅 thinking:{type:'enabled'} → 仍为 0；
+  //   - 两者都带 → 返回思考。
+  // 即 reasoning_effort 才是真正开关，thinking 单独不生效（保留以对齐官方形态）。
+  it('stream enables thinking for deepseek models', async () => {
+    expect(await captureBody()).toMatchObject({ thinking: { type: 'enabled' } })
+  })
+
+  // 真实缺陷回归（会话 session-03b4d1f2 "测试思考过程显示"）：workbuddy 的
+  // deepseek-v4.1-flash 未声明 defaultReasoningEffort，composer 因而未预选档位，
+  // 请求体里只剩 thinking 而没有 reasoning_effort → 上游按不思考应答 → UI 看不到
+  // 思考块。适配器必须在此情形补档，保证任何 deepseek 请求都带 reasoning_effort。
+  it('stream backfills reasoning_effort for deepseek when none is selected or unsupported', async () => {
+    // composer 未选等级（options.reasoningEffort === undefined）时补默认档。
+    expect(await captureBody()).toMatchObject({ reasoning_effort: 'high' })
     // 会话历史里可能残留切换模型前的旧等级（如 glm-5.2 的 xhigh），
-    // 直接透传会让服务端拒绝整个请求。
-    expect(await captureBody({ reasoningEffort: 'xhigh' })).not.toHaveProperty('reasoning_effort')
+    // 不被该模型支持时也要补成合法档位，而非丢弃导致静默不思考。
+    const body = await captureBody({ reasoningEffort: 'xhigh' })
+    expect(body).toHaveProperty('reasoning_effort')
+    expect(['low', 'high', 'max']).toContain(body.reasoning_effort)
+  })
+
+  it('stream does not enable thinking or backfill effort for non-deepseek models', async () => {
+    // glm 等其他模型走各自 thinkingFormat（默认开或 enable_thinking），
+    // 不注入 thinking 开关、不补默认档。
+    const body = await captureBody({ model: 'glm-5.2' })
+    expect(body).not.toHaveProperty('thinking')
+    expect(body).not.toHaveProperty('reasoning_effort')
   })
 
   // CodeBuddy 只接受 OpenAI 多模态 parts 形态的图片；
@@ -391,6 +805,53 @@ describe('BuddyAdapter credential handling', () => {
     const body = await captureBody({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })
     const user = (body.messages as Array<Record<string, unknown>>).find((m) => m.role === 'user')!
     expect(user.content).toBe('hello')
+  })
+
+  // 「静默丢图」回归护栏：readImage 表示读不到时，必须抛错。
+  // 旧实现会 `continue` 丢掉整张图，线上请求退化成纯文本，
+  // 模型只能答「我看不到图片」，用户拿不到任何错误原因。
+  it('stream fails loudly when readImage reports it cannot read the bytes', async () => {
+    let body: Record<string, unknown> | undefined
+    const adapter = makeAdapter({
+      readImage: async () => undefined,
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: [DONE]\n\n')
+      },
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is this?' },
+          { type: 'image', attachment: { attachmentId: 'att-missing' } },
+        ],
+      }],
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+    // 关键：请求根本没有发出，图片不可能被静默丢弃。
+    expect(body).toBeUndefined()
+  })
+
+  it('stream preserves the cause when readImage throws', async () => {
+    const cause = new Error('attachment object is gone')
+    const adapter = makeAdapter({
+      readImage: async () => { throw cause },
+      fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }] }],
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+    expect((error as LlmError).message).toContain('attachment object is gone')
   })
 })
 
@@ -851,6 +1312,21 @@ describe('BuddyAdapter 账号池限流切换', () => {
   }
 
   /**
+   * 国际版（WorkBuddy）英文 6004 响应体 —— 用户报障原文。
+   *
+   * 与 {@link rateLimitBody} 的唯一差别是语言（以及句式）。两者都必须能
+   * 触发账号切换：服务端对同一业务码返回哪种语言，取决于请求落在哪个区域。
+   */
+  function intlRateLimitBody(): string {
+    return JSON.stringify({
+      code: 6004,
+      msg: "usage exceeds frequency limit, but don't worry, your usage will reset at "
+        + '2099-12-31 23:59:59 UTC+8, alternatively, you can switch to the other models to continue using it.',
+      requestId: 'ffb5bd97-2036-48a0-baba-a56c6ab13c9c',
+    })
+  }
+
+  /**
    * 记录 updateModelRateLimit / getAvailableAccount 调用的轻量 AccountPool 替身。
    * @param current - 会话开始时就已启用的当前账号（token 与 resolveCredential 一致）
    * @param candidates - 切换时按顺序返回的候选账号
@@ -970,6 +1446,91 @@ describe('BuddyAdapter 账号池限流切换', () => {
     expect((error as LlmError).code).not.toBe('QUOTA_EXCEEDED')
     expect((error as LlmError).message).toContain('model not found')
   })
+
+  /**
+   * 国际版（WorkBuddy）英文 6004 必须同样触发账号切换。
+   *
+   * 历史缺陷（用户报障）：限流判定与重置时间解析都只认中文文案，而国际版
+   * 返回的是英文 `usage exceeds frequency limit ... reset at <时间> UTC+8`。
+   * 于是 `isRateLimited` 恒为 false，适配器**只试了当前账号就抛原始 JSON**
+   * （用户看到的正是 `buddy: {"code":6004,...}`），既没切换账号，也没记录
+   * 限流标记。国内版返回中文，故该缺陷只在国际版复现。
+   *
+   * 本用例锁死「英文 6004 → 逐个尝试其余账号 → 成功账号产出内容」的完整链路。
+   */
+  it('国际版英文 6004 同样触发账号切换，并记录限流标记', async () => {
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [
+        { id: 'acct-2', token: 'AT2' },
+        { id: 'acct-3', token: 'AT3' },
+      ],
+    )
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      product: WORKBUDDY,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        // AT1 与 AT2 都被英文 6004 拒绝，AT3 成功
+        if (token === 'AT3') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        return new Response(intlRateLimitBody(), { status: 400 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 关键断言 1：确实换了账号（旧实现只会发 AT1 一次）
+    expect(sentTokens).toEqual(['AT1', 'AT2', 'AT3'])
+    // 关键断言 2：最终拿到内容，而不是把 6004 抛给用户
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 关键断言 3：失败账号都被记录限流（UI 才能显示标记），且用的是真实重置时间
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+    expect(pool.recorded.every((r) => r.modelId === DEFAULT_MODEL)).toBe(true)
+    // 英文报文里的重置时间是 2099 年（远未来），不能是 fallback 的「1 小时后」
+    expect(pool.recorded.every((r) => r.resetAtMs > Date.parse('2090-01-01'))).toBe(true)
+  })
+
+  it('国际版英文 6004 全部账号受限时报 QUOTA_EXCEEDED（而非原始 400）', async () => {
+    const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      product: WORKBUDDY,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        sentTokens.push(auth.replace('Bearer ', ''))
+        return new Response(intlRateLimitBody(), { status: 400 })
+      },
+    })
+
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    // 关键：错误码必须是不可重试的 QUOTA_EXCEEDED。
+    // 旧实现因 HTTP 400 退化成 INVALID_REQUEST，且两个账号都被试过（证明切换生效）
+    expect((error as LlmError).code).toBe('QUOTA_EXCEEDED')
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1', 'acct-2'])
+  })
 })
 
 /** 端点常量供测试断言引用（避免硬编码字符串漂移）。 */
@@ -1045,13 +1606,18 @@ describe('产品参数化', () => {
     } as never)
     expect(seen!.get('X-Product-Code')).toBe(CODEBUDDY.productCode)
     expect(seen!.get('User-Agent')).toBe(CODEBUDDY.userAgent)
-    // 部署类型（X-Product）两个产品共用 SaaS，不随产品变化。
-    expect(seen!.get('X-Product')).toBe('SaaS')
+    // X-Product 是**归属名**（产品名），不是部署类型。
+    expect(seen!.get('X-Product')).toBe('CodeBuddy')
+    // 归属头族：后台「使用端」列按这组头归因。
+    expect(seen!.get('X-Agent-Purpose')).toBe('conversation')
+    expect(seen!.get('X-IDE-Name')).toBe('CodeBuddy')
+    expect(seen!.get('X-IDE-Type')).toBe('CodeBuddy')
+    expect(seen!.get('X-IDE-Version')).toBe(CODEBUDDY.clientVersion)
   })
 
   it('WorkBuddy 适配器使用自身 product 的 productCode、User-Agent 与 providerInfo 展示名', async () => {
-    // 两个内置产品的 userAgent 字面量暂时相同，无法观测「是否取自 product」，
-    // 故这里注入自定义 UA 的 product，让该分支真正有鉴别力。
+    // deepseek-v4-flash 不命中任何模型族规则 → 回落到 product.userAgent，
+    // 故注入自定义 UA 的 product 仍能被观测到。
     const custom: BuddyProduct = { ...WORKBUDDY, userAgent: 'WorkBuddy/7.7.7' }
     let seen: Headers | undefined
     const adapter = new BuddyAdapter({
@@ -1071,7 +1637,8 @@ describe('产品参数化', () => {
     } as never)
     expect(seen!.get('X-Product-Code')).toBe('workbuddy')
     expect(seen!.get('User-Agent')).toBe('WorkBuddy/7.7.7')
-    expect(seen!.get('X-Product')).toBe('SaaS')
+    expect(seen!.get('X-Product')).toBe('WorkBuddy')
+    expect(seen!.get('X-IDE-Name')).toBe('WorkBuddy')
     expect(adapter.providerInfo('workbuddy').name).toBe(WORKBUDDY.displayName)
   })
 
@@ -1095,8 +1662,65 @@ describe('产品参数化', () => {
     expect(seen!.get('User-Agent')).toBe('CustomAgent/9.9.9')
   })
 
-  it('providerInfo 对非字符串入参回退到本产品的 id', () => {
-    // 上游传入 undefined 时不得让 deriveKeyRef 的 toUpperCase 崩在客户端。
+  // ── 按模型族分档的 User-Agent ──
+
+  it('WorkBuddy 的 UA 按模型族分档：GPT 系走国际版形态，GLM 系走国内形态', async () => {
+    const uaFor = async (model: string): Promise<string | null> => {
+      let seen: Headers | undefined
+      const adapter = new BuddyAdapter({
+        credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+        resolveCredential: async () => makeCredential(),
+        refresh: async () => {},
+        product: WORKBUDDY,
+        fetchImpl: async (_url, init) => {
+          seen = new Headers(init?.headers as HeadersInit)
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model,
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never)
+      return seen!.get('User-Agent')
+    }
+
+    // 国际版独有模型线 → 国际版形态（平台段为 `WorkBuddy AI`）。
+    expect(await uaFor('gpt-5.6-sol')).toBe('WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
+    expect(await uaFor('gemini-3.5-flash')).toBe('WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
+    // 国内系模型 → 国内客户端形态（平台段为 `WorkBuddy`）。
+    expect(await uaFor('glm-5.2')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
+    expect(await uaFor('hy3')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
+    expect(await uaFor('kimi-k3')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
+    // 未命中任何模型族规则 → 回落到 product.userAgent（默认国际版形态）。
+    expect(await uaFor('deepseek-v4.1-flash')).toBe(WORKBUDDY.userAgent)
+  })
+
+  it('分档后的 UA 仍含产品品牌字样，不会退化成框架的 harness UA', async () => {
+    // 归因前提：腾讯后台按出站 UA 归因「使用端」，UA 必须含 WorkBuddy/CodeBuddy 字样。
+    const custom: BuddyProduct = { ...WORKBUDDY, userAgent: 'WorkBuddy/9.9.9' }
+    let seen: Headers | undefined
+    const adapter = new BuddyAdapter({
+      credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+      resolveCredential: async () => makeCredential(),
+      refresh: async () => {},
+      product: custom,
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+    const ua = seen!.get('User-Agent')!
+    expect(ua).toContain('WorkBuddy')
+    expect(ua).not.toContain('deepseek-harness')
+  })
+
+  it('providerInfo 对非字符串入参回退到本产品的 id', () => {    // 上游传入 undefined 时不得让 deriveKeyRef 的 toUpperCase 崩在客户端。
     const workbuddy = new BuddyAdapter({
       credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
       resolveCredential: async () => makeCredential(),
@@ -1345,25 +1969,119 @@ describe('产品兜底模型目录校正', () => {
     expect(models.map((m) => m.id)).toEqual(['x', 'y'])
   })
 })
+// ── 无可用账号时的行为 ──
+//
+// 目录隐藏的门控已统一收归 `providerCatalogVisible()`（见
+// `describe('BuddyAdapter 目录门控…')`），此处只保留**与门控无关**的那条契约：
+// 凭据解析不到时 `resolveModel` 必须抛 AUTHENTICATION，而不是静默回退到静态兜底。
 describe('无可用账号时模型目录防护', () => {
-  it('未配置有效凭据时 listModels 返回空数组（不泄露静态兜底模型）', async () => {
-    const adapter = new BuddyAdapter({
-      credentialRef: credentialRef('BUDDY_INTL_ACCESS_TOKEN'),
-      resolveCredential: async () => undefined,
-      refresh: async () => {},
-      product: CODEBUDDY_INTL,
-    })
-    const models = await adapter.listModels('buddy-intl')
-    expect(models).toEqual([])
-  })
-
   it('未配置有效凭据时 resolveModel 抛出 AUTHENTICATION 错误', async () => {
     const adapter = new BuddyAdapter({
-      credentialRef: credentialRef('BUDDY_INTL_ACCESS_TOKEN'),
+      credentialRef: credentialRef('BUDDY_ACCESS_TOKEN'),
       resolveCredential: async () => undefined,
       refresh: async () => {},
-      product: CODEBUDDY_INTL,
+      product: CODEBUDDY,
     })
-    await expect(adapter.resolveModel('buddy-intl', 'deepseek-v4.1-flash')).rejects.toThrow(/未配置有效账号/)
+    await expect(adapter.resolveModel('buddy', 'deepseek-v4.1-flash')).rejects.toThrow(/未配置有效账号/)
+  })
+})
+
+
+/**
+ * 模型黑名单对 listModels 的过滤。
+ *
+ * 这是「关闭开关 → 对话框不再显示该模型」这条链路的关键一环：
+ * /api/session 的模型目录正是通过 ctx.llm.listModels() → 适配器 listModels()
+ * 构建的。此处断言适配器确实把黑名单里的模型摘掉了。
+ */
+describe('BuddyAdapter 模型黑名单', () => {
+  /** 只实现 listModels 所需方法的账号池替身。 */
+  function poolWithDisabled(provider: string, ids: string[]) {
+    const disabled = new Set(ids)
+    return {
+      disabledModelsFor: (value: string) => (value === provider ? disabled : new Set<string>()),
+    } as never
+  }
+
+  it('被关闭的模型从列表中消失，其余保持原有顺序', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['glm-5.2', 'hy3']) })
+    const models = await adapter.listModels('buddy')
+    const ids = models.map((m) => m.id)
+
+    expect(ids).not.toContain('glm-5.2')
+    expect(ids).not.toContain('hy3')
+    // 未关闭的模型一个都不能少，且顺序不变（顺序即选择器的展示顺序）
+    expect(ids).toEqual(
+      CODEBUDDY.fallbackModels!.map((m) => m.id).filter((id) => id !== 'glm-5.2' && id !== 'hy3'),
+    )
+  })
+
+  it('空黑名单不改变列表（默认全开）', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', []) })
+    const models = await adapter.listModels('buddy')
+    expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+  })
+
+  it('没有账号池时不过滤（适配器可脱离账号池使用）', async () => {
+    const models = await makeAdapter().listModels('buddy')
+    expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+  })
+
+  it('黑名单按产品 id 隔离：workbuddy 的关闭项不影响 buddy', async () => {
+    const adapter = makeAdapter({
+      accountPool: {
+        // 只对 workbuddy 报告黑名单
+        disabledModelsFor: (value: string) => (value === 'workbuddy' ? new Set(['glm-5.2']) : new Set<string>()),
+      } as never,
+    })
+    const ids = (await adapter.listModels('buddy')).map((m) => m.id)
+    expect(ids).toContain('glm-5.2')
+  })
+
+  it('关闭不影响 resolveModel/stream 的路由能力（目录只是建议性的）', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['glm-5.2']) })
+    // listModels 里已消失……
+    expect((await adapter.listModels('buddy')).map((m) => m.id)).not.toContain('glm-5.2')
+    // ……但仍可解析元数据（DSH 契约要求目录缺省不构成请求拒绝）
+    const resolved = await adapter.resolveModel('buddy', 'glm-5.2')
+    expect(resolved.id).toBe('glm-5.2')
+    expect(resolved.context?.contextWindow).toBe(1_000_000)
+  })
+})
+
+// ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──
+//
+// DSH 的 `buildModelCatalog` 显式 `.filter(group => group.models.length > 0)`，
+// 故返回空数组即让整个 provider 分组消失（用户需求：减少模型选择列表臃肿）。
+describe('BuddyAdapter 目录门控（无已登录账号时隐藏）', () => {
+  /** 账号池替身：报告是否有已登录账号。 */
+  function poolWithLogin(loggedIn: boolean) {
+    return {
+      disabledModelsFor: () => new Set<string>(),
+      hasLoggedInAccount: async () => loggedIn,
+    } as never
+  }
+
+  it('没有已登录账号 → 返回空数组', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithLogin(false) })
+    expect(await adapter.listModels('buddy')).toEqual([])
+  })
+
+  it('有已登录账号 → 正常返回目录', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithLogin(true) })
+    expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
+  })
+
+  it('accountPool 缺失时保守放行（判定不可用 ≠ 无账号）', async () => {
+    const adapter = makeAdapter()
+    expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
+  })
+
+  it('未实现 hasLoggedInAccount 的替身同样保守放行', async () => {
+    // 门控是展示优化而非安全边界：判定不可用时宁多勿少。
+    const adapter = makeAdapter({
+      accountPool: { disabledModelsFor: () => new Set<string>() } as never,
+    })
+    expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
   })
 })

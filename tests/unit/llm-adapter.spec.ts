@@ -23,6 +23,8 @@ function makeAdapter(overrides: {
   refresh?: () => Promise<void>
   fetchImpl?: typeof fetch
   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
+  accountPool?: unknown
 } = {}) {
   let credential = 'credential' in overrides ? overrides.credential : validCredential
   const refresh = overrides.refresh ?? (async () => {})
@@ -33,8 +35,32 @@ function makeAdapter(overrides: {
     refresh: async () => { await refresh(); credential = validCredential },
     fetchImpl,
     fetchRemoteModels: overrides.fetchRemoteModels,
+    ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
   })
   return adapter
+}
+
+/** 只实现 listModels 所需方法的账号池替身：对指定 provider 报告黑名单。 */
+function poolWithDisabled(provider: string, ids: string[]) {
+  const disabled = new Set(ids)
+  return {
+    disabledModelsFor: (value: string) => (value === provider ? disabled : new Set<string>()),
+  }
+}
+
+/**
+ * 目录门控替身。
+ *
+ * `loggedInRefs` = 账号池里**凭据可解析**的 ref（空数组表示没有已登录账号）。
+ * 替身只关心「账号池里有没有可用凭据」这一件事 —— 单凭据例外已移除，
+ * 故不再需要额外 ref 参数。
+ */
+function poolWithCredentials(loggedInRefs: readonly string[]) {
+  const pool = new Set(loggedInRefs)
+  return {
+    disabledModelsFor: () => new Set<string>(),
+    hasLoggedInAccount: async (_provider: string) => pool.size > 0,
+  }
 }
 
 describe('CodeArtsAdapter', () => {
@@ -42,8 +68,7 @@ describe('CodeArtsAdapter', () => {
     expect(makeAdapter().providerInfo('codearts')).toMatchObject({ id: 'codearts', name: 'CodeArts Agent' })
   })
 
-  it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {
-    // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
+  it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {    // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
     // openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
     // 后端 /v1/default/models 下发的 model_id 为全小写。
     // DeepSeek V4（对齐 deveco-code 62834ff6）：CodeArts Agent 模型列表新增
@@ -647,6 +672,75 @@ describe('CodeArtsAdapter', () => {
     expect(ids).not.toContain('Qwen3.5-397B-A17B-VL')
     // 普通模型不受影响。
     expect(ids).toContain('GLM-5.2')
+  })
+
+  /**
+   * 模型黑名单：Jet Hub 的「显示列表」开关关闭某模型后，它必须从
+   * listModels 的播报里消失 —— 对话框模型选择器读的正是这份数据。
+   */
+  it('hides models the user disabled from listModels', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'GLM-5.2', name: 'GLM-5.2' },
+        { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' },
+        { id: 'openpangu-2.0-pro', name: 'openpangu-2.0-pro' },
+      ],
+      accountPool: poolWithDisabled('codearts', ['GLM-5.2']),
+    })
+    const ids = (await adapter.listModels('codearts')).map((m) => m.id)
+    expect(ids).not.toContain('GLM-5.2')
+    // 未关闭的模型保持原样与原有顺序
+    expect(ids).toEqual(['deepseek-v4-flash', 'openpangu-2.0-pro'])
+  })
+
+  it('an empty disabled set leaves listModels untouched', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('codearts', []) })
+    const ids = (await adapter.listModels('codearts')).map((m) => m.id)
+    expect(ids).toContain('GLM-5.2')
+    expect(ids).toContain('deepseek-v4-flash')
+  })
+
+  it('blacklist is keyed by provider: another route\'s entries do not leak in', async () => {
+    // 池里只有 buddy 的黑名单，codearts 路由不该被它影响
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['GLM-5.2']) })
+    expect((await adapter.listModels('codearts')).map((m) => m.id)).toContain('GLM-5.2')
+  })
+
+  it('a disabled model still resolves and remains requestable (catalog is advisory)', async () => {
+    const adapter = makeAdapter({ accountPool: poolWithDisabled('codearts', ['GLM-5.2']) })
+    expect((await adapter.listModels('codearts')).map((m) => m.id)).not.toContain('GLM-5.2')
+    // DSH 契约：listModels 的结果仅供参考，缺省不构成请求拒绝。
+    const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
+    expect(resolved.id).toBe('GLM-5.2')
+    expect(resolved.context?.contextWindow).toBe(202752)
+  })
+
+  // ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──
+  //
+  // ⚠️ **CodeArts 不再有「单凭据模式」例外**：登录入口只有 Jet Hub 设置页，
+  // 凭据一律写账号池条目（`CODEARTS_ACCOUNT_XXX`）。固定的
+  // `CODEARTS_ACCESS_TOKEN` 不会再被写入或读取，判据与其余五个 provider 一致。
+  describe('无已登录账号时隐藏整个 provider 目录', () => {
+    it('没有已登录账号 → 返回空数组', async () => {
+      const adapter = makeAdapter({ accountPool: poolWithCredentials([]) })
+      expect(await adapter.listModels('codearts')).toEqual([])
+    })
+
+    it('⚠️ 单凭据 ref 有值但账号池为空 → 仍隐藏（单凭据模式已移除）', async () => {
+      // 这是本次变更的核心断言：老用户若只用固定 ref 登录过，模型会消失、
+      // 需要在 Jet Hub 重新登录一次（用户已确认接受该行为）。
+      const adapter = makeAdapter({ accountPool: poolWithCredentials([]) })
+      expect(await adapter.listModels('codearts')).toEqual([])
+    })
+
+    it('账号池里有已登录账号 → 正常返回目录', async () => {
+      const adapter = makeAdapter({ accountPool: poolWithCredentials(['CODEARTS_ACCOUNT_1']) })
+      expect((await adapter.listModels('codearts')).map((m) => m.id)).toContain('GLM-5.2')
+    })
+
+    it('未提供 accountPool 时保守放行（headless / CLI 场景）', async () => {
+      expect((await makeAdapter().listModels('codearts')).length).toBeGreaterThan(0)
+    })
   })
 
   it('switches deepseek-v4 to DSML tool mode: no tools field, schema injected into system', async () => {

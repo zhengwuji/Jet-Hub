@@ -1,12 +1,17 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
-import { apply } from '../../src/index.js'
+import { apply, makeReadImage } from '../../src/index.js'
+import * as pluginEntry from '../../src/index.js'
 import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
 import { runBuddyLoginFlow } from '../../src/buddy-oauth.js'
 import { CodeArtsAuth } from '../../src/service.js'
 import { BuddyAuth } from '../../src/buddy-auth.js'
+import { LobsteraiAuth } from '../../src/lobsterai-auth.js'
+import { TraeAuth } from '../../src/trae-auth.js'
 import { WORKBUDDY } from '../../src/product.js'
+import { LOBSTERAI } from '../../src/lobsterai-product.js'
+import { TRAE } from '../../src/trae-product.js'
 
 vi.mock('../../src/login.js', () => ({
   runLoginFlow: vi.fn(),
@@ -57,22 +62,15 @@ class FakeLlm {
   registerConfigurableProviders(
     entries: Array<{ provider: string; displayName?: string; settingsNs?: string }>,
   ): { replace: (next: Array<{ provider: string; displayName?: string; settingsNs?: string }>) => void } {
-    this.providers.length = 0
-    this.configurableProviders.length = 0
+    // ⚠️ **累加语义**，与真实 ctx.llm 一致：六个 provider 各自在自己的
+    // registerXxxLlm 里独立调用本方法，若这里先清空就会把前面几个注册的目录项
+    // 抹掉（早期 mock 这样写，导致 lobsterai/qoder/trae 的目录断言假失败）。
+    // `replace()` 返回空操作：当前实现已不再动态增删目录项（见 src/index.ts）。
     for (const entry of entries) {
       this.providers.push(entry.provider)
       this.configurableProviders.push(entry)
     }
-    return {
-      replace: (next) => {
-        this.providers.length = 0
-        this.configurableProviders.length = 0
-        for (const entry of next) {
-          this.providers.push(entry.provider)
-          this.configurableProviders.push(entry)
-        }
-      },
-    }
+    return { replace: () => {} }
   }
   registerAdapter(providers: string[], _adapter: unknown): { replace: () => void } {
     this.adapters.push(...providers)
@@ -134,65 +132,24 @@ afterEach(() => {
 })
 
 describe('plugin entry', () => {
-  it('registers the codeartsAuth service and the codearts-login command', () => {
+  it('registers the codeartsAuth service (no slash commands)', () => {
     const { ctx, commands } = makeContext()
     apply(ctx)
     expect(ctx.codeartsAuth).toBeInstanceOf(CodeArtsAuth)
-    expect(commands.definitions.map((d) => d.name)).toContain('codearts-login')
-  })
-
-  it('command handler reports success with ref and expiry', async () => {
-    mockedRunOAuthFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    const login = commands.definitions.find((d) => d.name === 'codearts-login')!
-    const result = await login.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toMatchObject({ kind: 'success' })
-    expect((result as { text?: string }).text).toContain('CODEARTS_ACCESS_TOKEN')
-  })
-
-  it('command handler reports a failure as an error result', async () => {
-    mockedRunOAuthFlow.mockRejectedValue(new Error('CodeArts login timed out'))
-    const { ctx, commands } = makeContext()
-    apply(ctx)
-    const login = commands.definitions.find((d) => d.name === 'codearts-login')!
-    const result = await login.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toEqual({ kind: 'error', text: 'CodeArts login timed out' })
-  })
-
-  it('registers the codearts LLM route and the status/refresh commands', () => {
-    const { ctx, commands, llm } = makeContext()
-    apply(ctx)
-    // 无账号时模型设置列表不显示，但 adapter 路由已就绪
-    expect(llm.providers).not.toContain('codearts')
-    expect(llm.adapters).toContain('codearts')
+    // CodeArts 不再注册任何斜杠命令：登录/状态/续期统一在 Jet Hub 设置页完成。
     const names = commands.definitions.map((d) => d.name)
-    expect(names).toContain('codearts-status')
-    expect(names).toContain('codearts-refresh')
+    for (const removed of ['codearts-login', 'codearts-status', 'codearts-refresh', 'codearts-logout']) {
+      expect(names, removed).not.toContain(removed)
+    }
   })
 
-  it('codearts-status reports refreshability', async () => {
-    mockedRunOAuthFlow.mockResolvedValue({ access: 'cred', expires: 1234, loginUrl: 'https://login' })
-    const { ctx, commands } = makeContext()
+  it('注册 codearts LLM 路由（目录、适配器、设置 namespace）', () => {
+    const { ctx, llm } = makeContext()
     apply(ctx)
-    const status = commands.definitions.find((d) => d.name === 'codearts-status')!
-    const result = await status.handler({
-      commandId: 'cid' as never,
-      agent: undefined as never,
-      rawInput: '',
-      signal: new AbortController().signal,
-    })
-    expect(result).toMatchObject({ kind: 'success' })
+    // 目录项必须常在（模型的设置页入口），「无账号就不显示模型」由适配器
+    // listModels() 内的 providerCatalogVisible() 门控实现，见 src/account-pool.ts。
+    expect(llm.providers).toContain('codearts')
+    expect(llm.adapters).toContain('codearts')
   })
 
   it('stops the refresh scheduler when the plugin context is disposed', async () => {
@@ -219,8 +176,11 @@ describe('buddy plugin entry', () => {
   it('registers the buddy LLM route', () => {
     const { ctx, llm } = makeContext()
     apply(ctx)
-    // 无账号时模型设置列表不显示，但 adapter 路由已就绪
-    expect(llm.providers).not.toContain('buddy')
+    // provider 路由与目录项都注册就绪。
+    // 「没有账号就不显示模型」由适配器 listModels() 内的 providerCatalogVisible()
+    // 门控实现（返回空数组让 DSH 过滤掉该分组），**不**体现为目录项被摘除 ——
+    // 目录项必须常在，否则模型的设置页入口会消失。
+    expect(llm.providers).toContain('buddy')
     expect(llm.adapters).toContain('buddy')
   })
 
@@ -239,40 +199,35 @@ describe('WorkBuddy provider 注册', () => {
     apply(ctx as never)
     const registered = ctx.llm.registeredProviders
     expect(registered).toContain('buddy')
-    expect(registered).toContain('buddy-intl')
-    expect(registered).toContain('workbuddy-cn')
     expect(registered).toContain('workbuddy')
+    // 早期变体 `buddy-intl` / `workbuddy-cn` 已随产品收敛移除（见 src/product.ts
+    // 的 ALL_PRODUCTS 注释）：它们是同一协议的区域副本，差异全部收敛进
+    // endpoint / UA 分档配置，不再各自注册 provider 路由。
+    expect(registered).not.toContain('buddy-intl')
+    expect(registered).not.toContain('workbuddy-cn')
   })
 
   it('WorkBuddy 使用独立的凭据 ref', () => {
     expect(WORKBUDDY.defaultCredentialRef).toBe('WORKBUDDY_ACCESS_TOKEN')
   })
 
-  it('动态同步模型设置目录项：有账号时注册显示，删除账号后自动移除', async () => {
+  it('可配置 provider 目录项注册即固定，不随账号池增删而变动', () => {
     const ctx = createMockContext()
     apply(ctx as never)
-    // 初始没有账号：模型侧不显示（已删除/无账号的提供方不留在模型列表中）
-    expect(ctx.llm.configurableProviders.find((p) => p.provider === 'workbuddy')).toBeUndefined()
-    expect(ctx.llm.configurableProviders.find((p) => p.provider === 'codearts')).toBeUndefined()
 
-    // 模拟在账号池新增一个 workbuddy 账号
-    await ctx.accountPool.addAccount({
-      id: 'workbuddy-test-1',
-      provider: 'workbuddy',
-      nickname: 'WB Test',
-      enabled: true,
-      credentialRef: 'WORKBUDDY_TEST_REF',
-      refreshable: false,
-      createdAt: Date.now(),
-    })
-
-    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'workbuddy')
-    expect(entry).toMatchObject({ provider: 'workbuddy', displayName: WORKBUDDY.displayName })
-    expect(entry?.settingsNs).toBe('llm-workbuddy')
-
-    // 模拟删除该账号：模型侧自动注销移除
-    await ctx.accountPool.removeAccount('workbuddy-test-1')
-    expect(ctx.llm.configurableProviders.find((p) => p.provider === 'workbuddy')).toBeUndefined()
+    // 目录项在各自 registerXxxLlm 里一次性注册，**不**依赖账号是否存在。
+    //
+    // 早期实现（本地分支的 syncConfigurableProviders）会在「有账号才登记」，
+    // 后果是 lobsterai / qoder / trae 永远不在目录里、settingsNs 从未注册，
+    // 模型设置页在 `refFor → deriveKeyRef(provider)` 处崩溃。该机制已被
+    // Gitee 的 b3a9561 整体替换：目录固定，而「没有账号就不显示模型」改由
+    // 各适配器 listModels() 里的 providerCatalogVisible() 门控实现
+    // （空分组会被 DSH 的 buildModelCatalog 过滤掉）。
+    for (const provider of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'trae']) {
+      const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === provider)
+      expect(entry, provider).toBeDefined()
+      expect(entry?.settingsNs, provider).toBe(`llm-${provider}`)
+    }
   })
 
   // 关键前置：命名空间必须预先注册，防止模型设置页崩溃
@@ -281,22 +236,27 @@ describe('WorkBuddy provider 注册', () => {
     apply(ctx as never)
     expect(ctx.settings.registeredNamespaces).toContain('llm-codearts')
     expect(ctx.settings.registeredNamespaces).toContain('llm-buddy')
-    expect(ctx.settings.registeredNamespaces).toContain('llm-buddy-intl')
-    expect(ctx.settings.registeredNamespaces).toContain('llm-workbuddy-cn')
     expect(ctx.settings.registeredNamespaces).toContain('llm-workbuddy')
+    // 六个 provider 的 namespace 都要预注册（含 Gitee 新增的三个）
+    expect(ctx.settings.registeredNamespaces).toContain('llm-lobsterai')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-qoder')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-trae')
+    // Antigravity 复用本机 IDE 凭据，同样需要自己的 namespace
+    expect(ctx.settings.registeredNamespaces).toContain('llm-antigravity')
   })
 
-  it('不注册任何 buddy/workbuddy 斜杠命令（入口在 Jet Hub 设置页）', () => {
+  it('不注册任何 provider 的斜杠命令（入口都在 Jet Hub 设置页）', () => {
     const ctx = createMockContext()
     apply(ctx as never)
     const names = ctx.commands.definitions.map((d) => d.name)
-    for (const removed of ['buddy-login', 'buddy-status', 'buddy-refresh', 'workbuddy-login', 'workbuddy-status']) {
+    for (const removed of [
+      'buddy-login', 'buddy-status', 'buddy-refresh', 'workbuddy-login', 'workbuddy-status',
+      // CodeArts 的三个命令也已移除：登录/状态/续期统一在 Jet Hub 完成，
+      // 六个 provider 的做法现在完全一致。
+      'codearts-login', 'codearts-status', 'codearts-refresh', 'codearts-logout',
+    ]) {
       expect(names, removed).not.toContain(removed)
     }
-    // codearts 的三个命令保留（CodeArts 没有 Jet Hub 登录入口的替代品）。
-    expect(names).toContain('codearts-login')
-    expect(names).toContain('codearts-status')
-    expect(names).toContain('codearts-refresh')
     // 命令名必须唯一，重复注册会让后注册的覆盖先注册的。
     expect(new Set(names).size).toBe(names.length)
   })
@@ -308,14 +268,16 @@ describe('WorkBuddy provider 注册', () => {
     const ctx = createMockContext()
     apply(ctx as never)
     expect(ctx.buddyAuth).toBeInstanceOf(BuddyAuth)
-    expect(ctx.buddyIntlAuth).toBeInstanceOf(BuddyAuth)
-    expect(ctx.workbuddyCnAuth).toBeInstanceOf(BuddyAuth)
     expect(ctx.workbuddyAuth).toBeInstanceOf(BuddyAuth)
     expect(ctx.buddyAuth).not.toBe(ctx.workbuddyAuth)
     expect(ctx.buddyAuth.product.id).toBe('buddy')
     expect(ctx.workbuddyAuth.product.id).toBe('workbuddy')
     expect(ctx.buddyAuth.credentialRefName).toBe('BUDDY_ACCESS_TOKEN')
     expect(ctx.workbuddyAuth.credentialRefName).toBe('WORKBUDDY_ACCESS_TOKEN')
+    // 早期变体 `buddy-intl` / `workbuddy-cn` 已随产品收敛移除（见 src/product.ts
+    // 的 ALL_PRODUCTS 注释），不再各自注册独立的 Auth 服务实例。
+    expect(ctx.buddyIntlAuth).toBeUndefined()
+    expect(ctx.workbuddyCnAuth).toBeUndefined()
   })
 
   it('workbuddyAuth 只读 WorkBuddy 自己的凭据 ref', async () => {
@@ -353,5 +315,219 @@ describe('WorkBuddy provider 注册', () => {
     await ctx.fiber.dispose()
     expect(buddyStop).toHaveBeenCalled()
     expect(workbuddyStop).toHaveBeenCalled()
+  })
+
+  /**
+   * `connection` **不得**出现在插件级静态 `inject` 里。
+   *
+   * 该服务只由 Web bundle（dsh-client-connection）提供，headless / CLI profile
+   * 中并不存在。静态 `inject` 会让本插件在那些 profile 里永久 pending，整个
+   * profile 因此以
+   * `plugin tree failed to load: 1 entry did not activate` 启动失败
+   * —— chicheng-cron 的 skill/agent 任务正是跑在 `dsh --profile headless` 下，
+   * 会全部 exit 1。
+   *
+   * 正确做法是 `registerJetHubRpc` 内部用惰性注入（`ctx.inject(['connection'], …)`）
+   * 挂载端点：Web 下正常注册，其余 profile 只是不注册 Jet Hub 端点。
+   *
+   * 这条断言锁住的是「**能不能加载**」而非某个功能细节，所以即便日后有人为了
+   * 让 UI 更"直接"而把 connection 加回静态 inject，也必须先看到这里失败。
+   */
+  it('静态 inject 不得包含 connection（否则 headless profile 启动失败）', () => {
+    const { inject } = pluginEntry as { inject?: readonly string[] }
+    expect(Array.isArray(inject)).toBe(true)
+    expect(inject).not.toContain('connection')
+    // 必需服务仍须声明，避免修 connection 时顺手把别的服务误删。
+    for (const required of ['credentials', 'commands', 'llm']) {
+      expect(inject, required).toContain(required)
+    }
+  })
+})
+
+
+describe('LobsterAI provider 注册', () => {
+  it('apply 时注册 lobsterai provider 路由与适配器', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.llm.registeredProviders).toContain('lobsterai')
+    expect(ctx.llm.adapters).toContain('lobsterai')
+  })
+
+  it('注册 lobsterai 的可配置 provider 目录项（含展示名）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'lobsterai')
+    expect(entry).toMatchObject({ provider: 'lobsterai', displayName: LOBSTERAI.displayName })
+  })
+
+  // 与 workbuddy 同理：settingsNs 未注册时，模型设置页会在
+  // refFor → deriveKeyRef(provider) 处以 `provider.toUpperCase is not a function` 崩溃。
+  it('lobsterai 的 settingsNs 为 llm-lobsterai，且对应 settings namespace 已注册', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'lobsterai')
+    expect(entry?.settingsNs).toBe('llm-lobsterai')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-lobsterai')
+  })
+
+  it('不注册任何 lobsterai 斜杠命令（入口在 Jet Hub 设置页）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const names = ctx.commands.definitions.map((d) => d.name)
+    for (const removed of ['lobsterai-login', 'lobsterai-status', 'lobsterai-refresh']) {
+      expect(names, removed).not.toContain(removed)
+    }
+  })
+
+  it('暴露 lobsteraiAuth 服务实例，服务名不与既有 provider 冲突', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.lobsteraiAuth).toBeInstanceOf(LobsteraiAuth)
+    expect(ctx.lobsteraiAuth.name).toBe('lobsteraiAuth')
+    expect(ctx.lobsteraiAuth.product.id).toBe('lobsterai')
+    expect(ctx.lobsteraiAuth.credentialRefName).toBe('LOBSTERAI_ACCESS_TOKEN')
+    // 四个 provider 的服务实例必须两两不同（同名二次注册会抛错）。
+    expect(ctx.lobsteraiAuth).not.toBe(ctx.buddyAuth)
+    expect(ctx.lobsteraiAuth).not.toBe(ctx.workbuddyAuth)
+  })
+
+  it('lobsteraiAuth 只读自己的凭据 ref（不串用腾讯系凭据）', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 只写入 CodeBuddy 的 ref：LobsterAI 必须报告未配置。
+    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.lobsteraiAuth.status()).configured).toBe(false)
+
+    await ctx.credentials.set('LOBSTERAI_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT2', refresh_token: 'RT2', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.lobsteraiAuth.status()).configured).toBe(true)
+  })
+
+  it('dispose 时停止 LobsterAI 的续期调度', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const stop = vi.spyOn(ctx.lobsteraiAuth, 'stop')
+    await ctx.fiber.dispose()
+    expect(stop).toHaveBeenCalled()
+  })
+})
+
+describe('TRAE provider 注册', () => {
+  it('apply 时注册 trae provider 路由与适配器', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.llm.registeredProviders).toContain('trae')
+    expect(ctx.llm.adapters).toContain('trae')
+  })
+
+  it('注册 trae 的可配置 provider 目录项（含展示名）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'trae')
+    expect(entry).toMatchObject({ provider: 'trae', displayName: TRAE.displayName })
+  })
+
+  // 与 workbuddy / lobsterai 同理：settingsNs 未注册时，模型设置页会在
+  // refFor → deriveKeyRef(provider) 处以 `provider.toUpperCase is not a function` 崩溃。
+  it('trae 的 settingsNs 为 llm-trae，且对应 settings namespace 已注册', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'trae')
+    expect(entry?.settingsNs).toBe('llm-trae')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-trae')
+  })
+
+  it('不注册任何 trae 斜杠命令（入口在 Jet Hub 设置页）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const names = ctx.commands.definitions.map((d) => d.name)
+    for (const removed of ['trae-login', 'trae-status', 'trae-refresh']) {
+      expect(names, removed).not.toContain(removed)
+    }
+  })
+
+  it('暴露 traeAuth 服务实例，服务名不与既有 provider 冲突', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.traeAuth).toBeInstanceOf(TraeAuth)
+    expect(ctx.traeAuth.name).toBe('traeAuth')
+    expect(ctx.traeAuth.product.id).toBe('trae')
+    expect(ctx.traeAuth.credentialRefName).toBe('TRAE_ACCESS_TOKEN')
+    // 五个 provider 的服务实例必须两两不同（同名二次注册会抛错）。
+    expect(ctx.traeAuth).not.toBe(ctx.buddyAuth)
+    expect(ctx.traeAuth).not.toBe(ctx.workbuddyAuth)
+    expect(ctx.traeAuth).not.toBe(ctx.lobsteraiAuth)
+  })
+
+  it('traeAuth 只读自己的凭据 ref（不串用其它 provider 凭据）', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 只写入 CodeBuddy 的 ref：TRAE 必须报告未配置。
+    await ctx.credentials.set('BUDDY_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.traeAuth.status()).configured).toBe(false)
+
+    await ctx.credentials.set('TRAE_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT2', refresh_token: 'RT2', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.traeAuth.status()).configured).toBe(true)
+  })
+
+  it('dispose 时停止 TRAE 的续期调度', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const stop = vi.spyOn(ctx.traeAuth, 'stop')
+    await ctx.fiber.dispose()
+    expect(stop).toHaveBeenCalled()
+  })
+})
+
+/**
+ * `makeReadImage` 是「图片为什么送不出去」这条诊断链上唯一的桥接点。
+ *
+ * 旧实现在附件服务缺失或单图读取失败时一律 `return undefined`，
+ * 适配器收到 undefined 后 `continue` 丢图：线上请求静默退化成纯文本，
+ * 用户只看到模型「看不到图片」，拿不到任何错误原因——排查成本极高。
+ * 下面两条锁住「读不到必须抛错」这一契约。
+ */
+describe('makeReadImage 图片桥接', () => {
+  it('附件服务缺失时抛错，并提示需要哪个插件', async () => {
+    const ctx = new Context()
+    const readImage = makeReadImage(ctx)
+    const error = await readImage({ attachmentId: 'att-1' }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('attachments')
+    expect((error as Error).message).toContain('dsh-attachment-local')
+  })
+
+  it('读取成功时返回字节与 mediaType', async () => {
+    const ctx = new Context()
+    ctx.provide('attachments', {
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), ref: { mediaType: 'image/png' } }),
+    } as never)
+    const readImage = makeReadImage(ctx)
+    await expect(readImage({ attachmentId: 'att-1' })).resolves.toEqual({
+      data: new Uint8Array([1, 2, 3]),
+      mediaType: 'image/png',
+    })
+  })
+
+  it('单图读取失败时让原始异常冒泡（绝不静默返回 undefined）', async () => {
+    // 分工：桥接层不包装，保持原始错误完整；适配器层负责包成带
+    // attachmentId 的 LlmError。此处锁住「不会变成 undefined」这一点。
+    const cause = new Error('attachment object is gone')
+    const ctx = new Context()
+    ctx.provide('attachments', {
+      readImage: async () => { throw cause },
+    } as never)
+    const readImage = makeReadImage(ctx)
+    const error = await readImage({ attachmentId: 'att-1' }).catch((e: unknown) => e)
+    expect(error).toBe(cause)
+    expect(error).not.toBeUndefined()
+
   })
 })

@@ -35,6 +35,13 @@ export interface BuddyFallbackModel {
   name: string
   /** 上下文窗口（对应远端 `maxInputTokens`）。 */
   contextWindow?: number
+  /**
+   * 单次请求输出上限（对应远端 `maxOutputTokens`）。
+   *
+   * 远端可达时以远端为准；本字段只在远端不可用或未覆盖该模型时补位。
+   * 取值依据见 `deepseek-v4.1-flash` 条目的注释。
+   */
+  maxOutputTokens?: number
   /** 是否接受图片输入（对应远端 `supportsImages`）。 */
   supportsImages?: boolean
   /** 可选思考等级（对应远端 `reasoning.supportedEfforts`）。 */
@@ -42,6 +49,26 @@ export interface BuddyFallbackModel {
   /** 默认思考等级（对应远端 `reasoning.defaultEffort`）。 */
   defaultReasoningEffort?: string
 }
+
+/** 一条「模型族 → User-Agent」覆盖规则。 */
+export interface BuddyUserAgentRule {
+  /** 模型 id 前缀；命中即采用本规则的 ua。 */
+  match: string
+  /** 命中后使用的 User-Agent。 */
+  ua: string
+}
+
+/**
+ * 国际版（WorkBuddy AI）模型线 → UA 分档规则。
+ *
+ * 判据来自 IDE 客户端形态：国际版产品名是 `WorkBuddy AI`，其客户端出站 UA
+ * 遵循官方三段式 `WorkBuddy/<ver> WorkBuddy AI/<ver> CLI/<ver>`。GPT / Gemini
+ * 系仅在国际版池中提供，归入国际版形态；国内系模型（glm/hy/kimi/minimax）
+ * 虽在国际版池中也可见，但仍沿用国内客户端形态（`WorkBuddy/<ver> WorkBuddy/...`），
+ * 与 realm 无关。
+ */
+const WORKBUDDY_UA_INTL = 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2'
+const WORKBUDDY_UA_CN = 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2'
 
 /** 一个 CodeBuddy 系产品的全部差异配置。 */
 export interface BuddyProduct {
@@ -63,8 +90,36 @@ export interface BuddyProduct {
   displayName: string
   /** X-Product-Code 请求头值 */
   productCode: string
-  /** User-Agent */
+  /**
+   * 默认 User-Agent（无按模型分档命中时使用）。
+   *
+   * 腾讯后台的「使用端」列按出站 UA 归因，故该值必须**含对应产品品牌字样**
+   * （`WorkBuddy/...` 或 `CodeBuddyIDE/...`），否则账单显示为 `-`。
+   */
   userAgent: string
+  /**
+   * 按模型族覆盖 User-Agent 的规则表（先命中先返回）。
+   *
+   * 为什么需要按模型分档：国际版与国内版共用同一后端协议，但模型池分属不同
+   * 产品线 —— 实测同一账号下，走 `gpt-*` 系与走 `glm-*` 系时官方客户端形态
+   * 并不一致，后台按 UA 归因的「使用端」也随之不同。仅用一个全局 UA 无法让
+   * 两类模型都归因正确。
+   *
+   * 匹配规则：`match` 为模型 id 前缀（大小写敏感，与模型 id 一致）；
+   * 空数组或未提供时全部回退到 {@link BuddyProduct.userAgent}。
+   */
+  userAgentByModelFamily?: readonly BuddyUserAgentRule[]
+  /**
+   * 归属头名（`X-IDE-Name` / `X-IDE-Type` / `X-Product` 三头共用同一取值）。
+   *
+   * 注意语义：`X-Product` 是**用量归属名**，不是部署类型 —— 历史实现把它发成
+   * `SaaS`（部署类型语义）导致后台归因不到产品，故此处按产品名下发。
+   */
+  attributionName: string
+  /** `X-IDE-Version` 头取值（客户端形态版本号） */
+  clientVersion: string
+  /** User-Agent 第三段 `CLI/<ver>` 的版本号 */
+  cliVersion: string
   /** 默认凭据 ref（无账号池时的单凭据回退） */
   defaultCredentialRef: string
   /**
@@ -113,42 +168,89 @@ export interface BuddyProduct {
 const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   {
     id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3-x', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
+    // maxOutputTokens 实测（2026-09-19）：scoped 端点 128000、/v3/config 131072。
+    // 取 **128000**（两个端点的较小者）：它是服务端真正接受的额度，131072 是
+    // /v3/config 的声明值。取小者避免因端点差异被上游拒绝；远端可用时仍以
+    // 远端下发值为准，本字段只在远端缺失时补位。
     id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
+  },
+  {
+    // 2026-09 补录：远端 /v3/config 与 scoped 端点均返回该模型，且实测能看图
+    // （纯红图问答答出「红色」）。它不在 craft/cli agent 白名单里，但可正常调用，
+    // 也是适配器 DEFAULT_MODEL 的取值。
+    //
+    // 档位沿用适配器静态表 REASONING_EFFORTS 的既有取值 [low,high,max]（该表有
+    // 实测依据：三档会显著改变返回的 reasoning_content 长度）。注意上游
+    // /v3/config 声明的是 [low,high,xhigh]，与本表不一致；实测服务端对 low /
+    // medium / high / xhigh / max 一律返回 200（不报非法参数），无法据此判定
+    // 哪一组才真实生效，故不擅自改动既有行为，仅记录该分歧待后续验证。
+    id: 'deepseek-v4-flash', name: 'Deepseek-V4-Flash', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 50_000,
   },
   {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 32_000,
   },
   {
     id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
-  { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    // supportsImages 为 true 有实测依据：纯红图问答答出「红色」。
+    // 注意 scoped 端点（/console/enterprises/personal/models）对它返回
+    // supportsImages=false，与 /v3/config、IDE 缓存、wb2api 清单三处矛盾；
+    // 实测以「能看到图」为准，故保留 true（远端若下发 true 则两者一致，
+    // 只有 scoped 端点先命中时才会被它的 false 覆盖，见 buddy-adapter 的
+    // supportsImagesFor 修正）。
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 48_000,
+  },
+  {
+    id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 64_000,
+  },
+  {
+    id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
+  {
+    // 2026-09 补录：旧注释曾把它列为「service info not found」而排除，但实测
+    // 可正常调用且能看图（纯红图问答答出「红色」），远端两端点也都在下发。
+    id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
+  },
+  {
+    id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
+  {
+    id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
+  {
+    id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 64_000,
+  },
 ]
 
 export const CODEBUDDY: BuddyProduct = {
@@ -159,6 +261,11 @@ export const CODEBUDDY: BuddyProduct = {
   displayName: 'CodeBuddy (国内版)',
   productCode: 'codebuddy',
   userAgent: 'CodeBuddyIDE/1.106.1',
+  // 中国版只有一条产品线，无需按模型分档：全部模型沿用 IDE UA。
+  userAgentByModelFamily: [],
+  attributionName: 'CodeBuddy',
+  clientVersion: '1.106.1',
+  cliVersion: '2.137.1',
   defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
   appendSessionParams: false,
   fallbackModels: CODEBUDDY_FALLBACK_MODELS,
@@ -174,56 +281,77 @@ export const CODEBUDDY: BuddyProduct = {
  * 顺序即 IDE 的展示顺序（`cli` agent 白名单顺序），不要随意重排。
  */
 const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
-  { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true },
-  { id: 'fast-model', name: 'Fast', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'balanced-model', name: 'Balanced', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'primary-model', name: 'Primary', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['high'] },
-  { id: 'deep-model', name: 'Deep', contextWindow: 176_000, supportsImages: true },
+  // 注：以下 maxOutputTokens 全部来自 2026-09-19 对国际版 `/v3/config` 的实测
+  // （`node scripts/dump-max-output.mjs`）。该值就是用户在 IDE 里实际拿到的
+  // 单次输出额度，远端不可用时由本表顶替。远端未下发的模型保持 undefined。
+  { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true, maxOutputTokens: 24_000 },
+  { id: 'fast-model', name: 'Fast', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  { id: 'balanced-model', name: 'Balanced', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  { id: 'primary-model', name: 'Primary', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['high'], maxOutputTokens: 72_000 },
+  { id: 'deep-model', name: 'Deep', contextWindow: 176_000, supportsImages: true, maxOutputTokens: 24_000 },
   {
     id: 'hy4-preview-f', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
+  },
+  {
+    // 2026-09 补录：/v3/config 的 cli agent 白名单里有它，但兜底表原先漏了，
+    // 于是被 reconcileWithFallback 丢弃、模型选择器里看不到。实测能看图。
+    id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
-  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'] },
+  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000 },
+  {
+    // 2026-09 补录：新加坡区的同代模型（-sg 后缀），远端下发且实测能看图。
+    id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
+  },
   {
     id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-terra', name: 'GPT-5.6-Terra', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-luna', name: 'GPT-5.6-Luna', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 272_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 72_000,
   },
+  // gpt-5.3-codex：远端未下发 maxOutputTokens，故不填（保持 undefined，
+  // 交由网关默认），不臆造数值。
   { id: 'gpt-5.3-codex', name: 'GPT-5.3-Codex', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'gemini-3.5-flash', name: 'Gemini-3.5-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'gemini-3.5-flash', name: 'Gemini-3.5-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 65_536 },
   {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 48_000,
   },
   {
     id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 48_000,
   },
-  { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  {
+    // 2026-09 补录：远端 /v3/config 的 cli agent 白名单里有它，兜底表原先漏了。
+    id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 32_000,
+  },
+  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
 ]
 
 /**
@@ -238,43 +366,6 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
  * 该产品**没有**每日签到积分接口（内核中只有 `/v2/billing/meter/get-dosage-notify`），
  * 因此 Jet Hub 不为其渲染「一键领取积分」按钮；积分领取在 CodeBuddy 侧完成。
  */
-export const CODEBUDDY_CN = CODEBUDDY
-
-/**
- * CodeBuddy 国际版（CodeBuddy AI），platform = ide。
- * endpoint = "https://www.codebuddy.ai"
- */
-export const CODEBUDDY_INTL: BuddyProduct = {
-  id: 'buddy-intl',
-  platform: 'ide',
-  endpoint: 'https://www.codebuddy.ai',
-  apiDomain: 'www.codebuddy.ai',
-  displayName: 'CodeBuddy (国际版)',
-  productCode: 'codebuddy',
-  userAgent: 'CodeBuddyIDE/1.106.1',
-  defaultCredentialRef: 'BUDDY_INTL_ACCESS_TOKEN',
-  appendSessionParams: false,
-  fallbackModels: WORKBUDDY_FALLBACK_MODELS,
-}
-
-/**
- * WorkBuddy 国内版（腾讯 WorkBuddy），platform = workbuddy。
- * endpoint = "https://copilot.tencent.com"
- */
-export const WORKBUDDY_CN: BuddyProduct = {
-  id: 'workbuddy-cn',
-  platform: 'workbuddy',
-  endpoint: 'https://copilot.tencent.com',
-  apiDomain: 'copilot.tencent.com',
-  displayName: 'WorkBuddy (国内版)',
-  productCode: 'workbuddy',
-  userAgent: 'CodeBuddyIDE/1.106.1',
-  defaultCredentialRef: 'WORKBUDDY_CN_ACCESS_TOKEN',
-  appendSessionParams: true,
-  pluginVersion: '5.5.4',
-  fallbackModels: CODEBUDDY_FALLBACK_MODELS,
-}
-
 export const WORKBUDDY: BuddyProduct = {
   id: 'workbuddy',
   platform: 'workbuddy-ai',
@@ -282,25 +373,57 @@ export const WORKBUDDY: BuddyProduct = {
   apiDomain: 'www.workbuddy.ai',
   displayName: 'WorkBuddy (国际版)',
   productCode: 'workbuddy',
-  userAgent: 'CodeBuddyIDE/1.106.1',
+  // 默认档：国际版产品形态（无按模型命中时使用）。
+  userAgent: WORKBUDDY_UA_INTL,
+  userAgentByModelFamily: [
+    // 国际版独有模型线（GPT / Gemini / Claude 系）→ 国际版形态。
+    { match: 'gpt-', ua: WORKBUDDY_UA_INTL },
+    { match: 'gemini-', ua: WORKBUDDY_UA_INTL },
+    { match: 'claude-', ua: WORKBUDDY_UA_INTL },
+    // 国内系模型（glm / hy / kimi / minimax）→ 国内客户端形态。
+    { match: 'glm-', ua: WORKBUDDY_UA_CN },
+    { match: 'hy', ua: WORKBUDDY_UA_CN },
+    { match: 'kimi-', ua: WORKBUDDY_UA_CN },
+    { match: 'minimax-', ua: WORKBUDDY_UA_CN },
+  ],
+  attributionName: 'WorkBuddy',
+  clientVersion: '5.5.2',
+  cliVersion: '5.5.2',
   defaultCredentialRef: 'WORKBUDDY_ACCESS_TOKEN',
   appendSessionParams: true,
   pluginVersion: '5.5.2',
   fallbackModels: WORKBUDDY_FALLBACK_MODELS,
 }
 
-/** 全部产品配置，供按 id 查询与遍历注册使用。 */
-export const WORKBUDDY_INTL = WORKBUDDY
-
-/** 全部产品配置，供按 id 查询与遍历注册使用。 */
-export const ALL_PRODUCTS: readonly BuddyProduct[] = [
-  CODEBUDDY,
-  CODEBUDDY_INTL,
-  WORKBUDDY_CN,
-  WORKBUDDY,
-]
+/**
+ * 全部产品配置，供按 id 查询与遍历注册使用。
+ *
+ * ⚠️ 只有两个产品：`buddy`（CodeBuddy）与 `workbuddy`（WorkBuddy 国际版）。
+ * 早期的 `buddy-intl` / `workbuddy-cn` 两个变体已**移除** —— 它们是同一后端
+ * 协议下的区域副本，差异全部收敛进本文件的 endpoint / UA 分档配置，
+ * 不再需要独立的产品条目。客户端 PROVIDERS 列表中的 `buddy-intl` /
+ * `workbuddy-cn` 仅作历史 provider id 的展示兼容，注册表不为其建实例。
+ */
+export const ALL_PRODUCTS: readonly BuddyProduct[] = [CODEBUDDY, WORKBUDDY]
 
 /** 按 provider id 取产品配置；未知 id 返回 undefined。 */
 export function productById(id: string): BuddyProduct | undefined {
   return ALL_PRODUCTS.find((product) => product.id === id)
+}
+
+/**
+ * 按模型 id 解析该产品应使用的 User-Agent（按模型族分档）。
+ *
+ * 命中规则：`userAgentByModelFamily` 中**先命中先返回**（`match` 为前缀）。
+ * 未命中任何规则时回退到 `product.userAgent`。这条回退链保证新模型上线时
+ * 仍有一个确定的、含产品品牌字样的 UA，不会退化成框架默认的 harness UA。
+ *
+ * @param product - 产品配置
+ * @param model - 模型 id（如 `gpt-5.6-sol` / `glm-5.2`）
+ */
+export function resolveUserAgent(product: BuddyProduct, model: string): string {
+  for (const rule of product.userAgentByModelFamily ?? []) {
+    if (model.startsWith(rule.match)) return rule.ua
+  }
+  return product.userAgent
 }
