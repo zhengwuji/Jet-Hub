@@ -201,7 +201,54 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 `refreshAll`（`buddy-auth.ts` / `service.ts` / `lobsterai-auth.ts` / `qoder-auth.ts` / `trae-auth.ts`）与调度器
 **都必须保持只看 `refreshable`**。
 
-服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，`QoderAuth` 注册为 `qoderAuth`，`TraeAuth` 注册为 `traeAuth`，互不覆盖。
+### ⚠️ 客户端列出的 provider 必须与服务端注册**一一对应**（面板不得成空壳）
+
+**铁律**：`plugin-src/client/jet-hub.js` 的 `PROVIDERS` 列表里**每一个** id，
+都必须在服务端有对应的 **provider 路由 + 适配器 + settings namespace**。
+两侧集合必须相等 —— 客户端列了而服务端没注册，就是**空壳面板**。
+
+**真实缺陷**（2026-09-22 修复）：合并 Gitee 时把 `ALL_PRODUCTS` 从 4 个产品
+收敛成 2 个（只留 `buddy` + `workbuddy`），**但客户端 `PROVIDERS` 列表没同步收敛**。
+于是 `buddy-intl` 与 `workbuddy-cn` 成了空壳，三处后果：
+
+| 后果 | 表现 |
+|---|---|
+| 账号成**孤儿** | 本机账号池里的 `workbuddy-cn` 账号能看见，但**无法续期、无法删除** |
+| 设置页**崩溃** | `llm-buddy-intl` / `llm-workbuddy-cn` 未注册，模型设置页在 `refFor → deriveKeyRef(provider)` 处抛 `provider.toUpperCase is not a function` |
+| 「刷新」按钮**报错** | `account.refresh` 的 switch 缺这两条 → 落到 `default` 抛 `Unknown provider` |
+
+**新增/删除 provider 时的完整清单**（漏一处就出上面三类问题）：
+
+1. `src/<product>.ts` — 产品配置常量 + 加进该族的 `ALL_*_PRODUCTS`
+2. `src/index.ts` — `new XxxAuth(ctx, { product })`、`registerXxxLlm(...)`
+3. `src/index.ts` — `registerProviderSettings(...)` 里加 **`llm-${product.id}`**
+4. `src/index.ts` — `refreshAllCredentials()` 与**两个** `ctx.effect` 清理块
+5. `src/index.ts` — `modelAdapters` 映射（「显示列表」要用 `listAllModels()`）
+6. `src/index.ts` — `registerJetHubRpc(...)` 实参
+7. `src/jet-hub-rpc.ts` — 区域族分派 Map（`buddyServices` / `qoderServices` / `traeServices`）
+8. `src/jet-hub-rpc.ts` — `account.refresh` 的 switch 分支（**最容易漏**）
+9. `plugin-src/client/jet-hub.js` — `PROVIDERS` 面板项
+10. `plugin-src/client/credits-capabilities.js` — 能力表（**必须与 PROVIDERS 等集**）
+
+**该铁律由测试锁死**（`tests/unit/plugin.spec.ts`）：
+- 「客户端列出的每个 provider 都有服务端实例（防面板空壳）」
+  —— 直接比对「客户端面板列表」与「服务端已注册 provider/适配器集合」两个集合，
+  任一侧新增而另一侧漏加都会立刻失败；
+- 「能力矩阵覆盖 PROVIDERS 中的每一个 provider」
+  —— 断言 `Object.keys(CREDITS_CAPABILITIES)` 与面板列表**排序后相等**。
+  ⚠️ 该断言的正则必须写成 `([a-z][a-z0-9-]*)` 才能匹配带连字符的区域 id
+  （`qoder-cn` / `trae-intl`）；早期写成 `([a-z]+)` 时这些 provider
+  **完全搜不到**，漏登记也照样通过，断言形同虚设。
+
+**为什么不能「悄悄收敛」**：收敛产品配置是纯服务端行为，但面板是**用户可见入口**。
+面板存在而服务端无实例时，用户看到的是一个点进去什么都不工作的页面，
+且已有账号**静默变砖**（数据还在、功能全无）。要收敛就必须两侧同时收敛，
+并给出账号迁移方案。
+
+服务名由产品 id 派生（`${product.id}Auth`）：`BuddyAuth` 实例分别注册为
+`buddyAuth` / `buddyIntlAuth` / `workbuddyCnAuth` / `workbuddyAuth`，
+`LobsteraiAuth` → `lobsteraiAuth`，`QoderAuth` → `qoderAuth` / `qoder-cnAuth`，
+`TraeAuth` → `traeAuth` / `trae-intlAuth`，互不覆盖。
 
 各 provider 的登录/续期机制不同（详见 README.md），但均通过 `ctx.credentials` 统一管理凭据生命周期。
 
@@ -597,7 +644,14 @@ ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs
 
 ## LLM Provider 约定
 
-- provider 名称：`codearts` / `buddy` / `buddy-intl` / `workbuddy-cn` / `workbuddy` / `antigravity` / `lobsterai` / `qoder` / `trae`
+- provider 名称（**11 个**）：`codearts` / `buddy` / `buddy-intl` / `workbuddy-cn` /
+  `workbuddy` / `lobsterai` / `qoder` / `qoder-cn` / `trae` / `trae-intl` / `antigravity`
+  - **分区域的产品各占一个 provider**：CodeBuddy 系 `buddy`(国内) / `buddy-intl`(国际)，
+    WorkBuddy 系 `workbuddy-cn`(国内) / `workbuddy`(国际)，
+    Qoder `qoder`(国际) / `qoder-cn`(国内)，TRAE `trae`(国内) / `trae-intl`(国际)。
+    两侧端点与登录态**互不相通**，故凭据 ref 也各自独立，绝不串用。
+  - ⚠️ 这个列表必须与 `plugin-src/client/jet-hub.js` 的 `PROVIDERS` **完全一致**
+    —— 见上文「客户端列出的 provider 必须与服务端注册一一对应」。
 - 端点格式为 OpenAI 兼容
 - 请求签名/鉴权方式因 provider 而异：
   - `codearts`：华为云 `SDK-HMAC-SHA256` 签名方案
