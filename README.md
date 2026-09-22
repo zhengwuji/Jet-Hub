@@ -10,18 +10,25 @@
 
 此外插件内置以下 provider 路由：
 
-- **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
-  另支持「一键领取积分」（每日签到）。
-- **workbuddy（腾讯 WorkBuddy 国际版）** — 见 [WorkBuddy provider](#workbuddy-provider)。
+- **buddy（腾讯 CodeBuddy 国内版）** / **buddy-intl（国际版）** — 见
+  [buddy provider](#buddy-provider)；国内版支持「一键领取积分」（每日签到）。
+- **workbuddy-cn（腾讯 WorkBuddy 国内版）** / **workbuddy（国际版）** — 见
+  [WorkBuddy provider](#workbuddy-provider)。国内版后端同样没有签到接口。
 - **lobsterai（有道 LobsterAI / 龙虾）** — 见 [LobsterAI provider](#lobsterai-provider)；
   另支持「一键领取积分」（每日签到）。
-- **qoder（阿里系 Qoder）** — 见 [Qoder provider](#qoder-provider)；
+- **qoder（阿里系 Qoder 国际版）** / **qoder-cn（国内版）** — 见
+  [Qoder provider](#qoder-provider)；
   **支持积分余额与每日领取**（每日 100 Credits，10:00（UTC+8）刷新）；
   走**加密推理端点**，模型池与客户端一致（含 Qwen3.8 系列）。
-- **trae（字节跳动 TRAE）** — 见 [TRAE provider](#trae-provider字节跳动-trae)。
+- **trae（字节跳动 TRAE 国内版）** / **trae-intl（国际版）** — 见
+  [TRAE provider](#trae-provider字节跳动-trae)。
 - **antigravity（Google Antigravity IDE）** — 见
   [Antigravity 渠道](#antigravity-渠道google-antigravity-ide)；
   走**本机凭据复用 / 本地私有通道**，不独立登录、不进账号池。
+
+> **国内版与国际版各占一个 provider**（共 11 个）。两侧端点与登录态
+> **互不相通**，因此凭据也各自独立保存，绝不串用 —— 在对应面板登录哪一侧的账号，
+> 就只走那一侧的端点。
 
 `codearts` 面板同样支持**积分账户检测、积分余额与「一键领取积分」**
 （华为云「每日签到得积分」活动，走 `SDK-HMAC-SHA256` 签名）——
@@ -50,7 +57,63 @@
 
 ## ✨ 更新日志
 
-### v0.2.1 (最新发布)
+### v0.3.0 (最新发布)
+
+本次为大版本合并：接入 Gitee 侧 43 个提交（三个新服务商 + 一批真实缺陷修复），
+并新增国内外区域支持。
+
+- 🌐 **新增国内外双版本支持（按官方是否分区域决定，不臆造）**：
+  - **Qoder 国内版 `qoder-cn`**：与已有的 `qoder`（国际版）并列。
+    官方是**同一代码库的两个构建**（客户端 `runtime-info.json` 里 version 与
+    git commit 相同，仅 `build.site` 分 `global` / `cn`），差异全在域名：
+    `qoder.cn` / `openapi.qoder.com.cn` / `gateway.qoder.com.cn`。
+    ⚠️ 国内版的**公开推理与加密推理是同一个 host**（国际版才是两个不同 host）。
+  - **TRAE 国际版 `trae-intl`**：与已有的 `trae`（国内版）并列。
+    `www.trae.ai` / `api.trae.ai` / `api5-normal-alisg.mchost.guru`。
+  - **LobsterAI 只有国内版**（有道单一端点），**按需不新增国际版**。
+  - 两侧登录态互不相通，故凭据 ref 各自独立（`QODER_CN_ACCESS_TOKEN` /
+    `TRAE_INTL_ACCESS_TOKEN`），不会串用。
+- 🆕 **接入三个全新服务商（来自 Gitee 合并）**：
+  - **`lobsterai`（有道 LobsterAI / 龙虾）**：本地回调 + authCode 换 token，
+    `client-activities` 三步签到；四个 provider 中最独立的一套协议。
+  - **`qoder`（阿里系 Qoder）**：PKCE 设备码轮询登录、**加密推理端点**
+    （请求体与签名头由客户端内嵌 WASM 生成，本插件直接调用其导出函数）、
+    静态模型表（含 Qwen3.8 系列）、积分余额与每日领取。
+  - **`trae`（字节跳动 TRAE）**：ExchangeToken 轮换续期、`Cloud-IDE-JWT` 鉴权、
+    请求体需从 OpenAI 转 SOLO 格式、响应是 SOLO 自定义 SSE（需反向转换）。
+- 🐛 **修复两个 provider 面板成「空壳」导致账号变砖（真实缺陷）**：
+  合并时把服务端产品配置从 4 个收敛成 2 个，但客户端面板列表没同步收敛，
+  于是 `buddy-intl` 与 `workbuddy-cn` 出现「面板在、后端无实例」：
+  - 账号池里对应 provider 的账号成**孤儿**（能看见但无法续期、无法删除）；
+  - 两者的 settings namespace 未注册 → 模型设置页在
+    `refFor → deriveKeyRef(provider)` 处抛 `provider.toUpperCase is not a function`；
+  - 账号卡片「刷新」按钮落到 `default` 分支抛 `Unknown provider`。
+  现已补齐产品配置、Auth 实例、适配器、namespace 与刷新分派，
+  并新增**不变量测试**锁死「客户端列出的每个 provider 都必须有服务端实例」。
+- 🐛 **补回 SSE 内联错误的上下文超限识别**：CodeBuddy 有时把 400 错误塞进
+  **HTTP 200 的正常 SSE 帧**，该路径走不到 HTTP 状态码映射，导致溢出信号丢失、
+  压缩子系统不触发、**长会话越过窗口后卡死**。现按源码风格识别并归为
+  `CONTEXT_WINDOW_EXCEEDED`。
+- 🐛 **修复后的其他缺陷（来自 Gitee 合并）**：
+  - 停用账号不续期导致凭据失效（`refreshAll` 误按 `enabled` 过滤）；
+  - 换号在 server/client 类错误下实际从未发生（账号池未排除已试账号）；
+  - `tool-result` / 用户图片被静默丢弃，模型看不到 `read_image` 的图；
+  - 国际版 WorkBuddy 英文 6004 限流无法触发账号切换；
+  - LobsterAI 模型列表恒为空导致静默回退兜底表、远端新模型不可见。
+- ✨ **新增功能（来自 Gitee 合并）**：
+  - **账号池支持拖拽排序**，顺序即选号优先级（`account.reorder`）；
+  - 模型选择列表**显示计费倍率**并区分同名模型（`x0.79→x0.50` 形态）；
+  - 设置页「**显示列表**」开关，被关闭的模型仍显示正确展示名（含倍率）；
+  - 没有已登录账号的 provider **不显示其模型**（减少模型选择列表臃肿）；
+  - CodeArts 支持**积分账户检测与每日签到领取**；
+  - TRAE 支持**图片输入**（逐模型判定，见 Issue #IKHDKC）。
+- 🎨 **免费模型实时标注**：三个 provider 统一展示形态 ——
+  `buddy` 为 `x0.00→免费`（含时段窗口推算）、`qoder` / `trae` 为 `· 免费`。
+  倍率与免费标记均**实时按当前时刻推算**，不照搬采集快照。
+- 🧪 **测试体系**：1561 / 1563 通过。余 2 项为 oauth 用例的本地端口竞态
+  （隔离运行全部通过，且在合并前的基线上同样偶发，与本次改动无关）。
+
+### v0.2.1
 
 - 🐛 **修复 CodeBuddy (国际版) 无账号时在 DSH 模型列表中残留泄露的缺陷**：
   - **前置凭据鉴权防护**：在 `BuddyAdapter.listModels` 与 `resolveModel` 前置增加 `resolveCredential` 校验，未配置或未启用账号时直接返回空模型列表，彻底杜绝无账号状态下静态兜底模型（如 deepseek-v4.1-flash 等）错误暴露给前端的问题。
