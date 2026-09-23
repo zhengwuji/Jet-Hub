@@ -9,7 +9,8 @@
  * TIMEOUT，harness 才能重试该步骤，把控制权交还给用户。
  */
 
-import { LlmError } from '@deepseek-ai/dsh-llm'
+import { EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-llm'
+import type { FinishReason } from '@deepseek-ai/dsh-llm'
 
 /** SSE 读取阶段：等待首 token 与已收到数据后的 chunk 间等待。 */
 export type SsePhase = 'first-token' | 'chunk'
@@ -78,6 +79,121 @@ export async function readWithIdleTimeout(
  */
 export function hasUsableToolName(name: unknown): boolean {
   return typeof name === 'string' && name.trim().length > 0
+}
+
+/**
+ * 判断一次响应是否为「零内容块」的退化补全，并给出 DSH 约定的 finish reason。
+ *
+ * ## 为什么必须有这条判据
+ *
+ * DSH 的 `EMPTY_RESPONSE` 契约（`dsh-llm/lib/index.js`）：
+ *
+ * > Providers occasionally emit a degenerate completion (a terminal stop with zero
+ * > output); adapters classify it as this failure instead of yielding an empty
+ * > assistant message, because **an empty message silently ends the turn with
+ * > nothing for the user or the loop to act on**. The attempt produced nothing
+ * > durable, so retry policy treats it as safe to repeat.
+ *
+ * 官方适配器 `dsh-llm-deepseek` 的写法（权威范本）：
+ *
+ * ```js
+ * reason.kind === 'stop' && order.length === 0
+ *   ? { kind: 'error', failure: { message: '…no content', code: EMPTY_RESPONSE_CODE } }
+ *   : reason
+ * ```
+ *
+ * ⚠️ **本判据是「压制纯空白思考」的必要配套**（Task 2 审查发现、控制方实测证实）：
+ * 压制空块后，若该响应本来**只有**那个空白 reasoning 块（无 text、无 tool-call），
+ * 就会产出「零块 + `finish: stop`」—— 正是上面契约要防的**静默结束**，
+ * 与本项目已两次踩过的同族坑（空名 `tool_call`、死循环）完全同型。
+ * 实测真实频率：**1 / 30404**（`scripts/quantify-empty-response-risk.ts`）。
+ *
+ * ## 只覆盖「否则会落到 stop」的情形
+ *
+ * 传入的 `reason` 若不是 `{kind:'stop'}`（例如已是 `max-tokens` / `tool-calls`），
+ * **原样返回** —— 那些 reason 本身就表示「有不完整/有产出」，语义更具体，
+ * 不应被泛化的零块判据覆盖（与官方范本一致：只在 `kind === 'stop'` 时才改写）。
+ *
+ * ## ⚠️ `code` 必须用 `EMPTY_RESPONSE_CODE` 常量，不得写字面量
+ *
+ * 重试资格由**字符串匹配**决定（`dsh-llm` 的 `resolveRetryPolicy` →
+ * `policy.retryableCodes.includes(failure.code)`，默认集合含 `EMPTY_RESPONSE`）。
+ * 硬编码 `'EMPTY_RESPONSE'` 一旦与上游常量漂移（改名、改前缀、加命名空间），
+ * 匹配**静默失败** —— 于是本修复要消灭的「静默结束」会以「静默不退避重试」
+ * 的形式原样回来，且编译期与测试都不会报错。
+ * 根导出可用性已确认（`@deepseek-ai/dsh-llm` 的 `lib/index.js` 第 217 行
+ * 即把 `EMPTY_RESPONSE_CODE` 放进 `DEFAULT_RETRYABLE_CODES`）。
+ *
+ * @param reason - 各适配器已算出的 finish reason。
+ * @param blockCount - 本次响应**实际产出**的块数量（不含被压制的空块）。
+ * @returns 零块且原为 `stop` 时返回 `error`/`EMPTY_RESPONSE`，否则原样返回。
+ */
+export function resolveEmptyResponseReason(reason: FinishReason, blockCount: number): FinishReason {
+  if (blockCount > 0 || reason.kind !== 'stop') return reason
+  return {
+    kind: 'error',
+    failure: {
+      message: 'model returned a completed response with no content',
+      code: EMPTY_RESPONSE_CODE,
+    },
+  }
+}
+
+/**
+ * 行首空白思考（`trim()` 为空）的累积器。
+ *
+ * 为什么需要它：模型偶发只输出一个空格当思考（实测 2232 次，
+ * `reasoningTokens=1`），会落成空 Think 块污染 UI 与提示词。
+ * 而 `BlockAssembler` 在没有 `block-end` 时会用 `partial.text` 组装出块，
+ * 故**不能**只在出口过滤 —— 必须从一开始就不发 chunk。
+ *
+ * ⚠️ 本 helper **不产出 chunk 对象**（它不该知道 `index`），只告诉调用方
+ * 「该不该发、发什么文本」。调用方负责组装 `block-start` / `reasoning-delta`
+ * 并写入 `block.text`。这样 `index` 的分配仍完全由调用方的 `nextIndex++` 掌控。
+ *
+ * 判据落在**整块**而非单片上：只有迄今累积文本 `trim()` 为空才压制；
+ * 一旦整块出现过非空白字符，后续空白片就是**普通增量**，照常发出
+ * （故 `["a", " "]` 的整块 `'a '` 被完整保留）。
+ */
+export function createBlankReasoningSuppressor(): {
+  /**
+   * 喂入一个 reasoning 增量，返回**该发出的 delta 文本**：
+   * - `undefined`：本片不产出任何 chunk（整块迄今仍是空白）；
+   * - `string`：应发一个 `reasoning-delta`，文本为返回值。
+   *   其中「从空白转为非空白」的那一次，返回值是**已累积的全部文本**
+   *   （因为此前一片都没发过，必须补发），且调用方须**先发 `block-start`**。
+   *
+   * ⚠️ 参数名 `text` 与下方同名方法 `text()` **不是一回事**：函数体内 `text`
+   * 指本参数（增量），要取整块累积请调 `this`/闭包外的 `text()`。接线时别混。
+   */
+  feed(text: string): string | undefined
+  /** 整块迄今的完整文本；`''` 或 `trim()` 为空 ⇒ 整块应丢弃（不得发 `block-end`）。 */
+  text(): string
+} {
+  let accumulated = ''
+  // 是否已经「转正」（整块出现过非空白字符）。用布尔量而非每次重算 `trim()`：
+  // 一旦转正就永不复位，故后续空白片不可能把块判回空白。
+  let emitting = false
+  return {
+    feed(text: string): string | undefined {
+      accumulated += text
+      if (emitting) return text
+      // 整块迄今仍是空白 ⇒ 一片都不发。调用方因此不会建块、不会消耗 nextIndex，
+      // 纯空白思考便无从落成 `partial.text` 组装出的块。
+      //
+      // ⚠️ 判据用 `text.trim()`（**本片**）而非 `accumulated.trim()`（整段）：
+      // 未转正期间此前所有片 `trim()` 皆为空，而全空白串拼接后仍全空白，
+      // 故二者**语义等价**（已用变异测试证实）。但用整段会让「全空白流」退化成
+      // O(n²)（每片重扫全部累积；128000 token 的病态流下约 1e9 次比较），
+      // 而只看本片是 O(1)。
+      if (text.trim() === '') return undefined
+      emitting = true
+      // 从空白转为非空白：补发**已累积的全部文本**（不是仅本片）——
+      // 此前一片都没发过，只发增量会丢掉前导空白、与 wire 不符。
+      return accumulated
+    },
+    text(): string { return accumulated },
+  }
 }
 
 /**

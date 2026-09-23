@@ -32,12 +32,14 @@
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
+  createBlankReasoningSuppressor,
   createReasoningLoopDetector,
   hasUsableToolName,
   isReasoningLoopGuardEnabled,
   isTruncatedArguments,
   normalizeToolArguments,
   readWithIdleTimeout,
+  resolveEmptyResponseReason,
   resolveToolPairing,
   stripCourseLeakFromHistoryContent,
   stripCourseLeakIfEnabled,
@@ -339,6 +341,15 @@ export async function* consumeOpenAiSse(
    */
   const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
   let loopDetected = false
+  /**
+   * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
+   * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
+   *
+   * 为什么必须延后建块：`BlockAssembler` 在**没有 `block-end`** 时同样会用
+   * `partial.text` 组装出块，故只在出口过滤挡不住空 Think 块 —— 必须从一开始
+   * 就不发任何 chunk（与「空名字 tool_call」同型修法）。
+   */
+  const suppressor = createBlankReasoningSuppressor()
   const toolCalls = new Map<number, {
     index: number
     text: string
@@ -547,14 +558,21 @@ export async function* consumeOpenAiSse(
             if (loopGuard.observe(reasoningDelta)) loopDetected = true
           }
           if (!loopDetected) {
-            let block = blocks.find(candidate => candidate.kind === 'reasoning')
-            if (block === undefined) {
-              block = { index: nextIndex++, kind: 'reasoning', text: '' }
-              blocks.push(block)
-              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            // 纯空白思考：`emit === undefined` ⇒ 本片一个 chunk 都不发，
+            // 于是既不建块、也不消耗 `nextIndex`（见 helper 注释与 `blank-reasoning.spec.ts`）。
+            const emit = suppressor.feed(reasoningDelta)
+            if (emit !== undefined) {
+              let block = blocks.find(candidate => candidate.kind === 'reasoning')
+              if (block === undefined) {
+                block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                blocks.push(block)
+                yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+              }
+              // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本，
+              // 用 `+=` 会把已发过的部分再写一遍（双写）。
+              block.text = suppressor.text()
+              yield { type: 'reasoning-delta', index: block.index, text: emit }
             }
-            block.text += reasoningDelta
-            yield { type: 'reasoning-delta', index: block.index, text: reasoningDelta }
           }
         }
         for (const call of delta?.tool_calls ?? []) {
@@ -654,6 +672,17 @@ export async function* consumeOpenAiSse(
     reader.releaseLock()
   }
 
+  /**
+   * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
+   *
+   * ⚠️ **不能写成 `blocks.length`**：`blocks` 里可能留着**不会发出**的条目 ——
+   * 纯空白思考块（已被 `suppressor` 压制，连 `block-start` 都没发）、
+   * 或被清洗成空串的块。用 `blocks.length` 会让「零块响应」被误判成「有块」，
+   * 于是静默结束的缺陷原样保留。
+   *
+   * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
+   */
+  let blockCount = 0
   // 按创建顺序关闭每个块
   const textBlock = blocks.find(block => block.kind === 'text')
   for (const index of toolOrder) {
@@ -661,7 +690,14 @@ export async function* consumeOpenAiSse(
     // `toolOrder` 只收「名字已可用」的块（见 tool_calls 分支），故此处名字必然
     // 可用；断言而非回退成 `?? ''` —— 回退会把空名字块写进会话，正是本次
     // 修复要根除的那条污染路径。
+    //
+    // ⚠️ 就当前实现而言本行是**不可达的防御**（`toolOrder` 的 push 已在
+    // `hasUsableToolName` 守卫内，且 `block.name` 之后只被非空值覆盖）——
+    // 已用变异测试证实把 `blockCount += 1` 移到本行**之前**结果不变。
+    // 保留它是为「将来有人放宽 `toolOrder` 的入口条件」兜底；**不要**以为
+    // 它此刻在承担判定职责。
     if (!hasUsableToolName(block.name)) continue
+    blockCount += 1
     yield {
       type: 'block-end',
       index,
@@ -680,6 +716,7 @@ export async function* consumeOpenAiSse(
   }
   if (textBlock !== undefined) {
     // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+    blockCount += 1
     yield {
       type: 'block-end',
       index: textBlock.index,
@@ -687,15 +724,23 @@ export async function* consumeOpenAiSse(
     }
   }
   const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
-  if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
+  // ⚠️ 判据收紧为 `trim() !== ''`：纯空白思考块（helper 未转正时不会建块，
+  // 但兜底仍按整块 trim 判定）不得被当成「有 reasoning 产出」。
+  if (reasoningBlock !== undefined && reasoningBlock.text.trim() !== '') {
     // 命中死循环时只保留循环前的干净前缀（`cutAt`）。
     // 实测 `BlockAssembler` 的 `block-end` 是**权威覆盖**：即便前面已 yield
     // 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+    //
+    // ⚠️ 文本以 helper 为权威（`suppressor.text()`），**不用**
+    // `reasoningBlock.text` —— 两处累积口径若不一致（例如 `+=` 双写），
+    // 以 helper 为准才能保证落块内容与 wire 一致。
+    const suppressedReasoning = suppressor.text()
     const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
-      ? reasoningBlock.text.slice(0, loopGuard.cutAt)
-      : reasoningBlock.text
+      ? suppressedReasoning.slice(0, loopGuard.cutAt)
+      : suppressedReasoning
     const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
     if (cleanedReasoning !== '') {
+      blockCount += 1
       yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
     }
   }
@@ -776,5 +821,10 @@ export async function* consumeOpenAiSse(
     : finishReason === 'tool_calls' || toolOrder.length > 0
       ? { kind: 'tool-calls' as const }
       : { kind: 'stop' as const }
-  yield { type: 'finish', reason }
+  // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
+  // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
+  // ⚠️ 传入的是**上面已算好的** `reason`：`loopDetected` / `length` /
+  // 无名 tool-call 等既存判据全在里面，helper 只在 `kind === 'stop'` 时才改写，
+  // 故天然不冲突。
+  yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) }
 }

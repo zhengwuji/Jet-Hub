@@ -919,6 +919,131 @@ fixture 为**真实会话文本**（`tests/fixtures/reasoning-*.txt`）。
 回归用例 `tests/unit/course-leak-strip.spec.ts`（33 条）；
 端到端脚本 `scripts/verify-course-leak-e2e.ts`。
 
+#### ⚠️ 纯空白思考会画出「空 Think 块」；零内容块响应必须报 `EMPTY_RESPONSE`
+
+**真实缺陷**（用户报障，2026-09-23）：UI 上出现**空的思考（Think）块**。
+
+实测：`deepseek-v4.1-flash` 偶发只输出**一个空格**当思考 —— 全库 **2233 个**
+`trim()` 为空的 reasoning 块，`block.text` **全部是 `" "`**，且 wire 上
+`reasoning-chunks.texts` 就是 `[" "]`；**上游为它计了 1 个 token**
+（`usage.reasoningTokens=1`，2232/2232）⇒ **空格是模型真实生成的**，非适配器伪造。
+分布：`buddy/deepseek-v4.1-flash` 1398 + `workbuddy/deepseek-v4.1-flash` 835。
+（脚本 `scripts/trace-empty-reasoning.ts`、`scripts/analyze-reasoning-tokens.ts`。）
+
+⚠️ **两个必须记住的机理**：
+
+**① 「只改出口判据」不够 —— `BlockAssembler` 会用 `partial.text` 组装出残缺块。**
+```js
+assemble(partial, index) {
+  if (partial.block) return partial.block                              // 有 block-end → 用它
+  case "reasoning": return { type: "reasoning", text: partial.text }   // 无 → 用累积文本
+```
+⇒ 只要发过 `block-start`，即便**一个 `block-end` 都不发**，收尾仍会组装出块
+（这正是「空 Think 块」的成因）。故必须**从一开始就不发任何 chunk**
+（连 `block-start` 都不发）—— 与「空名字 `tool_call`」的修法**完全同型**。
+实测脚本 `scripts/verify-empty-reasoning-fix.ts`。
+
+**② 零内容块响应必须报 `EMPTY_RESPONSE`，不能报 `stop`。**
+压制空块会引出**新退化形态**：若某响应本来只有那个空白 reasoning 块
+（无 text、无 tool-call），就会产出「零块 + `finish: stop`」—— DSH 契约明令禁止：
+> Providers occasionally emit a degenerate completion (a terminal stop with zero
+> output); adapters classify it as this failure instead of yielding an empty
+> assistant message, because **an empty message silently ends the turn with
+> nothing for the user or the loop to act on**.
+
+官方范本 `dsh-llm-deepseek`（`lib/index.js` 的 `translate()`）：
+```js
+reason.kind === "stop" && order.length === 0
+  ? { kind: "error", failure: { message: "…no content", code: EMPTY_RESPONSE_CODE } }
+  : reason
+```
+实测频率 **1/30404**（`scripts/quantify-empty-response-risk.ts`）。
+这与本项目已两次踩过的同族坑（空名 `tool_call`、死循环）完全同型。
+
+**判据与落点**：
+
+| 位置 | 作用 |
+|---|---|
+| `src/sse.ts` 的 `createBlankReasoningSuppressor()` | 纯空白思考**一个 chunk 都不发**；转正那次**补发已累积全部文本**（含前导空格）。判据在**整块**（`["a"," "]` → `'a '` 保留），非单片 |
+| `src/sse.ts` 的 `resolveEmptyResponseReason(reason, blockCount)` | 零块且原为 `stop` ⇒ `error`/`EMPTY_RESPONSE`；**只在 `kind === 'stop'` 时改写**（故 `loopDetected`/`length`/无名 tool_call/`tool-calls` 优先级全保留） |
+| 5 个适配器的 reasoning 发射点（**6 处**，codearts 有两条出口） | 用 helper 的产出替代「无条件建块 + 发 chunk」 |
+| 5 个适配器的 `finish` 出口 | `blockCount` = **实际发出的 `block-end` 数**，**不是 `blocks.length`** |
+
+⚠️ **`blockCount` 必须数「实发块」。** 反例：`reasoning_content: '课'`
+（本项目已知的真实泄漏 token）会让 helper **建块**，但收尾被
+`stripCourseLeakIfEnabled` 洗成空串 ⇒ **实发 0 块而 `blocks.length === 1`**。
+用 `blocks.length` 会把这种响应误判成「有 1 块」而报 `stop`（静默结束）。
+审查据此实测：把 5 处换成 `blocks.length` 后 34/34 仍通过 —— **曾是测试盲区**，
+`tests/unit/empty-response.spec.ts` 已补用例钉住它。
+
+⚠️ **codearts 有两条 reasoning 出口**（`src/llm-adapter.ts:1113-1123` 自称
+「漏一条就等于漏一条路径」）：① `delta.content` → `DsmlContentExtractor` 解析
+`<thought>` → `emitDsmlFeed`；② `delta.reasoning_content` → `thinking`。
+**两条共用同一个 helper 实例**（否则各自累积会错乱）。
+回归测试必须**两条都覆盖** —— 审查发现只覆盖出口② 时，出口① 若回归
+会**静默**放回空 Think 块（`tests/unit/blank-reasoning-adapter.spec.ts` 的
+`A'/B'/C'/D'` 专组负责出口①）。
+
+⚠️ **不得改动发送侧**：`buddy-adapter.ts` 的 `reasoning_content: reasoning` 是
+**无条件写入**的（注释：推理模型缺失该字段会 400）。删掉存储侧空块后
+`reasoning === ''` 但**字段依然存在** ⇒ 不会 400。**绝不可**改成条件写入。
+
+**开关**：无独立开关（正确性修复，非可选项）。
+
+回归用例：`tests/unit/blank-reasoning.spec.ts`（helper 语义）、
+`tests/unit/blank-reasoning-adapter.spec.ts`（块层面「零 chunk」+ 出口①）、
+`tests/unit/empty-response.spec.ts`（`finish` 归类 + `blockCount` 判据）。
+
+★ **测试写法教训**（本任务反复踩到，值得单列）：
+
+- **只断言 `finish` 不够**：空块回归时 `finish` 可能仍是 `EMPTY_RESPONSE`
+  （因为 `blockCount` 仍为 0），必须**同时断言「没发任何 chunk」**。
+- **测试注释里的论证必须有实测支撑**。本项目连续三次凭推理写下断言
+  （「没有 D 则 A/B/C 全绿」等），**全部被自己的变异实验证伪**：
+  C 与 D 都经过 `feed` 的「转正」分支，故**无法构造只打 D 的变异**。
+  注释应**只写实测事实**（附「曾写进注释 / 变异 / 实测 / 结论」表格）。
+- **变异测试是唯一能证明断言有判别力的手段**。用「恒真断言」或「只看测试通过」
+  都会漏掉盲区 —— 本项目两次靠变异测试发现缺口（`blockCount` 盲区、
+  出口① 无覆盖）。
+- ⚠️ 变异实验脚本必须 `try/finally` 恢复，并在结束时用
+  `git diff --quiet -- <file>` **确认无残留**（否则污染后续提交）。
+
+### ⚠️ `tests/` 不在 `pnpm typecheck` 覆盖内
+
+`tsconfig.json` 的 `include` **只有 `["src"]`** ⇒ `tests/` 的类型错误**不会**被
+`pnpm typecheck` 发现。实测把 `tests/` 一并纳入后有 **108 个既有类型错误**
+（`HeadersInit` 未定义、`ContentBlock[]` 赋值不兼容、`plugin-src/*.js` 缺声明等），
+属独立工程。
+
+⚠️ **新增/修改测试文件后，务必单独跑一次类型检查**（否则 `tests/` 里的类型错误
+会被静默放过 —— 本任务已发生过一次：收紧 `src/` 的类型签名后 `pnpm typecheck`
+仍 exit 0，但测试文件里有一处 TS2345）：
+
+```
+npx tsc --noEmit --strict --target ES2023 --module NodeNext --moduleResolution NodeNext \
+  --skipLibCheck --esModuleInterop --types node --lib ES2023 --rootDir . <你的测试文件>
+```
+
+#### ⚠️ 测试 fixture 必须保持 LF（`core.autocrlf` 会造成假失败）
+
+本机 `git config core.autocrlf=true`，checkout 时会把仓库里的 LF 转成 CRLF。
+而 `tests/fixtures/reasoning-*.txt` 是**真实会话文本提取**，其**字符偏移被测试精确断言**
+（`reasoning-loop.spec.ts` 的 `cutAt === 1536/1600`）—— 凭空多出的 3082 个 `\r`
+会把偏移推到 **1792** ⇒ **两个断言失败**，且**在纯基线上同样失败**，
+极易误判成「刚改的代码坏了」。
+
+根治：`.gitattributes` 的 **`tests/fixtures/** text eol=lf`**。
+
+⚠️ **必须是 `text eol=lf`，不能写成 `-text`**（初版写错，经审查实测纠正）：
+- `-text`（不规范化）只挡**检出**期转换，**挡不住入库污染** —— 实测工作区是 CRLF 时
+  `git add` 会把 48338 字节（含 617 个 `\r`）写进索引（HEAD 本为 47721），
+  此后 `checkout` 把这些 `\r` 发给所有人，**偏移断言对全仓库永久失败**；
+- `text eol=lf` 同时具备两项能力：检出写 LF，**入库时把 CRLF 规范化回 LF**。
+
+用 `**` 而非 `*`：gitattributes 的单星**不跨目录**（实测子目录为 `unspecified`）。
+
+**自查**：`git ls-files --eol -- tests/fixtures/` 应全是 `i/lf w/lf`。
+
 ### 测试
 
 - 单元测试覆盖核心逻辑（签名、续期、参数构造、账号池），不依赖网络

@@ -836,8 +836,15 @@ describe('TRAE 适配器 · SOLO SSE 到 OpenAI chunk 转换', () => {
   })
 
   it('finish_reason=stop 产出 finish(stop)', async () => {
+    // ⚠️ 必须带**内容**：本用例验的是 `done` 事件的 `finish_reason` 映射，
+    // 而零内容块的 `stop` 已按 DSH `EMPTY_RESPONSE` 契约改写为 error
+    // （见 `resolveEmptyResponseReason` / `empty-response.spec.ts`）。
+    // 带一个 output 事件后，块数 > 0，本用例才锁定的是**映射**而非退化形态。
     const { adapter } = makeAdapter({
-      responses: [sseResponse(soloSse(['done', { finish_reason: 'stop' }]))],
+      responses: [sseResponse(soloSse(
+        ['output', { response: '答案' }],
+        ['done', { finish_reason: 'stop' }],
+      ))],
     })
     const chunks = await collect(adapter, BASIC_OPTIONS)
     expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
@@ -961,12 +968,29 @@ describe('TRAE 适配器 · SOLO SSE 到 OpenAI chunk 转换', () => {
     expect(error.message).toBe('trae: boom (code=5000)')
   })
 
-  it('无 done 事件且无内容时仍产出 finish(stop)', async () => {
+  it('无 done 事件且无内容时仍产出 finish（零块 ⇒ EMPTY_RESPONSE，可重试）', async () => {
+    // `metadata` 是可解析事件 ⇒ 不算「上游一个事件都没发」（那条走 TRANSPORT
+    // 抛错），且流**正常读到结尾**。但它一个内容块都没产出，故不能报 `stop`
+    // ——那是 DSH `EMPTY_RESPONSE` 契约明令禁止的「零输出却宣告正常结束」，
+    // 会让本轮静默结束。分类为可重试的 error 后，harness 会重跑该步。
+    //
+    // 本用例锁定的仍是**不挂起、必然给出终态 finish**（原意），只是终态从
+    // 泛化的 `stop` 收紧成了更准确的 `error`/`EMPTY_RESPONSE`。
     const { adapter } = makeAdapter({
       responses: [sseResponse(soloSse(['metadata', { session_id: 's' }]))],
     })
     const chunks = await collect(adapter, BASIC_OPTIONS)
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+    expect(chunks.filter((c) => c.type === 'block-end')).toEqual([])
+    expect(chunks.at(-1)).toEqual({
+      type: 'finish',
+      reason: {
+        kind: 'error',
+        failure: {
+          message: 'model returned a completed response with no content',
+          code: 'EMPTY_RESPONSE',
+        },
+      },
+    })
   })
 
   it('容忍 data: 后无空格（SOLO 上游实测形态）', async () => {

@@ -44,7 +44,7 @@ import {
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
-import { createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -1073,6 +1073,15 @@ export class TraeAdapter extends LlmAdapter {
      */
     const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
     let loopDetected = false
+    /**
+     * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
+     * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
+     *
+     * 为什么必须延后建块：`BlockAssembler` 在**没有 `block-end`** 时同样会用
+     * `partial.text` 组装出块，故只在出口过滤挡不住空 Think 块 —— 必须从一开始
+     * 就不发任何 chunk（与「空名字 tool_call」同型修法）。
+     */
+    const suppressor = createBlankReasoningSuppressor()
     const toolCalls = new Map<number, {
       index: number
       text: string
@@ -1190,14 +1199,20 @@ export class TraeAdapter extends LlmAdapter {
                         if (loopGuard.observe(delta.reasoning_content as string)) loopDetected = true
                       }
                       if (!loopDetected) {
-                        let block = blocks.find(c => c.kind === 'reasoning')
-                        if (block === undefined) {
-                          block = { index: nextIndex++, kind: 'reasoning', text: '' }
-                          blocks.push(block)
-                          yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                        // 纯空白思考：`emit === undefined` ⇒ 本片一个 chunk 都不发，
+                        // 于是既不建块、也不消耗 `nextIndex`（见 helper 注释）。
+                        const emit = suppressor.feed(delta.reasoning_content as string)
+                        if (emit !== undefined) {
+                          let block = blocks.find(c => c.kind === 'reasoning')
+                          if (block === undefined) {
+                            block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                            blocks.push(block)
+                            yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                          }
+                          // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本。
+                          block.text = suppressor.text()
+                          yield { type: 'reasoning-delta', index: block.index, text: emit }
                         }
-                        block.text += delta.reasoning_content as string
-                        yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content as string }
                       }
                     }
                     if (delta.tool_calls !== undefined) {
@@ -1334,6 +1349,21 @@ export class TraeAdapter extends LlmAdapter {
       )
     }
 
+    /**
+     * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
+     *
+     * ⚠️ **不能写成 `blocks.length`**：`blocks` 里可能留着**不会发出**的条目 ——
+     * 纯空白思考块（已被 `suppressor` 压制，连 `block-start` 都没发）、
+     * 或被清洗成空串的块。用 `blocks.length` 会把「零块响应」误判成「有块」，
+     * 于是静默结束的缺陷原样保留。
+     *
+     * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
+     *
+     * ⚠️ 上方 `!sawAnyUpstreamEvent` 的 TRANSPORT 抛错**先于**本判据：
+     * 「一个上游事件都没收到」是更具体的可重试信号，不该被泛化的零块判据
+     * （EMPTY_RESPONSE）覆盖 —— 与 `kind !== 'stop'` 不改写同一条道理。
+     */
+    let blockCount = 0
     // 按创建顺序关闭每个块
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
@@ -1341,6 +1371,7 @@ export class TraeAdapter extends LlmAdapter {
       // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
       // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
       if (!hasUsableToolName(block.name)) continue
+      blockCount += 1
       yield {
         type: 'block-end',
         index,
@@ -1354,6 +1385,7 @@ export class TraeAdapter extends LlmAdapter {
     }
     if (textBlock !== undefined) {
       // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      blockCount += 1
       yield {
         type: 'block-end',
         index: textBlock.index,
@@ -1361,16 +1393,23 @@ export class TraeAdapter extends LlmAdapter {
       }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
-    if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
+    // ⚠️ 判据收紧为 `trim() !== ''`：纯空白思考不得被算作「有 reasoning 产出」。
+    if (reasoningBlock !== undefined && reasoningBlock.text.trim() !== '') {
       // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
       // **权威覆盖**（已由 `scripts/verify-blockend-override.ts` 实证）：
       // 即便前面已 yield 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+      //
+      // ⚠️ 文本以 helper 为权威（`suppressor.text()`），**不用**
+      // `reasoningBlock.text` —— 两者累积口径若不一致，以 helper 为准才能
+      // 保证落块内容与 wire 一致。
+      const suppressedReasoning = suppressor.text()
       const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
-        ? reasoningBlock.text.slice(0, loopGuard.cutAt)
-        : reasoningBlock.text
+        ? suppressedReasoning.slice(0, loopGuard.cutAt)
+        : suppressedReasoning
       // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
       const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
       if (cleanedReasoning !== '') {
+        blockCount += 1
         yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
       }
     }
@@ -1390,7 +1429,11 @@ export class TraeAdapter extends LlmAdapter {
         : finishReason === 'tool_calls' || toolOrder.length > 0
           ? { kind: 'tool-calls' as const }
           : { kind: 'stop' as const }
-    yield { type: 'finish', reason }
+    // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
+    // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
+    // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
+    // 无名 tool-call 等全部既存判据）；helper 只在 `kind === 'stop'` 时改写。
+    yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) }
   }
 }
 

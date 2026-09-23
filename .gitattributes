@@ -1,0 +1,24 @@
+# ⚠️ 测试 fixture 必须保持 **LF**（`text eol=lf`）。
+#
+# 背景（真实踩坑，2026-09-23）：
+# 本机 `git config core.autocrlf=true`，checkout 时会把仓库里的 LF 转成 CRLF。
+# 而 `tests/fixtures/reasoning-*.txt` 是**真实会话文本提取**，其字符偏移被测试
+# 精确断言（如 `reasoning-loop.spec.ts` 的 `cutAt === 1536/1600`）。
+# 一旦被转成 CRLF，会凭空多出 3082 个 `\r` 字符 ⇒ `cutAt` 变成 1792 ⇒
+# **两个断言失败**，且失败与任何代码改动无关（在纯基线上同样失败），
+# 极易被误判成「刚改的代码坏了」。
+#
+# ⚠️ **必须是 `text eol=lf`，不能写成 `-text`**（控制方第一版写错，经审查实测纠正）：
+#   - `-text`（不做规范化）只挡得住**检出**期的转换，**挡不住入库污染** ——
+#     实测：工作区已是 CRLF 时 `git add` 会把 48338 字节（含 617 个 `\r`）写入
+#     索引（HEAD 本为 47721），此后 `checkout` 把这些 `\r` 发给所有人，
+#     **偏移断言对全仓库永久失败且无法靠重新检出恢复**；
+#   - `text eol=lf` 同时具备两项能力：检出时写 LF，**入库时把 CRLF 规范化回 LF**
+#     （实测同样操作后索引仍为 47721 字节 / CR=0）。
+#
+# `**` 而非 `*`：gitattributes 的单星**不跨目录**（实测
+# `tests/fixtures/sub/nested.txt` 在单星规则下为 `unspecified`），
+# 用 `**` 才能覆盖将来可能出现的子目录。
+#
+# 新增依赖字符偏移的 fixture 时，放在 `tests/fixtures/` 下的任意层级即自动受保护。
+tests/fixtures/** text eol=lf

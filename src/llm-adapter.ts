@@ -9,7 +9,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { signRequestHuawei } from './sign.js'
-import { createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
@@ -1115,6 +1115,21 @@ export class CodeArtsAdapter extends LlmAdapter {
      */
     const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
     let loopDetected = false
+    /**
+     * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
+     * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
+     *
+     * ⚠️ **本适配器的两个 reasoning 出口必须共用这一个实例**：
+     * ① `emitDsmlFeed` 的 `reasoning` 参数、② `delta.reasoning_content` →
+     * `thinking`。两处都用 `blocks.find(kind === 'reasoning')` 找**同一个**
+     * reasoning 块 —— 若各持一个 helper，第二处就会从空态重新开始累积
+     * （明明已有非空白内容却被判为「至今仍空白」），`text()` 也随之错乱。
+     *
+     * 为什么必须延后建块：`BlockAssembler` 在**没有 `block-end`** 时同样会用
+     * `partial.text` 组装出块，故只在出口过滤挡不住空 Think 块 —— 必须从一开始
+     * 就不发任何 chunk（与「空名字 tool_call」同型修法）。
+     */
+    const suppressor = createBlankReasoningSuppressor()
     // DSML 提取器：从 delta.content 中识别模型以原生 DSML XML 风格
     // 写入的工具调用（deepseek-v4 等模型在工具模式不匹配时会直接
     // 输出 `<｜DSML｜tool_calls>...`），解析为结构化 tool-call，
@@ -1161,14 +1176,22 @@ export class CodeArtsAdapter extends LlmAdapter {
           if (loopGuard.observe(reasoning)) loopDetected = true
         }
         if (!loopDetected) {
-          let block = blocks.find(candidate => candidate.kind === 'reasoning')
-          if (block === undefined) {
-            block = { index: nextIndex++, kind: 'reasoning', text: '' }
-            blocks.push(block)
-            yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+          // 纯空白思考：`emit === undefined` ⇒ 本片一个 chunk 都不发，
+          // 于是既不建块、也不消耗 `nextIndex`（见 helper 注释）。
+          const emit = suppressor.feed(reasoning)
+          if (emit !== undefined) {
+            let block = blocks.find(candidate => candidate.kind === 'reasoning')
+            if (block === undefined) {
+              block = { index: nextIndex++, kind: 'reasoning', text: '' }
+              blocks.push(block)
+              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            }
+            // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本，
+            // 用 `+=` 会双写。本适配器两个出口共用同一 helper，故回写值恒为
+            // 两处共同累积的完整文本。
+            block.text = suppressor.text()
+            yield { type: 'reasoning-delta', index: block.index, text: emit }
           }
-          block.text += reasoning
-          yield { type: 'reasoning-delta', index: block.index, text: reasoning }
         }
       }
       for (const call of dsmlCalls) {
@@ -1318,14 +1341,22 @@ export class CodeArtsAdapter extends LlmAdapter {
                 if (loopGuard.observe(thinking)) loopDetected = true
               }
               if (!loopDetected) {
-                let block = blocks.find(candidate => candidate.kind === 'reasoning')
-                if (block === undefined) {
-                  block = { index: nextIndex++, kind: 'reasoning', text: '' }
-                  blocks.push(block)
-                  yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                // 纯空白思考：`emit === undefined` ⇒ 本片一个 chunk 都不发。
+                // ⚠️ 与出口①共用**同一个** `suppressor`：两处落在同一个
+                // `blocks.find(kind === 'reasoning')` 块上，各自累积会错乱
+                // （出口②会误判「整块迄今仍空白」而丢弃本已有内容的块）。
+                const emit = suppressor.feed(thinking)
+                if (emit !== undefined) {
+                  let block = blocks.find(candidate => candidate.kind === 'reasoning')
+                  if (block === undefined) {
+                    block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                    blocks.push(block)
+                    yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                  }
+                  // ⚠️ **整块回写**（赋值，不是 `+=`）。
+                  block.text = suppressor.text()
+                  yield { type: 'reasoning-delta', index: block.index, text: emit }
                 }
-                block.text += thinking
-                yield { type: 'reasoning-delta', index: block.index, text: thinking }
               }
             }
             for (const call of reasoningDsmlCalls) {
@@ -1461,9 +1492,12 @@ export class CodeArtsAdapter extends LlmAdapter {
     // reasoning `block-end` 使用，故在此清洗可覆盖全部三处出口，
     // 不会出现「正文干净而 Think 区仍脏」或反之的不一致。
     const reasoningText = stripCourseLeakIfEnabled(
-      reasoningBlock !== undefined && loopDetected && loopGuard?.cutAt !== undefined
-        ? reasoningBlock.text.slice(0, loopGuard.cutAt)
-        : reasoningBlock?.text ?? '',
+      loopDetected && loopGuard?.cutAt !== undefined
+        // ⚠️ 文本以 helper 为权威（`suppressor.text()`），**不用**
+        // `reasoningBlock.text` —— 两个出口共用同一 helper，以它为准才能保证
+        // 累积口径一致；`reasoningBlock` 仅用于取块 `index`。
+        ? suppressor.text().slice(0, loopGuard.cutAt)
+        : suppressor.text(),
     )
     // visible 回退：正文为空且无工具调用时，用推理文本填充可见区（GLM 端点
     // 偶尔把整个回答作为 reasoning_content 输出）。但若推理含 DSML 标签
@@ -1480,11 +1514,33 @@ export class CodeArtsAdapter extends LlmAdapter {
     const visible = textBlock !== undefined && textBlock.text !== ''
       ? textBlock.text
       : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningText : ''
+    /**
+     * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
+     *
+     * ⚠️ **不能写成 `blocks.length`**：`blocks` 里可能留着**不会发出**的条目 ——
+     * 纯空白思考块（已被 `suppressor` 压制，连 `block-start` 都没发）、
+     * 或被 `cutAt` / `course` 清洗成空串的块。用 `blocks.length` 会把
+     * 「零块响应」误判成「有块」，于是静默结束的缺陷原样保留。
+     *
+     * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
+     * 本适配器有**两个**容易算错的地方：
+     *
+     * 1. **正文块的条件含 `visible` 回退**：判据是
+     *    `textBlock !== undefined || visible !== ''`（不是只看 `textBlock`）。
+     *    `visible` 在「正文为空且无工具调用」时用推理文本填充 —— 此时
+     *    `textBlock` 可能是 `undefined`（正文一个 delta 都没收到），
+     *    但块**确实会发出**。只数 `textBlock` 会漏掉它、把一个非空响应
+     *    误判成零块。
+     * 2. **reasoning 块是双层条件**：外层 `trim() !== ''`、内层
+     *    `reasoningText !== ''`。只有两层都过才真的发 `block-end`。
+     */
+    let blockCount = 0
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
       // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
       // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
       if (!hasUsableToolName(block.name)) continue
+      blockCount += 1
       yield {
         type: 'block-end',
         index,
@@ -1499,11 +1555,24 @@ export class CodeArtsAdapter extends LlmAdapter {
         },
       }
     }
+    // ⚠️ 计数条件必须与上面的**发射**条件逐字一致（含 `|| visible !== ''`）：
+    // `visible` 回退会用推理文本回填正文，只数 `textBlock` 会把「有正文」误判成
+    // 零块、进而错报 EMPTY_RESPONSE。
+    //
+    // 就当前实现而言，`|| visible !== ''` 这一半在**计数**上是冗余的防御
+    // （`visible !== ''` 蕴含 reasoning 那块也非空，下一段的计数必命中，
+    // 故块数不会因此为 0）—— 已用变异测试证实。但在**发射**上它是必需的
+    // （去掉它会让 `llm-adapter.spec.ts` 的 visible 回退用例失败）。
     if (textBlock !== undefined || visible !== '') {
+      blockCount += 1
       yield { type: 'block-end', index: textBlock?.index ?? nextIndex, block: { type: 'text', text: visible } }
     }
-    if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
+    // ⚠️ 判据收紧为 `trim() !== ''`：纯空白思考不得被算作「有 reasoning 产出」。
+    // 文本改用上面的 `reasoningText`（源自 `suppressor.text()`，已应用 cutAt
+    // 截断与 course 清洗），保证与 `visible` 回退、`reasoningHasDsml` 同一口径。
+    if (reasoningBlock !== undefined && reasoningBlock.text.trim() !== '') {
       if (reasoningText !== '') {
+        blockCount += 1
         yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningText } }
       }
     }
@@ -1529,7 +1598,11 @@ export class CodeArtsAdapter extends LlmAdapter {
         : finishReason === 'tool_calls' || toolOrder.length > 0
           ? { kind: 'tool-calls' as const }
           : { kind: 'stop' as const }
-    yield { type: 'finish', reason }
+    // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
+    // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
+    // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
+    // 无名 tool-call 等全部既存判据）；helper 只在 `kind === 'stop'` 时改写。
+    yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) }
   }
 
   /**

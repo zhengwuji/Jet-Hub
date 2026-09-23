@@ -112,11 +112,30 @@ describe('网关形态的错误帧不得被静默忽略（真实缺陷）', () =
     await expect(collect(asResponse(frame))).rejects.toThrow(/gateway exploded/)
   })
 
-  it('没有 choices 但也没有错误信号 → 仍按无内容处理（不误杀）', async () => {
-    // 例如只带 usage 的收尾帧：不应抛错。
+  it('没有 choices 但也没有错误信号 → 不抛错，判为可重试的 EMPTY_RESPONSE', async () => {
+    // 例如只带 usage 的收尾帧：**不应抛错**（那不是服务端错误）。
+    //
+    // ⚠️ 但它确实是**零内容块**的响应 —— 上游已用 `[DONE]` 宣告结束（合法
+    // 结束方式），却一个块都没产出。按 DSH 的 `EMPTY_RESPONSE` 契约，这种
+    // 「terminal stop with zero output」必须归类为该失败，而**不能**报 `stop`
+    // 让 harness 认为「模型正常答完」—— 那会让本轮静默结束、什么都没有留给
+    // 用户或循环去处理（与本文件上半部分那条「无报错中断」同族）。
+    //
+    // 官方适配器 `dsh-llm-deepseek` 的 `translate()` 正是这个语义：
+    // `[DONE]` 且 `order.length === 0` ⇒ `EMPTY_RESPONSE`（与 usage 无关）。
     const usageOnly = `data: ${JSON.stringify({ usage: { prompt_tokens: 1, completion_tokens: 1 } })}\n\ndata: [DONE]\n\n`
     const chunks = await collect(asResponse(usageOnly))
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+    expect(chunks.find((c) => c.type === 'usage')).toBeDefined()
+    expect(chunks.at(-1)).toEqual({
+      type: 'finish',
+      reason: {
+        kind: 'error',
+        failure: {
+          message: 'model returned a completed response with no content',
+          code: 'EMPTY_RESPONSE',
+        },
+      },
+    })
   })
 })
 
