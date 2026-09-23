@@ -31,7 +31,13 @@
 
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
-import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import {
+  hasUsableToolName,
+  isTruncatedArguments,
+  normalizeToolArguments,
+  readWithIdleTimeout,
+  resolveToolPairing,
+} from './sse.js'
 
 /** 将消息内容载荷展平为纯文本字符串。 */
 export function contentToText(content: unknown): string {
@@ -317,7 +323,14 @@ export async function* consumeOpenAiSse(
 
   const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
   let nextIndex = 0
-  const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+  const toolCalls = new Map<number, {
+    index: number
+    text: string
+    callId?: string
+    name?: string
+    /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+    announced: boolean
+  }>()
   const toolOrder: number[] = []
   const toolIds = new Map<number, string>()
   let buffer = ''
@@ -515,10 +528,8 @@ export async function* consumeOpenAiSse(
           const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
           let block = toolCalls.get(wireIndex)
           if (block === undefined) {
-            block = { index: nextIndex++, text: '', callId }
+            block = { index: nextIndex++, text: '', callId, announced: false }
             toolCalls.set(wireIndex, block)
-            toolOrder.push(block.index)
-            yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
           }
           block.callId = callId
           // 只允许非空名字覆盖：后续分片带空串 "" 会清空首个分片解析出的工具名，
@@ -528,6 +539,37 @@ export async function* consumeOpenAiSse(
           }
           const fragment = call.function?.arguments ?? ''
           block.text += fragment
+          // ⚠️ **名称为空前不发射任何 chunk**（2026-09-23 定位，用户报障）。
+          //
+          // 早期在这里**立即** `yield block-start` + `tool-call-delta`，名字稍后
+          // 才到。可 qoder 偶发一个**永远不带 name** 的 tool-call 分片
+          // （实测 seq=693：`{index:2, id:'call_25e9…', args:[""]}`）——
+          // 于是 `BlockAssembler` 为它建了一个 partial，收尾时组装出
+          // `{type:'tool-call', name:''}`。这条空名字块被 harness 执行成
+          // `unknown tool ""`、**持久化进会话**，之后切到 workbuddy 时被每次
+          // 请求原样重放 → **HTTP 400 code 11133**，整条会话报废。
+          //
+          // 注意：**只跳过收尾的 `block-end` 是不够的** —— 上游
+          // `BlockAssembler.assemble()` 对没有 `block-end` 的 partial 同样会
+          // 组装出 `name: partial.toolCallName ?? ''`。必须让该块**一个 chunk
+          // 都不产出**，assembler 才会彻底看不见它。
+          //
+          // 名字一旦可用就把**已累积的全部参数**一次性补发，后续分片增量发送：
+          // 正常形态（首片即带 name）与旧行为完全一致。
+          if (!block.announced) {
+            if (!hasUsableToolName(block.name)) continue
+            block.announced = true
+            toolOrder.push(block.index)
+            yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+            yield {
+              type: 'tool-call-delta',
+              index: block.index,
+              id: ToolCallId(callId),
+              name: block.name!,
+              argumentsDelta: block.text,
+            }
+            continue
+          }
           yield {
             type: 'tool-call-delta',
             index: block.index,
@@ -565,13 +607,17 @@ export async function* consumeOpenAiSse(
   const textBlock = blocks.find(block => block.kind === 'text')
   for (const index of toolOrder) {
     const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+    // `toolOrder` 只收「名字已可用」的块（见 tool_calls 分支），故此处名字必然
+    // 可用；断言而非回退成 `?? ''` —— 回退会把空名字块写进会话，正是本次
+    // 修复要根除的那条污染路径。
+    if (!hasUsableToolName(block.name)) continue
     yield {
       type: 'block-end',
       index,
       block: {
         type: 'tool-call',
         id: ToolCallId(block.callId ?? ''),
-        name: block.name ?? '',
+        name: block.name!,
         // 仅把「无参数工具下发的空分片」补成 {}；**残缺参数保持原样**，
         // 由 max-tokens 判定触发重试 —— 把残缺 JSON 补成 {} 会伪造出
         // 合法外观，让 harness 报 missing required property 而非重试。
@@ -596,6 +642,15 @@ export async function* consumeOpenAiSse(
   // 模型收到莫名错误后陷入重试循环；报告 max-tokens 则丢弃并重试。
   const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
   const incompleteTools = finishReason === undefined && toolOrder.length > 0
+  /**
+   * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
+   *
+   * 丢弃它们是对的（它们无法执行，且留着会污染会话），但**不能让这一步
+   * 静默地以 `stop` 结束** —— 那正是 AGENTS.md 记录的「没有任何报错就中断」
+   * 那一类现象：模型本意要调工具，harness 却认为它「正常答完了」。
+   * 故与截断同策：报 `max-tokens`（不完整、可重试），让 harness 重跑该步。
+   */
+  const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
 
   // ⚠️ **「根本没有任何 `data:` 帧」必须先判**：这不是「SSE 流没发完」，
   // 而是「响应压根不是 SSE」（网关/错误页直接回了一段 JSON）。
@@ -640,6 +695,14 @@ export async function* consumeOpenAiSse(
     || incompleteTools
     || truncatedStream
     || argsTruncated
+    // 丢弃了无名 tool-call、且**没有**任何可用调用留下来时，本步否则会以
+    // `stop` 收场 —— 模型本意要调工具、harness 却认为「正常答完了」，
+    // 又是一次无报错中断。报 max-tokens 让它重试。
+    //
+    // 若同批还有可用调用（`toolOrder.length > 0`），则照常报 `tool-calls`：
+    // 那几个调用与无名块各自独立，没理由因一个坏块把它们一起作废
+    // （实测线上形态正是「一个无名 + 一个合法 pwsh」）。
+    || (droppedUnnamedCalls && toolOrder.length === 0)
     ? { kind: 'max-tokens' as const }
     : finishReason === 'tool_calls' || toolOrder.length > 0
       ? { kind: 'tool-calls' as const }

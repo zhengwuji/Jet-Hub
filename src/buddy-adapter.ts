@@ -30,7 +30,7 @@ import {
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
-import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -1145,7 +1145,14 @@ export class BuddyAdapter extends LlmAdapter {
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
-    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    const toolCalls = new Map<number, {
+      index: number
+      text: string
+      callId?: string
+      name?: string
+      /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+      announced: boolean
+    }>()
     const toolOrder: number[] = []
     // tool_call index → 后端签发的真实 id。缺失时回退 call_{index}，
     // 保证 Start/Delta 使用同一 id。
@@ -1259,10 +1266,8 @@ export class BuddyAdapter extends LlmAdapter {
             const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
             let block = toolCalls.get(wireIndex)
             if (block === undefined) {
-              block = { index: nextIndex++, text: '', callId }
+              block = { index: nextIndex++, text: '', callId, announced: false }
               toolCalls.set(wireIndex, block)
-              toolOrder.push(block.index)
-              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
             }
             block.callId = callId
             // 后续参数分片会带上空的 function.name（""），它不是 undefined，
@@ -1273,6 +1278,24 @@ export class BuddyAdapter extends LlmAdapter {
             }
             const fragment = call.function?.arguments ?? ''
             block.text += fragment
+            // ⚠️ **名称为空前不发射任何 chunk**（与 `openai-compat.ts` 同因同修，
+            // 见该文件内的详细说明）。只跳过收尾的 `block-end` 不够 ——
+            // `BlockAssembler` 会把没有 block-end 的 partial 也组装成
+            // `name:''`，污染会话后让 workbuddy 以 400 code 11133 拒绝每次请求。
+            if (!block.announced) {
+              if (!hasUsableToolName(block.name)) continue
+              block.announced = true
+              toolOrder.push(block.index)
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+              yield {
+                type: 'tool-call-delta',
+                index: block.index,
+                id: ToolCallId(callId),
+                name: block.name!,
+                argumentsDelta: block.text,
+              }
+              continue
+            }
             yield {
               type: 'tool-call-delta',
               index: block.index,
@@ -1314,13 +1337,16 @@ export class BuddyAdapter extends LlmAdapter {
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
+      // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
+      if (!hasUsableToolName(block.name)) continue
       yield {
         type: 'block-end',
         index,
         block: {
           type: 'tool-call',
           id: ToolCallId(block.callId ?? ''),
-          name: block.name ?? '',
+          name: block.name!,
           // 仅把"无参数工具下发的空分片"补成 {}；**残缺参数保持原样**，
           // 由 max-tokens 判定触发重试。切勿把残缺 JSON 也补成 {}——那会
           // 伪造出合法外观，让 harness 报 `missing required property` 而
@@ -1348,9 +1374,19 @@ export class BuddyAdapter extends LlmAdapter {
     //   `missing required property "file_path"`，模型收到莫名其妙的参数错误
     //   并陷入重试循环。判定为截断后 dsh 丢弃残缺调用并重试，实测一次即恢复。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
+    /**
+     * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
+     *
+     * 丢弃是对的（无名调用无法执行、留着会污染会话），但不能让它**静默地以
+     * `stop` 结束** —— 那正是 AGENTS.md 记录的「没有任何报错就中断」：
+     * 模型本意要调工具，harness 却认为它「正常答完了」。故报 max-tokens
+     * （不完整、可重试）。同批若还有可用调用，则照常报 tool-calls。
+     */
+    const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
     const reason = finishReason === 'length'
       || finishReason === undefined && toolOrder.length > 0
       || argsTruncated
+      || droppedUnnamedCalls && toolOrder.length === 0
       ? { kind: 'max-tokens' as const }
       : finishReason === 'tool_calls' || toolOrder.length > 0
         ? { kind: 'tool-calls' as const }

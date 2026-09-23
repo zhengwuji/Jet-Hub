@@ -706,6 +706,73 @@ UI 上完全看不到错误。
 
 回归用例：`tests/unit/qoder-silent-stop.spec.ts`。
 
+#### ⚠️ 名称为空的 `tool_call` 会**跨 provider 传染**，让整条会话报废
+
+**真实缺陷**（用户报障，2026-09-23）：在 zed 会话里给
+`workbuddy/deepseek-v4.1-flash` 发一条**带图片**的任务，**每次都**报：
+
+```json
+{"code":11133,"msg":"the request parameters were rejected by the model provider",
+ "extError":{"code":"model_param_invalid","param":"","StatusCode":400}}
+```
+
+⚠️ 该文案**不指出是哪个字段**，且与图片、工具、思考档位全都无关 —— 极易误判成
+「这个模型不支持图片」。**逐项排除法**（`scripts/probe-workbuddy-image.mjs`
+与 `scripts/confirm-empty-tool-name.ts` 已固化）：
+
+| 被排除的假设 | 实测反证 |
+|---|---|
+| 图片 wire 形态（`{type:'image'}` / 裸 base64 / `image_url`） | 正确形态一律 200；错误形态报 **11101**（parse failed），不是 11133 |
+| 33 个工具的 schema（逐个单测 + 全量） | 全部 200 |
+| `thinking` / `reasoning_effort` / `max_tokens` | 单独去掉后**仍** 400 |
+| input + `max_tokens` 超上下文 | `max_tokens` 降到 **64** 仍 400；短历史 + `max_tokens: 900000` 反而 200 |
+| 重复 `tool_call_id`、中段 system 消息 | 变换后仍 400 |
+
+**真凶**：会话历史里有一条 **`name:''` 的 `tool_call`**：
+
+```json
+{"type":"tool-call","id":"call_25e97a78849f449da444fc72","name":"","arguments":"{}"}
+```
+
+**实测最小复现**（wire 上的 `function.name` → 上游结果）：
+
+| `function.name` | 结果 |
+|---|---|
+| `"read"` | 200 |
+| `"unknown_tool"`（**不存在的**工具名） | 200 ← 上游**只校验非空，不校验存在性** |
+| `""` / `null` / 缺失 | **400 code 11133** |
+
+**来源是 qoder**（所以叫「跨 provider 传染」）：其 SSE 偶发一个**完全没有 `name`
+字段**的 tool-call 分片（实测 seq=693：`{index:2, id:'call_25e9…', args:[""]}`），
+早期 `openai-compat.ts` 在 `block-end` 处 `name: block.name ?? ''` 把它落成空串块 →
+harness 执行得到 `unknown tool ""` → 该坏块被**持久化进会话** → 用户切到 workbuddy
+后每次请求原样重放 → 400。
+
+**两处修复，缺一不可**：
+
+1. **消费侧（源头，`src/openai-compat.ts`）**：名字可用**之前不发射任何 chunk**
+   （连 `block-start` 都不发）。
+   ⚠️ **只跳过收尾的 `block-end` 是不够的** —— 上游 `BlockAssembler.assemble()`
+   对没有 `block-end` 的 partial 同样会组装出 `name: partial.toolCallName ?? ''`。
+   必须让该块**一个 chunk 都不产出**。名字稍后到达时，把**已累积的参数一次性补发**，
+   故正常形态（首片即带 name）行为不变。
+   同一修法已施加到 `buddy-adapter.ts` / `llm-adapter.ts`（含两条 DSML 分支）/
+   `lobsterai-adapter.ts` / `trae-adapter.ts`。
+2. **序列化侧（存量会话自愈，`src/sse.ts` 的 `resolveToolPairing`）**：
+   发请求前剔除**名称不可用**的 tool_call 及其结果，让**已经坏掉的会话**无需重开即可恢复。
+   - 判据用 `hasUsableToolName()`，**不能写成 `String(name).length > 0`** ——
+     `undefined` / `null` 经 `String()` 会变成 `"undefined"` / `"null"` 这类**非空**
+     字符串，「缺名字」会被误判成「有名字」。
+   - **不得连累同批的合法调用**：实测线上形态正是「一个无名 + 一个合法 `pwsh`」，
+     整批丢弃会白白损失一次有效调用。结果按 id 匹配，剔一个不破坏另一个的配对。
+3. 丢弃了无名调用且**没有**留下任何可用调用时，`finish` 报 `max-tokens`（可重试）
+   而非 `stop` —— 否则又是一次「模型本意调工具、harness 却认为正常答完」的无报错中断。
+
+回归用例：`tests/unit/sse.spec.ts`（`resolveToolPairing` / `hasUsableToolName`）、
+`tests/unit/qoder-silent-stop.spec.ts`（消费侧不产出空名字块）。
+验收脚本：`scripts/verify-workbuddy-image-fix-e2e.ts`（**用线上那条报废会话的真实历史**
+重放，判据是修复后 HTTP 200）。
+
 ### 测试
 
 - 单元测试覆盖核心逻辑（签名、续期、参数构造、账号池），不依赖网络

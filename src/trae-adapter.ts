@@ -44,7 +44,7 @@ import {
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
-import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -1057,7 +1057,14 @@ export class TraeAdapter extends LlmAdapter {
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
-    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    const toolCalls = new Map<number, {
+      index: number
+      text: string
+      callId?: string
+      name?: string
+      /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+      announced: boolean
+    }>()
     const toolOrder: number[] = []
     const toolIds = new Map<number, string>()
     let buffer = ''
@@ -1167,10 +1174,8 @@ export class TraeAdapter extends LlmAdapter {
                         const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
                         let block = toolCalls.get(wireIndex)
                         if (block === undefined) {
-                          block = { index: nextIndex++, text: '', callId }
+                          block = { index: nextIndex++, text: '', callId, announced: false }
                           toolCalls.set(wireIndex, block)
-                          toolOrder.push(block.index)
-                          yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
                         }
                         block.callId = callId
                         const callFn = call.function
@@ -1180,6 +1185,24 @@ export class TraeAdapter extends LlmAdapter {
                         }
                         const fragment = fn !== undefined && typeof fn.arguments === 'string' ? fn.arguments : ''
                         block.text += fragment
+                        // ⚠️ **名称为空前不发射任何 chunk**（与 `openai-compat.ts` /
+                        // `buddy-adapter.ts` 同因同修）。只跳过收尾的 `block-end`
+                        // 不够 —— `BlockAssembler` 会把没有 block-end 的 partial
+                        // 也组装成 `name:''`，污染会话后让下游端点以 400 拒绝请求。
+                        if (!block.announced) {
+                          if (!hasUsableToolName(block.name)) continue
+                          block.announced = true
+                          toolOrder.push(block.index)
+                          yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+                          yield {
+                            type: 'tool-call-delta',
+                            index: block.index,
+                            id: ToolCallId(callId),
+                            name: block.name!,
+                            argumentsDelta: block.text,
+                          }
+                          continue
+                        }
                         yield {
                           type: 'tool-call-delta',
                           index: block.index,
@@ -1264,13 +1287,16 @@ export class TraeAdapter extends LlmAdapter {
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
+      // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
+      if (!hasUsableToolName(block.name)) continue
       yield {
         type: 'block-end',
         index,
         block: {
           type: 'tool-call',
           id: ToolCallId(block.callId ?? ''),
-          name: block.name ?? '',
+          name: block.name!,
           arguments: isTruncatedArguments(block.text) ? block.text : normalizeToolArguments(block.text),
         },
       }
@@ -1282,10 +1308,14 @@ export class TraeAdapter extends LlmAdapter {
     if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
       yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
     }
+    // 丢弃了无名 tool-call 且没有留下任何可用调用时，报 max-tokens 而非 stop ——
+    // 否则模型本意调工具、harness 却认为「正常答完了」（无报错中断）。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
+    const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
     const reason = finishReason === 'length'
       || (finishReason === undefined && toolOrder.length > 0)
       || argsTruncated
+      || (droppedUnnamedCalls && toolOrder.length === 0)
       ? { kind: 'max-tokens' as const }
       : finishReason === 'tool_calls' || toolOrder.length > 0
         ? { kind: 'tool-calls' as const }

@@ -9,7 +9,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { signRequestHuawei } from './sign.js'
-import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
@@ -1087,7 +1087,14 @@ export class CodeArtsAdapter extends LlmAdapter {
       text: string
     }> = []
     let nextIndex = 0
-    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    const toolCalls = new Map<number, {
+      index: number
+      text: string
+      callId?: string
+      name?: string
+      /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+      announced: boolean
+    }>()
     const toolOrder: number[] = []
     let buffer = ''
     let streamEnded = false
@@ -1134,6 +1141,10 @@ export class CodeArtsAdapter extends LlmAdapter {
         yield { type: 'reasoning-delta', index: block.index, text: reasoning }
       }
       for (const call of dsmlCalls) {
+        // 与 delta 路径同一条判据：名字不可用的调用**一个 chunk 都不产出**
+        // （否则 `BlockAssembler` 会组装出 `name:''` 的块并污染会话，
+        // 让下游端点以 400 code 11133 拒绝之后每一次请求）。
+        if (!hasUsableToolName(call.name)) continue
         const wireIndex = toolCalls.size
         // DSML 语法没有 provider 签发的 call id，必须生成唯一 id：
         // harness 的 tool/call ↔ tool/result 配对与 web UI 的工具行
@@ -1146,6 +1157,7 @@ export class CodeArtsAdapter extends LlmAdapter {
           text: call.arguments,
           name: call.name,
           callId: ToolCallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+          announced: true,
         }
         toolCalls.set(wireIndex, block)
         toolOrder.push(block.index)
@@ -1272,12 +1284,15 @@ export class CodeArtsAdapter extends LlmAdapter {
               yield { type: 'reasoning-delta', index: block.index, text: thinking }
             }
             for (const call of reasoningDsmlCalls) {
+              // 同 delta 路径：名字不可用者一个 chunk 都不产出（见上）。
+              if (!hasUsableToolName(call.name)) continue
               const wireIndex = toolCalls.size
               const block = {
                 index: nextIndex++,
                 text: call.arguments,
                 name: call.name,
                 callId: ToolCallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+                announced: true,
               }
               toolCalls.set(wireIndex, block)
               toolOrder.push(block.index)
@@ -1295,10 +1310,8 @@ export class CodeArtsAdapter extends LlmAdapter {
             const wireIndex = call.index ?? 0
             let block = toolCalls.get(wireIndex)
             if (block === undefined) {
-              block = { index: nextIndex++, text: '' }
+              block = { index: nextIndex++, text: '', announced: false }
               toolCalls.set(wireIndex, block)
-              toolOrder.push(block.index)
-              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
             }
             if (call.id !== undefined) block.callId = call.id
             // 后续参数分片会带上空的 function.name（""），它不是 undefined，
@@ -1309,6 +1322,24 @@ export class CodeArtsAdapter extends LlmAdapter {
             }
             const fragment = call.function?.arguments ?? ''
             block.text += fragment
+            // ⚠️ **名称为空前不发射任何 chunk**（与 `openai-compat.ts` / `buddy-adapter.ts`
+            // 同因同修）。只跳过收尾的 `block-end` 不够 —— `BlockAssembler`
+            // 会把没有 block-end 的 partial 也组装成 `name:''`，污染会话后让
+            // 腾讯系端点以 400 code 11133 拒绝之后每一次请求。
+            if (!block.announced) {
+              if (!hasUsableToolName(block.name)) continue
+              block.announced = true
+              toolOrder.push(block.index)
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+              yield {
+                type: 'tool-call-delta',
+                index: block.index,
+                id: ToolCallId(block.callId ?? ''),
+                name: block.name!,
+                argumentsDelta: block.text,
+              }
+              continue
+            }
             yield {
               type: 'tool-call-delta',
               index: block.index,
@@ -1373,13 +1404,16 @@ export class CodeArtsAdapter extends LlmAdapter {
       : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningBlock.text : ''
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
+      // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
+      if (!hasUsableToolName(block.name)) continue
       yield {
         type: 'block-end',
         index,
         block: {
           type: 'tool-call',
           id: ToolCallId(block.callId ?? ''),
-          name: block.name ?? '',
+          name: block.name!,
           // 同上：空分片补 {}，残缺参数保持原样交由截断判定处理。
           arguments: isTruncatedArguments(block.text)
             ? block.text
@@ -1399,7 +1433,13 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 把截断参数持久化进会话历史——web 加载历史时 presenter 解析也会失败
     // （"Unterminated string in JSON"）。报告 max-tokens 后，dsh 会丢弃不完整的
     // 工具调用并触发 max-tokens 续写（分批生成），避免脏数据与错误执行。
+    //
+    // 另：丢弃了无名 tool-call 且没有留下任何可用调用时，同样报 max-tokens 而
+    // 非 stop —— 否则模型本意调工具、harness 却认为「正常答完了」，
+    // 又是一次无报错中断（与 `openai-compat.ts` 同因同修）。
+    const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
     const reason = finishReason === 'length'
+      || droppedUnnamedCalls && toolOrder.length === 0
       ? { kind: 'max-tokens' as const }
       : finishReason === 'tool_calls' || toolOrder.length > 0
         ? { kind: 'tool-calls' as const }
