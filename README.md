@@ -964,6 +964,33 @@ assistant 的工具调用挂 `tool_calls`，工具结果用 `role:"tool"` + `too
 纯函数 `buildQoderInferPayload()`，由 `buildQoderTools()` /
 `buildQoderHistory()` 与端到端替身共同锁死（`tests/unit/qoder-tools.spec.ts`）。
 
+### 「没有任何报错就中断」已修
+
+症状：UI 上**看不到任何错误**，任务却停在了半路（`turn/end` 是 `completed`）。
+
+**根因**：`consumeOpenAiSse` 把「**没收到 `finish_reason`** 且**没有工具调用**」
+直接判成 `{kind:'stop'}` —— 而 `stop` 是「模型正常答完」的信号。于是**被掐断的
+连接伪装成正常结束**，harness 认为本轮已完成，任务就此中断。
+
+真实案例（2026-09-23，`qoder`/`qfmodel`）：某步的 chunk 流只有
+`block-start(text) → text → usage → block-end → finish{stop}`，**没有任何
+tool-call 分片**，而正文以冒号「：」结尾（模型正要调工具），`outputTokens=118`
+远未触上限；相邻的**正常步**则多出 `block-start(tool-call) → tool-call-chunks`。
+
+**修复**：判据改为「**连接结束的方式**」—— 既没有显式 `finish_reason`、
+也没有 `[DONE]`，就报 `max-tokens`（不完整、可重试），不再报 `stop`。
+
+同时修掉两个同族缺陷（都表现为「无报错中断」）：
+
+- **网关形态错误帧被整帧丢弃**：`{"stackTrace":[…],"message":"…","statusCodeValue":400}`
+  既没有 `code` 也没有 `error`、也没有 `choices`，早期解析器所有条件都不命中；
+- **响应根本不是 SSE**（网关直接回了一段 JSON，没有任何 `data:` 帧）：
+  早期静默空结束，现抛错并**带上原文片段**。
+
+> 排查这类问题用 `node scripts/inspect-session.mjs`（只读）——它能把会话日志
+> （zstd 压缩的 JSONL）里的**原始 chunk 流**还原出来。用法见 `AGENTS.md`。
+> 回归用例 `tests/unit/qoder-silent-stop.spec.ts`。
+
 ### 模型列表：17 个目录 key（**实测数据**）
 
 `listModels` 是**静态表**（不发网络请求）—— 远端目录需签名，运行时不做。

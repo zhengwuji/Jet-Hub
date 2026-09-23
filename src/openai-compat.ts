@@ -288,6 +288,14 @@ export interface ConsumeOpenAiSseOptions {
 }
 
 /**
+ * 诊断用原始文本上限（字符）。
+ *
+ * 只用于「响应根本不是 SSE」时的错误消息 —— 必须带原文片段，
+ * 否则用户看到的又是一次没有原因的失败。
+ */
+const RAW_SNIPPET_LIMIT = 400
+
+/**
  * 消费 OpenAI 兼容的 SSE 响应并产出 `StreamChunk`。
  *
  * 三处兼容处理（都来自实测）：
@@ -325,6 +333,20 @@ export async function* consumeOpenAiSse(
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let firstTokenReceived = false
+  /**
+   * 是否**至少解析过一帧 `data:`**（含 `[DONE]`）。
+   *
+   * 用途：区分「这是一个 SSE 流，只是没发完」与「这根本不是 SSE」
+   * （网关直接回了一段 JSON 错误体）。后者若被静默忽略，就又是一次
+   * 「没有任何报错就中断」——真实缺陷。
+   */
+  let sawDataFrame = false
+  /**
+   * 已读到的原始文本片段（**仅用于诊断**，上限 {@link RAW_SNIPPET_LIMIT} 字符）。
+   *
+   * 非 SSE 响应时把它拼进错误消息，否则用户只能看到一个没有原因的失败。
+   */
+  let rawSnippet = ''
 
   try {
     for (;;) {
@@ -344,12 +366,17 @@ export async function* consumeOpenAiSse(
         throw error
       }
       if (result.done) break
-      buffer += decoder.decode(result.value, { stream: true })
+      const decoded = decoder.decode(result.value, { stream: true })
+      if (rawSnippet.length < RAW_SNIPPET_LIMIT) {
+        rawSnippet = (rawSnippet + decoded).slice(0, RAW_SNIPPET_LIMIT)
+      }
+      buffer += decoded
       let newline: number
       while ((newline = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, newline).trim()
         buffer = buffer.slice(newline + 1)
         if (!line.startsWith('data:')) continue
+        sawDataFrame = true
         // 兼容 "data: {...}" 与 "data:{...}"（部分上游实测无空格）。
         const payload = line.slice(5).trim()
         if (payload === '[DONE]') {
@@ -375,6 +402,16 @@ export async function* consumeOpenAiSse(
           message?: string
           type?: string
           request_id?: string
+          /**
+           * 网关错误帧的**状态码字段**（实测形态）。
+           *
+           * ⚠️ 这类帧**既没有 `code`、也没有 `error`、更没有 `choices`**，
+           * 早期解析器会**整帧丢弃** → 表现为「干净地停止、无任何报错」。
+           * 见 `docs/qoder-encryption-notes.md` §4。
+           */
+          statusCodeValue?: number
+          /** 网关错误帧常带的调用栈（同样是「这是错误帧」的判据）。 */
+          stackTrace?: unknown
           choices?: Array<{
             delta?: {
               content?: string | null
@@ -418,6 +455,21 @@ export async function* consumeOpenAiSse(
             `${label}: ${data.message}${detail.length > 0 ? ` (${detail})` : ''}`,
             'SERVER',
           )
+        }
+        // ⚠️ **网关形态的错误帧**：既没有 `code`、也没有 `error`、也没有 `choices`，
+        // 只带 `statusCodeValue` / `stackTrace` + `message`。
+        // 早期解析器对这种帧**全部条件都不命中** → 整帧丢弃 → 流照常结束 →
+        // 报 `{kind:'stop'}`，UI 表现为「没有任何报错就中断」（真实缺陷，
+        // 与顶层 code/message 那条同源）。判据必须**显式覆盖**这一形态。
+        if (data.choices === undefined && typeof data.message === 'string') {
+          const status = typeof data.statusCodeValue === 'number' ? data.statusCodeValue : undefined
+          const looksLikeError = (status !== undefined && status >= 400) || data.stackTrace !== undefined
+          if (looksLikeError) {
+            const suffix = status === undefined ? '' : ` (status=${status})`
+            throw new LlmError(`${label}: ${data.message}${suffix}`, 'SERVER', {
+              ...(status === undefined ? {} : { status }),
+            })
+          }
         }
         const choice = data.choices?.[0]
         const delta = choice?.delta
@@ -543,8 +595,50 @@ export async function* consumeOpenAiSse(
   // 报告 tool-calls 会让 harness 执行缺参调用并报 schema 错误，
   // 模型收到莫名错误后陷入重试循环；报告 max-tokens 则丢弃并重试。
   const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
+  const incompleteTools = finishReason === undefined && toolOrder.length > 0
+
+  // ⚠️ **「根本没有任何 `data:` 帧」必须先判**：这不是「SSE 流没发完」，
+  // 而是「响应压根不是 SSE」（网关/错误页直接回了一段 JSON）。
+  // 若与下面的截断判定混在一起，用户只会看到一个没有原因的失败。
+  if (!sawDataFrame) {
+    const snippet = rawSnippet.trim()
+    if (snippet.length > 0) {
+      throw new LlmError(
+        `${label}: 响应不是 SSE（没有任何 data: 帧），原文片段：${snippet}`,
+        'SERVER',
+      )
+    }
+    // 空响应体：连接建立后立刻结束，属不完整 → 交由下面的 max-tokens 处理。
+  }
+
+  /**
+   * 连接是否**被掐断**：既没有显式 `finish_reason`，也没有收到 `[DONE]`。
+   *
+   * ⚠️ 这是「**没有任何报错就中断**」的根治点（用户报障，2026-09-23）。
+   * 旧判定把「未收到 finish_reason」与「有工具调用」绑在一起：
+   *
+   * ```ts
+   * finishReason === undefined && toolOrder.length > 0
+   * ```
+   *
+   * 于是**断在正文/即将调用工具时被静默接受** —— 直接报 `{kind:'stop'}`，
+   * 而 `stop` 的含义是「模型正常答完」。harness 认为本轮已完成，
+   * 任务就此中断且没有任何报错。
+   *
+   * 判据必须是「**连接结束的方式**」：
+   * - 收到 `[DONE]`（`streamEnded`）或显式 `finish_reason` → 上游宣告结束，合法；
+   * - **两者都没有** → 连接被掐断 → 报 `max-tokens`（不完整、可重试）。
+   *
+   * 真实会话证据：某步骤的 chunk 流只有
+   * `block-start → text-chunks → usage → block-end → finish{kind:'stop'}`，
+   * 正文以冒号「：」结尾（模型正要调工具），全程无 tool-call 分片，
+   * `outputTokens=319` 远未触上限 —— 典型的「断在即将调用工具处」。
+   */
+  const truncatedStream = finishReason === undefined && !streamEnded
+
   const reason = finishReason === 'length'
-    || (finishReason === undefined && toolOrder.length > 0)
+    || incompleteTools
+    || truncatedStream
     || argsTruncated
     ? { kind: 'max-tokens' as const }
     : finishReason === 'tool_calls' || toolOrder.length > 0

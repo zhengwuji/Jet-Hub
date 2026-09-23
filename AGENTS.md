@@ -657,6 +657,54 @@ ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs
 - 使用 `pnpm typecheck` 快速验证类型
 - E2E 测试需要设置环境变量 `DSH_CODEARTS_E2E=1`（测试在打开的浏览器中需要人工点击授权）
 - 构建错误检查 `lib/` 目录是否存在以及 `tsconfig.json` 的 include/exclude 配置
+- ⚠️ **改完插件必须重建 `lib/` 并重启 DSH 才生效**：宿主侧代码在 DSH 启动时从
+  `lib/index.js` 载入，不热重载（只有 `plugin-src/client/` 的客户端 bundle 有 HMR）。
+  **排查「改了没效果」时先看这两个时间**：`lib/index.js` 的 mtime 与 DSH 进程的启动时间 ——
+  进程早于产物就说明跑的是旧代码。
+
+#### ⚠️ 「没有任何报错就中断」怎么查
+
+这类现象**无法靠读代码推断**，必须回到会话记录。DSH 把每次请求的**原始 chunk 流**
+也记进了 `assistant/message` 事件（`data.stream`），据此可还原真相：
+
+```bash
+node scripts/inspect-session.mjs list zed                      # 找会话（工作区关键字）
+node scripts/inspect-session.mjs turns <会话文件>               # 每轮结束原因（先定位可疑轮次）
+node scripts/inspect-session.mjs brief <会话文件> assistant/message 700
+node scripts/inspect-session.mjs stream <会话文件> <seq>        # 该步的原始 chunk 流（关键证据）
+```
+
+会话日志位于 `~/.dsh/sessions/<工作区转义名>/<session-id>/session.v3.jsonl.zstd`
+（**zstd 压缩的 JSONL**；工作区名把 `\` `/` `:` 换成 `-`，如
+`D:\jet\code\rust\zed` → `--D-jet-code-rust-zed--`）。
+
+判据（真实案例，2026-09-23，`qoder`/`qfmodel`）：同轮相邻两步对照 ——
+
+| 步骤 | chunk 流 | finish |
+|---|---|---|
+| 正常步 | `block-start(text) → text → block-start(tool-call) → tool-call-chunks → block-end×2` | `tool-calls` |
+| 中断步 | `block-start(text) → text →`（**无任何 tool-call**）`→ usage → block-end` | `stop` |
+
+即：模型写完「让我检查 X：」后流就结束了。**`turn/end` 是 `completed`**，
+UI 上完全看不到错误。
+
+⚠️ 两个可能成因，**不要凭猜认定**：
+1. **连接被掐断**（没有 `finish_reason`、也没有 `[DONE]`）→ 已由
+   `consumeOpenAiSse` 的 `truncatedStream` 判定改为报 `max-tokens`（可重试）；
+2. **模型确实输出了 `finish_reason: stop`** 却没产出工具调用（模型抖动）→
+   本层无从强制，但此时**行为可与 (1) 区分**：修复后 (1) 会重试、(2) 仍是 `stop`。
+   若重启后再现且仍不重试，说明是 (2)，需换思路（如减少单步工具数量）。
+
+**其它已修的同族缺陷**（都表现为「无报错中断」，改 `openai-compat.ts` 时务必保留）：
+
+- **网关形态错误帧被整帧丢弃**：帧形如
+  `{"stackTrace":[...],"message":"...","statusCodeValue":400}` ——
+  **既没有 `code` 也没有 `error`、也没有 `choices`**，早期解析器所有条件都不命中。
+  现按 `statusCodeValue >= 400` 或带 `stackTrace` 判为错误并抛出。
+- **响应根本不是 SSE**（网关直接回了 JSON，没有任何 `data:` 帧）：
+  早期同样静默空结束。现抛错并**带上原文片段**，否则用户只能看到一个没有原因的失败。
+
+回归用例：`tests/unit/qoder-silent-stop.spec.ts`。
 
 ### 测试
 

@@ -43,7 +43,13 @@ import {
   type LobsteraiCredential,
 } from './lobsterai.js'
 import { LOBSTERAI, type LobsteraiFallbackModel, type LobsteraiProduct } from './lobsterai-product.js'
-import { classifyLobsteraiError, recordsLobsteraiRateLimit, shouldRotateLobsteraiAccount } from './lobsterai-errors.js'
+import {
+  classifyLobsteraiError,
+  classifyLobsteraiStreamError,
+  recordsLobsteraiRateLimit,
+  shouldRotateLobsteraiAccount,
+  type LobsteraiErrorKind,
+} from './lobsterai-errors.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
@@ -536,6 +542,77 @@ function errorMessage(error: unknown): string {
   try { return String(error) } catch { return 'unknown error' }
 }
 
+/**
+ * 上游把错误放进 **SSE 流内帧**（HTTP 200 + `{error:{message}}`）时抛出的错误。
+ *
+ * ⚠️ **必须是可识别的独立类型**：换号循环要据此区分「这个账号此刻失败了，
+ * 换个号可以重试」与「传输中断 / 用户取消 / 已产出内容后的错误 —— 换号重放
+ * 会污染输出」。仅凭 message 文本无法可靠区分。
+ *
+ * 携带 {@link kind}（已分类）与 {@link detail}（原始 message，用于诊断），
+ * 使流内错误与 HTTP 非 2xx 在换号循环里**共享同一套处理**。
+ */
+class LobsteraiStreamError extends LlmError {
+  constructor(
+    message: string,
+    readonly kind: LobsteraiErrorKind,
+    readonly detail: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, kind === 'hard-credit' ? 'QUOTA_EXCEEDED' : 'SERVER', options)
+  }
+}
+
+/** {@link buildLobsteraiFailure} 的入参。 */
+interface LobsteraiFailureInput {
+  kind: LobsteraiErrorKind
+  status: number
+  /** 原始错误体/错误帧 message（诊断用）。 */
+  text: string
+  model: string
+  /** 该失败是否来自流内错误帧（HTTP 200）。 */
+  fromStream: boolean
+  /** 是否已试遍候选账号（决定文案与错误码）。 */
+  exhausted: boolean
+}
+
+/**
+ * 构造换号循环终止时的最终错误。
+ *
+ * 三种情形共用（避免三处文案与错误码各自漂移）：
+ * 1. **无账号池 / 策略不轮转**：如实报错；
+ * 2. **候选耗尽**（池里没有下一个账号，或已达 `MaxRotate` 上限）：
+ *    报「所有账号均不可用」并带上**最后一次**的真实原因；
+ * 3. **流内错误**：原文是业务 message（如「免费额度已用完，请升级套餐」），
+ *    直接呈现，不再套 `errorDetail` 的 JSON 解析（那会原样返回文本，无害但冗余）。
+ *
+ * ⚠️ 错误码按**最后一次**失败的 kind/status 决定（成组同源）：早期实现把
+ * `kind` 留在循环外只算一次，导致「A=402(积分不足) → B=503」时错误码变成
+ * SERVER，用户完全看不到真实原因（见 `lobsterai-review-findings.md` S3）。
+ */
+function buildLobsteraiFailure(input: LobsteraiFailureInput): LlmError {
+  const { kind, status, text, model, fromStream, exhausted } = input
+  const detail = fromStream ? text : errorDetail(text)
+
+  // 额度耗尽是最主要的失败模式，必须用可读文案明确告知（而非泛泛的 HTTP 错误）。
+  if (kind === 'hard-credit') {
+    const prefix = exhausted
+      ? `lobsterai: 模型 ${model} 所有账号均不可用`
+      : 'lobsterai: 积分不足'
+    return new LlmError(`${prefix}（${detail}）`, 'QUOTA_EXCEEDED', { status })
+  }
+
+  if (exhausted) {
+    return new LlmError(
+      `lobsterai: 模型 ${model} 所有账号均不可用（${detail}）`,
+      fromStream ? 'SERVER' : httpErrorCode(status),
+      { status },
+    )
+  }
+
+  return new LlmError(`lobsterai: ${detail}`, fromStream ? 'SERVER' : httpErrorCode(status), { status })
+}
+
 /** 从错误体提取可读 detail 文本。 */
 function errorDetail(body: string): string {
   try {
@@ -921,102 +998,137 @@ export class LobsteraiAdapter extends LlmAdapter {
       response = await this.send(credential, body, options)
     }
 
-    if (!response.ok) {
-      let errorText = await response.text().catch(() => '')
-      // 当前这次失败的**成组**状态（status / kind / body 必须同源）。
-      //
-      // 用一组可变变量而不是只看循环外的 `kind`：换号循环里
-      // `response`、`errorText` 每轮都被覆盖，若单把 `kind` 留在循环外，
-      // 就会出现「A 账号的 kind 配 B 账号的 status/body」——
-      //   实测：A=402(积分不足) → B=503 时最终 code 变成 SERVER，
-      //   用户完全看不到「积分不足」这个真实原因；
-      //   且会拿 A 的 kind 去判断「要不要给 B 记限流徽章」，
-      //   给 B 写上「该模型限流 1 小时」这种虚假信息。
-      let lastStatus = response.status
-      let lastKind = classifyLobsteraiError(response.status, errorText)
+    // 5. 统一的重试循环：**HTTP 非 2xx 与流内错误帧都参与换号**。
+    //
+    // ⚠️ 这是用户报障「一个账号用完出错但没有切换」的**根因**。
+    // 额度耗尽是以 **HTTP 200 + SSE 流内错误帧** 表达的（Web 上那句
+    // 「lobsterai: 免费额度已用完，请升级套餐」正是 `consumeSse` 里
+    // `data.error.message` 的产物），而早期实现把整个换号循环放在
+    // `if (!response.ok)` **之内** —— 流内错误在消费阶段才抛出，
+    // 根本走不到换号逻辑，于是池里还有可用账号也不会被尝试。
+    //
+    // 现在两种失败模式共用同一个循环与同一套成组状态（status / kind / text
+    // 必须同源），换号、记徽章、上限与错误构造都只有一份实现。
+    const tried = new Set<string>()
+    if (currentAccountId) tried.add(currentAccountId)
 
-      // 任何非 2xx 都轮转到下一个账号（对齐 Go `handler.go:218-243`：
-      // 那个 switch 每个分支都以 continue 结尾）。策略判定集中在
-      // `shouldRotateLobsteraiAccount` 里，不在这里内联条件 ——
-      // 否则「策略声明」与「实际行为」两处分叉，后续维护必然互相误导。
-      if (this.options.accountPool && shouldRotateLobsteraiAccount(lastKind)) {
-        const tried = new Set<string>()
-        if (currentAccountId) tried.add(currentAccountId)
+    // 当前这次失败的**成组**状态（三者必须同源，见下方说明）。
+    let lastStatus = response.status
+    let lastKind: LobsteraiErrorKind = 'none'
+    let lastText = ''
+    /** 本次失败是否来自流内错误帧（决定错误文案与错误码的映射）。 */
+    let lastFromStream = false
 
-        // 换号次数上限，对齐 Go 的 `MaxRotate`（`handler.go:190` 的
-        // `for i := 0; i < h.cfg.MaxRotate; i++`，默认值 3 见
-        // `server.NewHandler`）。防雪崩：账号池很大时若逐个试完，
-        // 一次用户请求会打出 N 个上游请求，放大延迟与额度消耗。
-        //
-        // ⚠️ **减 1**：Go 的循环计数**包含首个账号**（它每次迭代都
-        // `PickExcluding` 取一个号），而本适配器在进入这个循环**之前**
-        // 已经用首个凭据发过一次请求了。若这里不减，总请求数会变成
-        // 1 + MaxRotate = 4，比 Go 多一次。
-        const maxRotate = LOBSTERAI_MAX_ROTATE - 1
-        for (let round = 0; round < maxRotate; round++) {
-          // 用**本轮**的 lastKind 判断是否该记徽章，而不是循环外的 kind：
-          // 只有 Go 里真正 `Cooldown(...)` 的三类才记（见
-          // `recordsLobsteraiRateLimit` 的说明），且必须记在**真正失败的那个
-          // 账号**上 —— currentAccountId 在下面的循环体里会被推进到下一个账号。
-          if (currentAccountId && recordsLobsteraiRateLimit(lastKind)) {
-            // 两层取值：优先 `parseRateLimitError` 从错误体里抠出**服务端声明的**
-            // 重置时刻；抠不到则用本地兜底。两者都要能落地 ——
-            // 若在抠不到时直接跳过记录，UI 上就不会出现任何限流标记，
-            // 「重测/重置」按钮也就无从操作。
-            const parsed = parseRateLimitError(errorText, options.model)
-            await this.options.accountPool.updateModelRateLimit(
-              currentAccountId,
-              parsed?.modelId ?? options.model,
-              // `parseRateLimitError` 内部要求错误体是 JSON（它 `JSON.parse` 取 msg），
-              // 而部分上游/网关会用**纯文本** 429。此时它返回 null，这里用
-              // 「1 小时后」兜底 —— 与它自己 JSON 路径下的 fallback 同一口径，
-              // 也与本插件「标记只是快照、可主动重测」的语义一致。
-              parsed?.resetTimeMs ?? Date.now() + LOBSTERAI_RATE_LIMIT_FALLBACK_MS,
-            )
+    for (let attempt = 0; ; attempt++) {
+      if (response.ok) {
+        // 消费流。**只有在尚未产出任何内容时才允许换号** —— 见下方 catch 的说明。
+        let emitted = false
+        try {
+          for await (const chunk of this.consumeSse(response, options)) {
+            emitted = true
+            yield chunk
           }
-          // 必须把 `tried` 传给池：失败类别为 5xx / 请求错误时**不写限流标记**
-          // （它们不是限流，不该留徽章），刚失败的账号仍是池里排序第一，
-          // 不排除就会拿回同一个账号、命中下面的 `tried.has` 而**立即 break**
-          // —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`（`pool.go:131`）。
-          const next = await this.options.accountPool.getAvailableAccount(
-            this.product.id, options.model, tried,
-          )
-          if (!next || tried.has(next.entry.id)) break
-          tried.add(next.entry.id)
-          credential = next.credential as LobsteraiCredential
-          currentAccountId = next.entry.id
-          response = await this.send(credential, body, options)
-          if (response.ok) {
-            yield* this.consumeSse(response, options)
-            return
-          }
-          // 覆盖成组状态：status / kind / body 三者必须一起更新，
-          // 否则下面抛出的错误码与实际原因会对不上（见上方说明）。
-          errorText = await response.text().catch(() => '')
+          return
+        } catch (error) {
+          // 传输/超时错误：如实抛出，由 harness 决定是否重试整个回合（不在这里换号）。
+          if (!(error instanceof LobsteraiStreamError)) throw error
+
+          // ⚠️ **已产出内容后绝不能换号**（真实缺陷，2026-09-23 修复）。
+          //
+          // 换号会重放一次请求，而新的 `consumeSse` 是**全新的生成器** ——
+          // 它的 `nextIndex` 从 0 重新开始，于是会**再发一次
+          // `block-start(index=0)`**。DSH 对重复块索引是**硬失败**：
+          //
+          //   `dsh-llm/lib/invariant.js`:
+          //     case "block-start":
+          //       if (open.has(chunk.index)) fail(`LLM stream repeated block-start index ${chunk.index}`)
+          //
+          // 也就是说：已产出内容后换号不仅会把两个账号的正文拼在一起，
+          // 还会把「额度耗尽」这个可读错误升级成 harness 的 invariant 崩溃 ——
+          // 比不换号更糟（用户看到一个与真实原因无关的内部错误）。
+          //
+          // 此时如实抛出即可：harness 会重试整个回合，而在那次请求里
+          // 本账号的失败通常发生在**首帧**（尚未产出内容），可干净换号。
+          if (emitted) throw error
+
+          // 流内业务错误（如额度耗尽）且**尚未产出任何内容**：换号重试。
+          // 这正是用户报障「一个账号用完出错但没有切换」的修复点 ——
+          // 额度耗尽的错误帧是流里的**第一帧**，此前却因为整段换号逻辑
+          // 位于 `if (!response.ok)` 之内而完全走不到。
+          lastFromStream = true
           lastStatus = response.status
-          lastKind = classifyLobsteraiError(response.status, errorText)
-          // 新账号也不可轮转（理论上不会：shouldRotate 仅对 none 为 false，
-          // 而非 2xx 已排除 none）—— 留作防御，避免将来改动引入死循环。
-          if (!shouldRotateLobsteraiAccount(lastKind)) break
+          lastKind = error.kind
+          lastText = error.detail
         }
-        // 试遍候选：报「均不可用」，并带上**最后一次**的真实原因（不吞诊断信息）。
-        throw new LlmError(
-          `lobsterai: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
-          lastKind === 'hard-credit' ? 'QUOTA_EXCEEDED' : httpErrorCode(lastStatus),
-          { status: lastStatus },
+      } else {
+        lastFromStream = false
+        lastText = await response.text().catch(() => '')
+        lastStatus = response.status
+        lastKind = classifyLobsteraiError(lastStatus, lastText)
+      }
+
+      // 用**本轮**的 kind 判断是否该记徽章：只有 Go 里真正 `Cooldown(...)`
+      // 的三类才记（见 `recordsLobsteraiRateLimit` 的说明），且必须记在
+      // **真正失败的那个账号**上 —— currentAccountId 在下面会被推进到下一个账号。
+      if (currentAccountId && recordsLobsteraiRateLimit(lastKind)) {
+        // 两层取值：优先 `parseRateLimitError` 从错误体里抠出**服务端声明的**
+        // 重置时刻；抠不到则用本地兜底。两者都要能落地 ——
+        // 若在抠不到时直接跳过记录，UI 上就不会出现任何限流标记，
+        // 「重测/重置」按钮也就无从操作。
+        const parsed = parseRateLimitError(lastText, options.model)
+        await this.options.accountPool!.updateModelRateLimit(
+          currentAccountId,
+          parsed?.modelId ?? options.model,
+          // `parseRateLimitError` 内部要求错误体是 JSON（它 `JSON.parse` 取 msg），
+          // 而部分上游/网关会用**纯文本** 429。此时它返回 null，这里用
+          // 「1 小时后」兜底 —— 与它自己 JSON 路径下的 fallback 同一口径，
+          // 也与本插件「标记只是快照、可主动重测」的语义一致。
+          parsed?.resetTimeMs ?? Date.now() + LOBSTERAI_RATE_LIMIT_FALLBACK_MS,
         )
       }
 
-      // 积分不足但无账号池（或只有一个账号）：用可读文案明确告知，
-      // 而不是抛一个泛泛的 HTTP 错误 —— 这是 LobsterAI 最主要的失败模式。
-      if (lastKind === 'hard-credit') {
-        throw new LlmError(`lobsterai: 积分不足（${errorDetail(errorText)}）`, 'QUOTA_EXCEEDED', { status: lastStatus })
+      // 无账号池（或策略判定不该轮转）：如实报错，不做换号。
+      if (!this.options.accountPool || !shouldRotateLobsteraiAccount(lastKind)) {
+        throw buildLobsteraiFailure({
+          kind: lastKind, status: lastStatus, text: lastText,
+          model: options.model, fromStream: lastFromStream, exhausted: false,
+        })
       }
-      throw new LlmError(`lobsterai: ${errorDetail(errorText)}`, httpErrorCode(lastStatus), { status: lastStatus })
-    }
 
-    // 5. 消费 SSE 流
-    yield* this.consumeSse(response, options)
+      // 换号次数上限，对齐 Go 的 `MaxRotate`（`handler.go:190` 的
+      // `for i := 0; i < h.cfg.MaxRotate; i++`，默认值 3 见
+      // `server.NewHandler`）。防雪崩：账号池很大时若逐个试完，
+      // 一次用户请求会打出 N 个上游请求，放大延迟与额度消耗。
+      //
+      // ⚠️ **减 1**：Go 的循环计数**包含首个账号**（它每次迭代都
+      // `PickExcluding` 取一个号），而本适配器在进入这个循环**之前**
+      // 已经用首个凭据发过一次请求了。若这里不减，总请求数会变成
+      // 1 + MaxRotate = 4，比 Go 多一次。
+      if (attempt >= LOBSTERAI_MAX_ROTATE - 1) {
+        throw buildLobsteraiFailure({
+          kind: lastKind, status: lastStatus, text: lastText,
+          model: options.model, fromStream: lastFromStream, exhausted: true,
+        })
+      }
+
+      // 必须把 `tried` 传给池：失败类别为 5xx / 请求错误时**不写限流标记**
+      // （它们不是限流，不该留徽章），刚失败的账号仍是池里排序第一，
+      // 不排除就会拿回同一个账号、命中下面的 `tried.has` 而**立即 break**
+      // —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`（`pool.go:131`）。
+      const next = await this.options.accountPool.getAvailableAccount(
+        this.product.id, options.model, tried,
+      )
+      if (!next || tried.has(next.entry.id)) {
+        throw buildLobsteraiFailure({
+          kind: lastKind, status: lastStatus, text: lastText,
+          model: options.model, fromStream: lastFromStream, exhausted: true,
+        })
+      }
+      tried.add(next.entry.id)
+      credential = next.credential as LobsteraiCredential
+      currentAccountId = next.entry.id
+      response = await this.send(credential, body, options)
+    }
   }
 
   /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
@@ -1144,7 +1256,17 @@ export class LobsteraiAdapter extends LlmAdapter {
             continue
           }
           if (data.error !== undefined) {
-            throw new LlmError(`lobsterai: ${data.error.message ?? 'unknown error'}`, 'SERVER')
+            // ⚠️ 必须抛**可分类的** `LobsteraiStreamError`：额度耗尽正是以
+            // 这个形态下发的（HTTP 200 + `{error:{message:'免费额度已用完，请升级套餐'}}`），
+            // 而早期这里抛的是裸 `LlmError`（固定 SERVER），换号循环
+            // 既看不到它、也无法判断该不该换号 —— 用户报障
+            // 「一个账号用完出错但没有切换」的直接原因。
+            const detail = data.error.message ?? 'unknown error'
+            throw new LobsteraiStreamError(
+              `lobsterai: ${detail}`,
+              classifyLobsteraiStreamError(detail),
+              detail,
+            )
           }
           const choice = data.choices?.[0]
           const delta = choice?.delta
