@@ -206,3 +206,378 @@ export function isTruncatedArguments(raw: string): boolean {
     return true
   }
 }
+
+/** {@link createReasoningLoopDetector} 的可调参数。 */
+export interface ReasoningLoopDetectorOptions {
+  /** 判定窗口大小（字符）。默认 3000。 */
+  windowChars?: number
+  /** 窗口内去重行比例低于此值视为局部循环。默认 0.35。 */
+  maxDistinctLineRatio?: number
+  /** 窗口内至少这么多非空行才参与判定。默认 40。 */
+  minLines?: number
+  /** 循环状态须持续这么多字符才确认中断。默认 2000。 */
+  minLoopChars?: number
+  /**
+   * 内部切片大小（字符）。默认 64；**<1 会被钳到 1**，非有限值（`NaN` /
+   * `Infinity`）回退默认 64 —— 归一化见 {@link resolveSliceChars}。
+   *
+   * 它使**触发结论**与 `cutAt > 0` 与调用方粒度无关；`cutAt` 数值精度受切片
+   * 大小限制（调用方粒度小于切片大小时更精确：实测粒度 3 → 1614、
+   * 10 → 1610、≥64 → 1600），触发时机也会随 delta 边界略有推迟。
+   */
+  sliceChars?: number
+}
+
+/** 思考死循环检测器。 */
+export interface ReasoningLoopDetector {
+  /**
+   * 喂入一个 reasoning 增量；返回 true 表示**本次调用首次**确认死循环。
+   * 确认后恒返回 false（幂等），调用方据此只处理一次。
+   */
+  observe(delta: string): boolean
+  /** 是否已确认死循环。 */
+  readonly detected: boolean
+  /**
+   * 截断点（字符偏移）：只保留 `[0, cutAt)` 的干净前缀。
+   * 未检测到时为 undefined。
+   */
+  readonly cutAt: number | undefined
+}
+
+/**
+ * 归一化 `sliceChars`：非有限值（NaN / Infinity）回退默认值，并钳到 ≥1。
+ *
+ * ⚠️ **必须钳下限**：`observe` 用 `offset += sliceChars` 推进切片循环，
+ * 步长为 0 或负数会让循环永不推进 → **同步死循环、进程挂死**。
+ * 而同步死循环**无法被测试框架的超时打断**（超时由事件循环 timer 实现），
+ * 表现为整个测试进程永久挂住且零诊断 —— 故这里必须兜住，不能只靠调用方自觉。
+ *
+ * `NaN` 也必须兜：`Math.max(1, NaN)` 仍是 `NaN`，会让 `offset < delta.length`
+ * 恒为 false → 判据**静默失效**（fail-open，不检测任何循环）。
+ */
+export function resolveSliceChars(raw: number | undefined): number {
+  const value = raw ?? 64
+  return Number.isFinite(value) ? Math.max(1, value) : 64
+}
+
+/**
+ * 创建思考死循环检测器。
+ *
+ * ## 真实缺陷（用户报障，2026-09-23）
+ *
+ * `workbuddy/deepseek-v4.1-flash` 报「已达到输出 token 上限，回答被截断」。
+ * 排查确认**不是**参数沿用上一个模型（DSH 按当前模型解析 `maxTokens`；
+ * 且同一会话 turn 1 未做任何切换就爆额度），而是模型思考陷入病态重复：
+ *
+ * ```
+ * Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
+ * ```
+ *
+ * `reasoning_tokens` **计入** `completion_tokens`，故思考停不下来 = 正文零产出，
+ * 最终 `reasoningTokens == outputTokens == 128000`、`finish_reason: length`。
+ * 该模型只声明 `reasoningEfforts: ['high']`（仅一档），用户无法靠降档缓解。
+ *
+ * ## 判据为什么是这两个（实测依据）
+ *
+ * 评估了三种判据（正常 109 条 / 死循环 6 条真实样本）：
+ *
+ * | 判据 | 正常误报 | 死循环命中 |
+ * |---|---|---|
+ * | n-gram 重复占比 | 0/109 | 2/3 |
+ * | **窗口去重行比例 + 持续体量** | **0/109** | **3/3** |
+ * | 尾部行周期 | 0/109 | 1/3 |
+ *
+ * 故取第二种。**「持续体量」这一层不可省**：实测 seq=401 在 14848/15795
+ * （94%）处被判局部循环，但它随即自愈并产出了工具调用 —— 它的持续体量
+ * 仅 1024 字符，被 `minLoopChars=2000` 正确排除；而三个真死循环的持续体量
+ * 是 435,968 ~ 509,184。区分度极高。
+ *
+ * 正常样本窗口去重率最低 0.149、死循环 0.017~0.031，**5 倍余量**。
+ *
+ * ⚠️ 只应喂 **reasoning** 增量：正文里的重复（代码块、列表）是正常输出。
+ */
+export function createReasoningLoopDetector(
+  options: ReasoningLoopDetectorOptions = {},
+): ReasoningLoopDetector {
+  const windowChars = options.windowChars ?? 3000
+  const maxDistinctLineRatio = options.maxDistinctLineRatio ?? 0.35
+  const minLines = options.minLines ?? 40
+  const minLoopChars = options.minLoopChars ?? 2000
+  /**
+   * 内部切片大小（字符）。
+   *
+   * 它使**触发结论**与 `cutAt > 0` 与调用方粒度无关，但**不**保证 `cutAt`
+   * 数值与粒度无关 —— 数值精度受切片大小限制（调用方粒度小于切片大小时更
+   * 精确：实测粒度 3 → 1614、10 → 1610、≥64 → 1600），触发时机也会随 delta
+   * 边界推迟。实测 64 与 256 都能满足全部约束；取 64 以获得更精确的截断点
+   * （死循环样本 cutAt=1600 vs 1536）。
+   *
+   * ⚠️ **<1 会被钳到 1**（`NaN` / `Infinity` 回退 64）：未钳制时
+   * `observe` 的 `offset += sliceChars` 永不推进 → **死循环、进程挂死**。
+   * 其余数值选项（如 `windowChars: 0`）都不会造成这种失败模式。
+   * 归一化逻辑单列在 {@link resolveSliceChars}，便于纯函数断言。
+   */
+  const sliceChars = resolveSliceChars(options.sliceChars)
+
+  let text = ''
+  let detected = false
+  let cutAt: number | undefined
+  /** 当前连续循环段的起点（字符偏移）与已持续长度。 */
+  let runStart = 0
+  let runChars = 0
+
+  /**
+   * 喂入一个**固定小片**并推进状态机。
+   *
+   * ⚠️ 判据的「持续体量」必须按**内部切片**累加，不能按调用方给的 delta 累加。
+   * 旧实现 `runChars += delta.length` 直接采用调用方边界，于是单个 delta 大于
+   * `minLoopChars` 时一次观察即满足阈值、`runStart` 落在该 delta 开头 →
+   * `cutAt = 0` → **把回答截成空**；更糟的是会误伤「早期自愈」负样本
+   * （它正是「零误报」结论的关键）。实测粒度 3000 时自愈样本被误触发。
+   *
+   * 真实流式帧极小（实测 1379 万帧：p99=10、max=95 字符），故逐帧调用的适配器
+   * 不可达；但 `llm-adapter.ts`（codearts）是累积后一次性调用 → **真实可达**。
+   *
+   * ⚠️ **`cutAt === 0` 在默认参数下不可达、调参可复现**（等价说法：默认参数下
+   * `cutAt > 0` 必然成立）。它依赖 `minLines` 与 `sliceChars` 的大小关系
+   * （下述论证**不依赖调用方粒度**）：进入 looping 至少需 `minLines=40`
+   * 个非空行。`n` 个非空行**至少**占 `2n−1` 字符（每行 ≥1 字符，行间 1 个换行），
+   * 代入 `n ≥ 40` 得**至少 79 字符**；而任一片的长度恒 `≤ sliceChars`(64) < 79
+   * ⇒ **首片结束时不可能已满足 40 行** ⇒ `runStart` 最早只能落在**第二片开头**，
+   * 即 `runStart ≥ 首片长度 ≥ 1` ⇒ **`cutAt > 0`**。
+   *
+   * 若调用方**调大 `sliceChars`** 使单片即可容纳 ≥79 字符（即 ≥40 个非空行），
+   * 或**下调 `minLines`**（两者都是既有可调项），首片即可能直接命中、
+   * `runStart = 0` → **`cutAt = 0` 截空复现**。
+   *
+   * **实测（40 个非空行的重复体，单元 79 字符）**：`sliceChars=32` → `cutAt=64`、
+   * `64` → `64`（默认参数，安全）；**`sliceChars=128` → `cutAt=0`**（截空）、
+   * `256` → `0`。即约束的临界正在「单片 ≥79 字符」处，`128` 已越过它。
+   * 调参时必须重新核验该约束。
+   */
+  function feedPiece(piece: string): boolean {
+    text += piece
+    // 只看尾部窗口：循环是「局部持续」现象，不必回溯全文。
+    const window = text.slice(Math.max(0, text.length - windowChars))
+    const lines = window.split('\n').map(line => line.trim()).filter(line => line.length > 0)
+    const looping = lines.length >= minLines
+      && new Set(lines).size / lines.length < maxDistinctLineRatio
+    if (!looping) {
+      // 恢复正常：清零持续计数，使「循环→正常→再循环」只认后一段。
+      runStart = 0
+      runChars = 0
+      return false
+    }
+    if (runChars === 0) runStart = text.length - piece.length
+    runChars += piece.length
+    if (runChars < minLoopChars) return false
+    detected = true
+    cutAt = runStart
+    return true
+  }
+
+  return {
+    get detected(): boolean { return detected },
+    get cutAt(): number | undefined { return cutAt },
+    observe(delta: string): boolean {
+      if (detected) return false
+      if (delta.length === 0) return false
+      // 把任意粒度的 delta 切成固定小片，使结论只取决于切片大小而非调用方边界。
+      for (let offset = 0; offset < delta.length; offset += sliceChars) {
+        if (feedPiece(delta.slice(offset, offset + sliceChars))) return true
+      }
+      return false
+    },
+  }
+}
+
+/**
+ * 解析 `DSH_REASONING_LOOP_GUARD`；**默认开启**。
+ *
+ * 只有显式假值（`0` / `false` / `no` / `off`）才关闭。与 `isTruthyFlag`
+ * 的「默认关」语义相反（对齐 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` /
+ * `DSH_TRAE_MAX_MODE`），故单列一个函数，**不要混用**。
+ */
+export function resolveReasoningLoopGuardFlag(raw: string | undefined): boolean {
+  if (raw === undefined) return true
+  const value = raw.trim().toLowerCase()
+  return !(value === '0' || value === 'false' || value === 'no' || value === 'off')
+}
+
+/** 思考死循环检测是否启用（读环境变量）。 */
+export function isReasoningLoopGuardEnabled(): boolean {
+  return resolveReasoningLoopGuardFlag(process.env.DSH_REASONING_LOOP_GUARD)
+}
+
+/**
+ * 清洗**行首**的 `course` / `课` 泄漏 token。
+ *
+ * ## 真实缺陷（用户报障，2026-09-23）
+ *
+ * 用户观察：`deepseek-v4.1-flash` 的输出与思考中，**经常一行开头带一个中文「课」
+ * 或英文「course」**，会污染提示词。
+ *
+ * ## 实测形态（全库核实：295 会话 / 307 万行）
+ *
+ * | 事实 | 数据 |
+ * |---|---|
+ * | `course` 片段长度 | **1381/1381 全部恰好 6 字符**，全文即 `"course"` |
+ * | `课` 片段长度 | **3362/3366 恰好 1 字符**，全文即 `"课"` |
+ * | 位置分布 | 行首 **2347**、行中 28（后者全是我们分析此现象的会话文字） |
+ * | 前接上下文 | 只有 `\n\n`(2395) / 块首(261) / `\n`(69) 三种，**无例外** |
+ *
+ * 100% 规整 → **不是**模型生成的自然语言，而是某个「段落起始」类**特殊 token
+ * 被解码成了字面量**（中文侧 `课`、英文侧 `course`，同源 —— 都是 "course" 的字面义）。
+ *
+ * 用户的补充（已证实）：「`课查` / `课修` 都是泄漏，只不过是**泄漏 + 模型循环**
+ * 两个问题叠加」—— 泄漏 token 后面直接跟模型正文/循环短句（`课查。` 895 次、
+ * `课跑。` 308、`课修。` 307…）。这也解释了为何量极大：模型进入循环后每轮迭代
+ * 都带一个泄漏前缀。
+ *
+ * ## 为什么判据是「行首一律删」，而不是白名单
+ *
+ * 泄漏就是**单个 `课` 字**，后面接任意正文 —— 故「`课` + 某字」永远可能是
+ * 「泄漏 + 正文」的偶然组合，**任何白名单都会被绕过**。实测反证：
+ *
+ * | 曾以为要保护的词 | 数据真相 |
+ * |---|---|
+ * | `课改`(12) | 行首 **10 次全是泄漏**（`课改测试。`、`课改 handler.go。`） |
+ * | `课时`(3) | 行首 3 次全是泄漏（`课时间轴逻辑…`） |
+ * | `课程`(23) | **全在中部**，且全是分析此现象的会话文字，非模型输出 |
+ *
+ * 故判据为：
+ *
+ * ```
+ * 行首（块首 或 前一字符是 \n，允许前置空白）的 `course`
+ *   且后接 ∈ {空格, \t, \n, \r, 块尾}          → 删掉 `course`
+ * 行首（同上）的 `课`                            → 删掉 `课`
+ * ```
+ *
+ * `course` 要求后接空白（**不接字母**）是为保守：避免误删 `courseware` 这类
+ * 真实英文词。实测行首 `course` 后接非空白的出现 **0 次**，故不影响覆盖率。
+ *
+ * 实测效果：命中 **2346** 处、行首未命中 **0** 处；中部 28 处（真正的正常用法
+ * `研讨课` / `重要的一课` / `of course` / `recourse`）**完全不受影响**。
+ *
+ * ⚠️ **已知边界（非零风险，故必须带开关）**：若模型真的以「课程设计已完成。」
+ * 这样的句子开头，会变成「程设计已完成。」。实测 0/2346，但原理上非零 ——
+ * 因为泄漏后接的正文可能偶然拼成正常词。可用 `DSH_COURSE_LEAK_STRIP=0` 关闭。
+ *
+ * ⚠️ **不解析 markdown 围栏**：围栏内若出现行首 `course` 同样会被删。实测数据里
+ * 泄漏都出现在自然语言段落、围栏内无此形态，故接受该简化。
+ *
+ * @param text - 待清洗文本（reasoning 块或 text 块）。
+ * @returns 清洗后的文本；无泄漏时**原样返回同一字符串**。
+ */
+export function stripCourseLeak(text: string): string {
+  if (text.length === 0) return text
+  // 快速短路：绝大多数文本不含目标词，避免无谓的逐行处理。
+  if (!text.includes('course') && !text.includes('课')) return text
+
+  const lines = text.split('\n')
+  let changed = false
+  const cleaned = lines.map((line) => {
+    // 行首 = 允许前置空白后的第一个字符（实测泄漏无缩进，但为稳妥仍处理）。
+    const match = /^([ \t]*)(course|课)(.*)$/.exec(line)
+    if (match === null) return line
+    const [, indent, word, rest] = match
+    if (word === 'course') {
+      // 保守：只有后接空白/制表/行尾才认为是泄漏（不接字母，避免 courseware 等）。
+      const first = rest[0]
+      if (!(rest.length === 0 || first === ' ' || first === '\t' || first === '\r')) return line
+      // 连同其后一个空格一起删，避免留下行首空格。
+      const trimmed = rest.startsWith(' ') ? rest.slice(1) : rest
+      changed = true
+      return indent + trimmed
+    }
+    // `课`：行首一律删（实测行首 `课` 100% 是泄漏）。
+    const trimmed = rest.startsWith(' ') ? rest.slice(1) : rest
+    changed = true
+    return indent + trimmed
+  })
+  return changed ? cleaned.join('\n') : text
+}
+
+/**
+ * 解析 `DSH_COURSE_LEAK_STRIP`；**默认开启**。
+ *
+ * 只有显式假值（`0` / `false` / `no` / `off`）才关闭。与 `isTruthyFlag`
+ * 的「默认关」语义相反（对齐 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` /
+ * `DSH_REASONING_LOOP_GUARD`），故单列一个函数，**不要混用**。
+ *
+ * ⚠️ 提供开关是因为判据有**已知边界**：若模型真的以「课程设计…」开头，
+ * 「课」会被误删。实测 0/2346，但原理上非零。
+ */
+export function resolveCourseLeakStripFlag(raw: string | undefined): boolean {
+  if (raw === undefined) return true
+  const value = raw.trim().toLowerCase()
+  return !(value === '0' || value === 'false' || value === 'no' || value === 'off')
+}
+
+/** 行首泄漏清洗是否启用（读环境变量）。 */
+export function isCourseLeakStripEnabled(): boolean {
+  return resolveCourseLeakStripFlag(process.env.DSH_COURSE_LEAK_STRIP)
+}
+
+/**
+ * 按开关决定是否清洗；**供适配器的 `block-end` 收尾处调用**。
+ *
+ * 清洗放在**组装后**（而非流式增量）有两个理由：
+ * 1. 判据需要「行首」这个上下文，而增量里 `course` 可能跨 chunk 到达
+ *    （`cou` + `rse`），流式层无法判定；
+ * 2. 只改 `block-end` 的 `block.text` 不必引入缓冲，不影响首 token 延迟。
+ *
+ * 实测 `BlockAssembler` 的 `block-end` 是**权威覆盖**，故此处改文本即可生效
+ * （与死循环截断同一机制）。
+ */
+export function stripCourseLeakIfEnabled(text: string): string {
+  return isCourseLeakStripEnabled() ? stripCourseLeak(text) : text
+}
+
+/**
+ * 清洗**历史消息**里已持久化的行首泄漏；**供各适配器的序列化前调用**。
+ *
+ * ## 为什么还需要这一层（`block-end` 清洗不够）
+ *
+ * `block-end` 清洗只管**本次新生成**的文本。但泄漏早在本次修复之前就已
+ * **持久化进会话历史**（实测全库 2771 行），此后每轮请求都会把这段脏历史
+ * 原样重放给模型 —— 正是用户报障的「污染提示词」。
+ *
+ * 故必须在**发给模型之前**再清一道，让**存量坏会话自愈**、无需用户重开会话。
+ * 这与「名称为空的 tool_call」那次的思路一致（消费侧修源头 + 序列化侧治存量）。
+ *
+ * ## 只清 assistant，不碰 user / system / tool 结果
+ *
+ * ⚠️ **判据只对模型自己的输出成立**（泄漏 token 由模型产生）。
+ * 用户消息是**人的输入** —— 里面出现的「课」/「course」可能是用户真的在
+ * 讨论这个词（本次排查期间我自己的分析文字就大量含 `课查。`）。
+ * 清洗用户输入会**篡改用户的话**，绝不可为。
+ *
+ * 故：
+ * - `role === 'assistant'` 的 `text` / `reasoning` 块 → 清洗；
+ * - `tool-call` 的 `arguments` → **不清洗**（是 JSON，改了会破坏解析）；
+ * - 其余角色的所有内容 → **不清洗**。
+ *
+ * @param message - 一条 harness 原生消息。
+ * @returns 清洗后的 content 数组；无改动时返回**原数组**（保持引用相等）。
+ */
+export function stripCourseLeakFromHistoryContent(
+  role: string,
+  content: readonly unknown[],
+): readonly unknown[] {
+  if (role !== 'assistant') return content
+  if (!isCourseLeakStripEnabled()) return content
+  let changed = false
+  const cleaned = content.map((raw) => {
+    if (typeof raw !== 'object' || raw === null) return raw
+    const block = raw as { type?: unknown; text?: unknown }
+    // 只动 text / reasoning 两种纯文本块。
+    if (block.type !== 'text' && block.type !== 'reasoning') return raw
+    if (typeof block.text !== 'string' || block.text.length === 0) return raw
+    const stripped = stripCourseLeak(block.text)
+    if (stripped === block.text) return raw
+    changed = true
+    return { ...block, text: stripped }
+  })
+  return changed ? cleaned : content
+}

@@ -9,7 +9,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { signRequestHuawei } from './sign.js'
-import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
@@ -97,7 +97,13 @@ function serializeMessages(messages: readonly { role: string; content: unknown }
   const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
   for (const message of messages) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -1099,6 +1105,16 @@ export class CodeArtsAdapter extends LlmAdapter {
     let buffer = ''
     let streamEnded = false
     let finishReason: 'stop' | 'tool_calls' | 'length' | undefined
+    /**
+     * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+     * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
+     *
+     * 本适配器有**两处** reasoning 出口，两处都必须喂入同一判据（漏一处
+     * 就等于漏一条路径）：① `emitDsmlFeed` 的 `reasoning` 聚合参数；
+     * ② `delta.reasoning_content` → `dsmlReasoningExtractor` → `thinking`。
+     */
+    const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let loopDetected = false
     // DSML 提取器：从 delta.content 中识别模型以原生 DSML XML 风格
     // 写入的工具调用（deepseek-v4 等模型在工具模式不匹配时会直接
     // 输出 `<｜DSML｜tool_calls>...`），解析为结构化 tool-call，
@@ -1131,14 +1147,29 @@ export class CodeArtsAdapter extends LlmAdapter {
         yield { type: 'text-delta', index: block.index, text }
       }
       if (reasoning.length > 0) {
-        let block = blocks.find(candidate => candidate.kind === 'reasoning')
-        if (block === undefined) {
-          block = { index: nextIndex++, kind: 'reasoning', text: '' }
-          blocks.push(block)
-          yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+        // 死循环守卫：命中后不再累积、不再发射。
+        //
+        // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + `break`）在
+        // 本 chunk 的行循环**全部处理完之后**、外层 `for (;;)` 末尾执行（见下方
+        // ★ 止损块）—— 这样同一 chunk 里已到达的 usage / [DONE] 仍会被处理。
+        // 若在此处直接 `break`，本 chunk 剩余的行会被整块跳过。
+        // ⚠️ 也**不能用 `continue`**（Task 2 审查发现并已实测复现）：它会
+        // 连带跳过**同一帧内**位于本分支之后的处理（`usage` 记账、DSML
+        // tool-call 解析），导致 token 统计静默丢失。故用 `if (!loopDetected)`
+        // 守卫分支体。
+        if (loopGuard !== undefined) {
+          if (loopGuard.observe(reasoning)) loopDetected = true
         }
-        block.text += reasoning
-        yield { type: 'reasoning-delta', index: block.index, text: reasoning }
+        if (!loopDetected) {
+          let block = blocks.find(candidate => candidate.kind === 'reasoning')
+          if (block === undefined) {
+            block = { index: nextIndex++, kind: 'reasoning', text: '' }
+            blocks.push(block)
+            yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+          }
+          block.text += reasoning
+          yield { type: 'reasoning-delta', index: block.index, text: reasoning }
+        }
       }
       for (const call of dsmlCalls) {
         // 与 delta 路径同一条判据：名字不可用的调用**一个 chunk 都不产出**
@@ -1274,14 +1305,28 @@ export class CodeArtsAdapter extends LlmAdapter {
             const { text, reasoning, toolCalls: reasoningDsmlCalls } = dsmlReasoningExtractor.feed(delta.reasoning_content)
             const thinking = text + reasoning
             if (thinking.length > 0) {
-              let block = blocks.find(candidate => candidate.kind === 'reasoning')
-              if (block === undefined) {
-                block = { index: nextIndex++, kind: 'reasoning', text: '' }
-                blocks.push(block)
-                yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+              // 死循环守卫：与上面 `emitDsmlFeed` 的 `reasoning` 分支同一判据，
+              // 两条出口都要接（漏一处就等于漏一条路径）。
+              //
+              // ⚠️ 守卫必须**同时包住** `block.text += thinking` 与 `yield`
+              // 两行 —— 只拦 yield 的话，累积文本仍含循环内容，收尾的截断
+              // 就失效了。这里**只跳过发射**：止损（`reader.cancel()` + `break`）
+              // 在本 chunk 行循环处理完之后执行（见下方 ★ 止损块），故同帧的
+              // usage 记账不受影响；**也不能用 `continue`**（会连带跳过本帧
+              // 之后的 usage 记账）。
+              if (loopGuard !== undefined) {
+                if (loopGuard.observe(thinking)) loopDetected = true
               }
-              block.text += thinking
-              yield { type: 'reasoning-delta', index: block.index, text: thinking }
+              if (!loopDetected) {
+                let block = blocks.find(candidate => candidate.kind === 'reasoning')
+                if (block === undefined) {
+                  block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                  blocks.push(block)
+                  yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                }
+                block.text += thinking
+                yield { type: 'reasoning-delta', index: block.index, text: thinking }
+              }
             }
             for (const call of reasoningDsmlCalls) {
               // 同 delta 路径：名字不可用者一个 chunk 都不产出（见上）。
@@ -1367,6 +1412,22 @@ export class CodeArtsAdapter extends LlmAdapter {
             }
           }
         }
+        // ★ 止损（终审 C1）：命中死循环后**中止上游**，否则 128000 token 照烧。
+        // 原实现只跳过下行累积/发射，`for (;;)` 仍把流读到底 —— 实测上游
+        // 200 帧被读 200 帧（守卫在 ~2304 字符即命中，99.5% 的额度仍被消耗）。
+        //
+        // ⚠️ 位置：内层行循环**之后**、外层 `for (;;)` 末尾 —— 同一 chunk 里已到达
+        // 的 `usage` / `[DONE]` 因此仍会被处理，但命中后**立即**退出，不再读下一块。
+        //
+        // ⚠️ 只 cancel **reader**，绝不 abort `options.signal`：后者是调用方信号，
+        // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+        // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+        // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+        // 「正常止损」变成一次失败。
+        if (loopDetected) {
+          await reader.cancel().catch(() => {})
+          break
+        }
       }
     } finally {
       reader.releaseLock()
@@ -1391,6 +1452,19 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 内嵌工具块），正文由工具调用承担，不再把推理复制为可见文本。
     const textBlock = blocks.find(block => block.kind === 'text')
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
+    // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+    // **权威覆盖**（已由 `scripts/verify-blockend-override.ts` 实证）：
+    // 即便前面已 yield 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+    //
+    // ⚠️ 行首 `course` / `课` 泄漏清洗（`stripCourseLeak`）**在此处一次性完成**：
+    // `reasoningText` 同时供 `reasoningHasDsml` 判定、`visible` 回退与
+    // reasoning `block-end` 使用，故在此清洗可覆盖全部三处出口，
+    // 不会出现「正文干净而 Think 区仍脏」或反之的不一致。
+    const reasoningText = stripCourseLeakIfEnabled(
+      reasoningBlock !== undefined && loopDetected && loopGuard?.cutAt !== undefined
+        ? reasoningBlock.text.slice(0, loopGuard.cutAt)
+        : reasoningBlock?.text ?? '',
+    )
     // visible 回退：正文为空且无工具调用时，用推理文本填充可见区（GLM 端点
     // 偶尔把整个回答作为 reasoning_content 输出）。但若推理含 DSML 标签
     // （deepseek-v4 在推理中引用 DSML 语法讨论实现方案，非完整工具调用块），
@@ -1398,10 +1472,14 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 终止或循环（实测 session-a69fa289 turn2 step26：推理仅含 DSML 闭合
     // 标签片段，visible 回退复制到正文后任务终止）。此时正文留空，推理仍
     // 在 Think 区域可见。
-    const reasoningHasDsml = reasoningBlock !== undefined && reasoningBlock.text.includes('｜DSML｜')
+    //
+    // ⚠️ 回退必须用**截断后**的 `reasoningText`，不能用 `reasoningBlock.text`：
+    // 命中死循环时正文恰好为空且无工具调用，用原文会把病态循环全文复制进
+    // 正文块并持久化，下次重放又要重新吃一遍（正是本守卫要根除的问题）。
+    const reasoningHasDsml = reasoningText.includes('｜DSML｜')
     const visible = textBlock !== undefined && textBlock.text !== ''
       ? textBlock.text
-      : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningBlock.text : ''
+      : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningText : ''
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
       // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
@@ -1425,7 +1503,9 @@ export class CodeArtsAdapter extends LlmAdapter {
       yield { type: 'block-end', index: textBlock?.index ?? nextIndex, block: { type: 'text', text: visible } }
     }
     if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
-      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+      if (reasoningText !== '') {
+        yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningText } }
+      }
     }
     // finish_reason 映射顺序很关键：'length'（输出被 max_tokens 截断）必须优先于
     // 工具调用检查。若先看 toolOrder.length > 0，截断的工具调用会被报告为
@@ -1438,12 +1518,17 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 非 stop —— 否则模型本意调工具、harness 却认为「正常答完了」，
     // 又是一次无报错中断（与 `openai-compat.ts` 同因同修）。
     const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
-    const reason = finishReason === 'length'
-      || droppedUnnamedCalls && toolOrder.length === 0
+    const reason = loopDetected
+      // 思考死循环：截断并报可重试。**优先级最高**（高于 tool_calls）——
+      // 循环中生成的工具调用参数不可信；且若无可用调用，落到 `stop` 会让
+      // 任务静默中断。
       ? { kind: 'max-tokens' as const }
-      : finishReason === 'tool_calls' || toolOrder.length > 0
-        ? { kind: 'tool-calls' as const }
-        : { kind: 'stop' as const }
+      : finishReason === 'length'
+        || (droppedUnnamedCalls && toolOrder.length === 0)
+        ? { kind: 'max-tokens' as const }
+        : finishReason === 'tool_calls' || toolOrder.length > 0
+          ? { kind: 'tool-calls' as const }
+          : { kind: 'stop' as const }
     yield { type: 'finish', reason }
   }
 

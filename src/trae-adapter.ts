@@ -44,7 +44,7 @@ import {
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
-import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -325,7 +325,13 @@ function serializeTraeMessages(
 
   for (const message of messages) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -1057,6 +1063,16 @@ export class TraeAdapter extends LlmAdapter {
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
+    /**
+     * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+     * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
+     *
+     * 与 buddy 同因：`reasoning_tokens` **计入** `completion_tokens`，思考陷入
+     * 病态重复就把输出额度烧光、正文零产出，而 `finish` 若是 `stop`，UI 上
+     * 完全看不出错误。
+     */
+    const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let loopDetected = false
     const toolCalls = new Map<number, {
       index: number
       text: string
@@ -1157,14 +1173,32 @@ export class TraeAdapter extends LlmAdapter {
                       yield { type: 'text-delta', index: block.index, text: delta.content as string }
                     }
                     if (delta.reasoning_content !== undefined) {
-                      let block = blocks.find(c => c.kind === 'reasoning')
-                      if (block === undefined) {
-                        block = { index: nextIndex++, kind: 'reasoning', text: '' }
-                        blocks.push(block)
-                        yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                      // 死循环守卫：命中后不再累积、不再发射。
+                      //
+                      // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` +
+                      // `break`）在本 chunk 的行循环**全部处理完之后**、外层
+                      // `for (;;)` 末尾执行（见下方 ★ 止损块）—— 这样同一 chunk
+                      // 里已到达的 `token_usage` / `done` 仍会被处理。
+                      //
+                      // ⚠️ 也**不能用 `continue`**（Task 2 审查发现，已独立复现）：
+                      // 它会连带跳过本帧位于 reasoning 分支**之后**的处理。
+                      // 本 provider 的 `usage` 走**独立** `token_usage` 事件、
+                      // 不在此帧内，故被丢的是**同帧的 `tool_calls`**（一个
+                      // `output` 事件确实可能同时携带两者，实测复现）。故用
+                      // `if (!loopDetected)` 守卫分支体。
+                      if (loopGuard !== undefined) {
+                        if (loopGuard.observe(delta.reasoning_content as string)) loopDetected = true
                       }
-                      block.text += delta.reasoning_content as string
-                      yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content as string }
+                      if (!loopDetected) {
+                        let block = blocks.find(c => c.kind === 'reasoning')
+                        if (block === undefined) {
+                          block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                          blocks.push(block)
+                          yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                        }
+                        block.text += delta.reasoning_content as string
+                        yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content as string }
+                      }
                     }
                     if (delta.tool_calls !== undefined) {
                       const calls = delta.tool_calls as Array<Record<string, unknown>>
@@ -1263,6 +1297,23 @@ export class TraeAdapter extends LlmAdapter {
           }
           // 注释行（":"）或其他忽略
         }
+        // ★ 止损（终审 C1）：命中死循环后**中止上游**，否则 128000 token 照烧。
+        // 原实现只跳过下行累积/发射，`for (;;)` 仍把流读到底 —— 实测上游
+        // 200 帧被读 200 帧（守卫在 ~2304 字符即命中，99.5% 的额度仍被消耗）。
+        //
+        // ⚠️ 位置：内层行循环**之后**、外层 `for (;;)` 末尾 —— 同一 chunk 里已到达
+        // 的 `token_usage` / `done` 事件因此仍会被处理，但命中后**立即**退出，
+        // 不再读下一块。
+        //
+        // ⚠️ 只 cancel **reader**，绝不 abort `options.signal`：后者是调用方信号，
+        // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+        // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+        // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+        // 「正常止损」变成一次失败。
+        if (loopDetected) {
+          await reader.cancel().catch(() => {})
+          break
+        }
       }
     } finally {
       reader.releaseLock()
@@ -1302,24 +1353,43 @@ export class TraeAdapter extends LlmAdapter {
       }
     }
     if (textBlock !== undefined) {
-      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      yield {
+        type: 'block-end',
+        index: textBlock.index,
+        block: { type: 'text', text: stripCourseLeakIfEnabled(textBlock.text) },
+      }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
     if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
-      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+      // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+      // **权威覆盖**（已由 `scripts/verify-blockend-override.ts` 实证）：
+      // 即便前面已 yield 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+      const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
+        ? reasoningBlock.text.slice(0, loopGuard.cutAt)
+        : reasoningBlock.text
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
+      if (cleanedReasoning !== '') {
+        yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
+      }
     }
     // 丢弃了无名 tool-call 且没有留下任何可用调用时，报 max-tokens 而非 stop ——
     // 否则模型本意调工具、harness 却认为「正常答完了」（无报错中断）。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
     const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
-    const reason = finishReason === 'length'
-      || (finishReason === undefined && toolOrder.length > 0)
-      || argsTruncated
-      || (droppedUnnamedCalls && toolOrder.length === 0)
+    const reason = loopDetected
+      // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
+      // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
       ? { kind: 'max-tokens' as const }
-      : finishReason === 'tool_calls' || toolOrder.length > 0
-        ? { kind: 'tool-calls' as const }
-        : { kind: 'stop' as const }
+      : finishReason === 'length'
+        || (finishReason === undefined && toolOrder.length > 0)
+        || argsTruncated
+        || (droppedUnnamedCalls && toolOrder.length === 0)
+        ? { kind: 'max-tokens' as const }
+        : finishReason === 'tool_calls' || toolOrder.length > 0
+          ? { kind: 'tool-calls' as const }
+          : { kind: 'stop' as const }
     yield { type: 'finish', reason }
   }
 }

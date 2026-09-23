@@ -30,7 +30,7 @@ import {
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
-import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -262,7 +262,13 @@ function serializeMessages(
 
   for (const message of messages) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCallBlocks = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -1145,6 +1151,16 @@ export class BuddyAdapter extends LlmAdapter {
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
+    /**
+     * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+     * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
+     *
+     * 本路径正是用户实际报障的那条（`workbuddy/deepseek-v4.1-flash` 报
+     * 「已达到输出 token 上限」）：`reasoning_tokens` 计入 `completion_tokens`，
+     * 思考陷入病态重复就把 128000 额度烧光、正文零产出。
+     */
+    const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let loopDetected = false
     const toolCalls = new Map<number, {
       index: number
       text: string
@@ -1249,14 +1265,29 @@ export class BuddyAdapter extends LlmAdapter {
             yield { type: 'text-delta', index: block.index, text: delta.content }
           }
           if (delta?.reasoning_content) {
-            let block = blocks.find(candidate => candidate.kind === 'reasoning')
-            if (block === undefined) {
-              block = { index: nextIndex++, kind: 'reasoning', text: '' }
-              blocks.push(block)
-              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            // 死循环守卫：命中后不再累积、不再发射。
+            //
+            // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + `break`）在
+            // 本 chunk 的行循环**全部处理完之后**、外层 `for (;;)` 末尾执行（见下方
+            // ★ 止损块）—— 这样同一 chunk 里已到达的 usage / [DONE] 仍会被处理。
+            //
+            // ⚠️ 也**不能用 `continue`**（Task 2 审查发现，已独立复现）：它会
+            // 连带跳过本帧位于 reasoning 分支**之后**的 `usage` 与 `tool_calls`
+            // —— 「reasoning + usage 同帧」时 usage 被静默丢弃（token 记账
+            // 缺失）。故用 `if (!loopDetected)` 守卫分支体。
+            if (loopGuard !== undefined) {
+              if (loopGuard.observe(delta.reasoning_content)) loopDetected = true
             }
-            block.text += delta.reasoning_content
-            yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content }
+            if (!loopDetected) {
+              let block = blocks.find(candidate => candidate.kind === 'reasoning')
+              if (block === undefined) {
+                block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                blocks.push(block)
+                yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+              }
+              block.text += delta.reasoning_content
+              yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content }
+            }
           }
           for (const call of delta?.tool_calls ?? []) {
             const wireIndex = call.index ?? 0
@@ -1328,6 +1359,22 @@ export class BuddyAdapter extends LlmAdapter {
             }
           }
         }
+        // ★ 止损（终审 C1）：命中死循环后**中止上游**，否则 128000 token 照烧。
+        // 原实现只跳过下行累积/发射，`for (;;)` 仍把流读到底 —— 实测上游
+        // 200 帧被读 200 帧（守卫在 ~2304 字符即命中，99.5% 的额度仍被消耗）。
+        //
+        // ⚠️ 位置：内层行循环**之后**、外层 `for (;;)` 末尾 —— 同一 chunk 里已到达
+        // 的 `usage` / `[DONE]` 因此仍会被处理，但命中后**立即**退出，不再读下一块。
+        //
+        // ⚠️ 只 cancel **reader**，绝不 abort `options.signal`：后者是调用方信号，
+        // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+        // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+        // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+        // 「正常止损」变成一次失败。
+        if (loopDetected) {
+          await reader.cancel().catch(() => {})
+          break
+        }
       }
     } finally {
       reader.releaseLock()
@@ -1358,11 +1405,26 @@ export class BuddyAdapter extends LlmAdapter {
       }
     }
     if (textBlock !== undefined) {
-      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      yield {
+        type: 'block-end',
+        index: textBlock.index,
+        block: { type: 'text', text: stripCourseLeakIfEnabled(textBlock.text) },
+      }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
     if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
-      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+      // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+      // **权威覆盖**（已由 `scripts/verify-blockend-override.ts` 实证）：
+      // 即便前面已 yield 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+      const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
+        ? reasoningBlock.text.slice(0, loopGuard.cutAt)
+        : reasoningBlock.text
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
+      if (cleanedReasoning !== '') {
+        yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
+      }
     }
     // 三种"不完整"都必须报告 max-tokens 而非 tool-calls，否则 harness 会
     // 执行残缺调用、报 INVALID_ARGS，并把脏参数持久化进会话历史：
@@ -1383,14 +1445,18 @@ export class BuddyAdapter extends LlmAdapter {
      * （不完整、可重试）。同批若还有可用调用，则照常报 tool-calls。
      */
     const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
-    const reason = finishReason === 'length'
-      || finishReason === undefined && toolOrder.length > 0
-      || argsTruncated
-      || droppedUnnamedCalls && toolOrder.length === 0
+    const reason = loopDetected
+      // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
+      // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
       ? { kind: 'max-tokens' as const }
-      : finishReason === 'tool_calls' || toolOrder.length > 0
-        ? { kind: 'tool-calls' as const }
-        : { kind: 'stop' as const }
+      : finishReason === 'length'
+        || finishReason === undefined && toolOrder.length > 0
+        || argsTruncated
+        || droppedUnnamedCalls && toolOrder.length === 0
+        ? { kind: 'max-tokens' as const }
+        : finishReason === 'tool_calls' || toolOrder.length > 0
+          ? { kind: 'tool-calls' as const }
+          : { kind: 'stop' as const }
     yield { type: 'finish', reason }
   }
 }

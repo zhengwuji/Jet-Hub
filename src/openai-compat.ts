@@ -32,11 +32,15 @@
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
+  createReasoningLoopDetector,
   hasUsableToolName,
+  isReasoningLoopGuardEnabled,
   isTruncatedArguments,
   normalizeToolArguments,
   readWithIdleTimeout,
   resolveToolPairing,
+  stripCourseLeakFromHistoryContent,
+  stripCourseLeakIfEnabled,
 } from './sse.js'
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -157,7 +161,13 @@ export function serializeMessages(
 
   for (const message of messages) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -323,6 +333,12 @@ export async function* consumeOpenAiSse(
 
   const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
   let nextIndex = 0
+  /**
+   * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+   * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
+   */
+  const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+  let loopDetected = false
   const toolCalls = new Map<number, {
     index: number
     text: string
@@ -513,14 +529,33 @@ export async function* consumeOpenAiSse(
         // 同样必须用 `typeof === 'string'`：reasoning_content 也会显式返回 null。
         const reasoningDelta = delta?.reasoning_content
         if (typeof reasoningDelta === 'string' && reasoningDelta.length > 0) {
-          let block = blocks.find(candidate => candidate.kind === 'reasoning')
-          if (block === undefined) {
-            block = { index: nextIndex++, kind: 'reasoning', text: '' }
-            blocks.push(block)
-            yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+          // 死循环守卫：命中后**不再累积、不再发射**该增量。
+          // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + `break`）在
+          // 本 chunk 的行循环**全部处理完之后**、外层 `for (;;)` 末尾执行（见下方
+          // ★ 止损块）—— 这样同一 chunk 里已到达的 usage / [DONE] 仍会被处理。
+          // 若在此处直接 `break`，本 chunk 剩余的行会被整块跳过。
+          //
+          // ⚠️ 也**不能用 `continue`**（审查发现，已独立复现）：`continue` 跳过的是
+          // 本帧**剩余全部**处理，而 `usage` 与 `tool_calls` 都在 reasoning 分支
+          // **之后** —— 于是「reasoning + usage 同帧」时 usage 被静默丢弃
+          // （token 记账缺失）。实测：混合帧收到 **0 个** usage chunk，而对照组
+          // （未命中）为 **1 个**。
+          // 可达性：扫描 281 会话 / **27949 个 attempt**，reasoning 帧与 usage 帧
+          // 时间戳完全相同的次数为 **0**（相差 ≤2ms 也为 0）—— 真实流量中不可达，
+          // 但修复成本为零，故仍按正确写法实现。
+          if (loopGuard !== undefined) {
+            if (loopGuard.observe(reasoningDelta)) loopDetected = true
           }
-          block.text += reasoningDelta
-          yield { type: 'reasoning-delta', index: block.index, text: reasoningDelta }
+          if (!loopDetected) {
+            let block = blocks.find(candidate => candidate.kind === 'reasoning')
+            if (block === undefined) {
+              block = { index: nextIndex++, kind: 'reasoning', text: '' }
+              blocks.push(block)
+              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            }
+            block.text += reasoningDelta
+            yield { type: 'reasoning-delta', index: block.index, text: reasoningDelta }
+          }
         }
         for (const call of delta?.tool_calls ?? []) {
           const wireIndex = call.index ?? 0
@@ -598,6 +633,22 @@ export async function* consumeOpenAiSse(
           }
         }
       }
+      // ★ 止损（终审 C1）：命中死循环后**中止上游**，否则 128000 token 照烧。
+      // 原实现只跳过下行累积/发射，`for (;;)` 仍把流读到底 —— 实测上游
+      // 200 帧被读 200 帧（守卫在 ~2304 字符即命中，99.5% 的额度仍被消耗）。
+      //
+      // ⚠️ 位置：内层行循环**之后**、外层 `for (;;)` 末尾 —— 同一 chunk 里已到达
+      // 的 `usage` / `[DONE]` 因此仍会被处理，但命中后**立即**退出，不再读下一块。
+      //
+      // ⚠️ 只 cancel **reader**，绝不 abort `options.signal`：后者是调用方信号，
+      // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+      // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+      // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+      // 「正常止损」变成一次失败。
+      if (loopDetected) {
+        await reader.cancel().catch(() => {})
+        break
+      }
     }
   } finally {
     reader.releaseLock()
@@ -628,11 +679,25 @@ export async function* consumeOpenAiSse(
     }
   }
   if (textBlock !== undefined) {
-    yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+    // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+    yield {
+      type: 'block-end',
+      index: textBlock.index,
+      block: { type: 'text', text: stripCourseLeakIfEnabled(textBlock.text) },
+    }
   }
   const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
   if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
-    yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+    // 命中死循环时只保留循环前的干净前缀（`cutAt`）。
+    // 实测 `BlockAssembler` 的 `block-end` 是**权威覆盖**：即便前面已 yield
+    // 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+    const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
+      ? reasoningBlock.text.slice(0, loopGuard.cutAt)
+      : reasoningBlock.text
+    const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
+    if (cleanedReasoning !== '') {
+      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
+    }
   }
   // 三种「不完整」都必须报告 max-tokens 而非 tool-calls：
   // - 'length'：被 max_tokens 显式截断；
@@ -691,7 +756,11 @@ export async function* consumeOpenAiSse(
    */
   const truncatedStream = finishReason === undefined && !streamEnded
 
-  const reason = finishReason === 'length'
+  const reason = loopDetected
+    // 思考死循环：截断并报可重试。优先级最高 —— 循环中生成的工具调用
+    // 参数不可信，且若无任何可用调用，落到 `stop` 会让任务静默中断。
+    ? { kind: 'max-tokens' as const }
+    : finishReason === 'length'
     || incompleteTools
     || truncatedStream
     || argsTruncated
