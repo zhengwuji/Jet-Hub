@@ -37,6 +37,28 @@
 5. **prod 的 `client_id` 是 `J_a`（`e883ade2-…`），不是 `G_a`**。源码 `client_id: i ? J_a : G_a`，而调用点 `loginWithDeviceFlow` 传的第 4 参是 **`isProd()`**（`$Oa(){return "prod"===db()}`）—— prod 为 `true` 故用 `J_a`；`G_a`（`e93fe488-…`）只在 daily/test 用。
    ⚠️ **真实缺陷**（用户报障）：初版把第 4 参误读成「useIdeClientId」，于是 prod 用了 `G_a`，GitHub 授权点击后页面报「**参数无效 / 你可以稍后前往 IDE 客户端并登录Qoder**」。根因是服务端在**授权回调阶段**才校验 client_id。
    ⚠️ **只靠入口 302 检查发现不了该错误**：`GET /device/selectAccounts` 对**任一** client_id（含全零 UUID）都返回 302。必须在源码层面核对第 4 参语义。见 `src/qoder-product.ts` 的 `clientId` / `testClientId` 字段注释。
+6. **`options.tools` 必须真的下发到请求体顶层 `tools`，且工具历史要保留 `tool_calls` / `tool_call_id`**（**OpenAI 风格，不是 Anthropic 风格**）。
+   客户端源码依据：`$Hc(A)` 把工具序列化成
+   `{type:'function', function:{name, description?, parameters?}}`，写入请求体**顶层**
+   `tools`（`A6e()`：`tools: o?.tools ?? []`）；assistant 的工具调用由 `t2c()` 转成
+   `tool_calls:[{id, type:'function', index, function:{name, arguments}}]`；
+   工具结果由 `A2c()` 产出 `{role:'tool', content, tool_call_id}`。
+   ⚠️ **另有一条 Anthropic 风格分支**（`IOc()` 的 `input_schema` + `tool_use_id`），
+   那是给 **Anthropic BYOK** 用的，加密端点**不吃那套** —— 别照它实现。
+   ⚠️ **真实缺陷**（用户报障）：「使用本插件的 qoder 的 qwen3.8-flash，执行任务出现
+   任务调用 xml 泄露任务终止」。两处根因：① `src/qoder-adapter.ts` **从不消费
+   `options.tools`**（其余四个适配器都消费），`qoder-wasm.ts` 又把请求体的 `tools`
+   **硬编码为 `[]`** → 模型在 wire 上拿不到任何函数 schema，只能用**正文里的 XML 文本**
+   臆造工具调用，harness 认不出 → 任务终止；② 适配器的 history 过滤器写成
+   「只留 `content` 为字符串的消息」，而 assistant 带工具调用时 `content` 是 **`null`**
+   （OpenAI 规范）→ 整条被丢，且 `role:'tool'` 的 `tool_call_id` 也被丢 → 模型看不到
+   自己调用过什么，反复重调同一工具或凭空编造结果（与 TRAE 那条同型缺陷一致）。
+   ⚠️ **加密端点的请求体本地不可解**，无法靠抓包验证 —— 故把 payload 构造抽成纯函数
+   `buildQoderInferPayload()`（`src/qoder-wasm.ts`），再由 `buildQoderTools()` /
+   `buildQoderHistory()`（`src/qoder-adapter.ts`）单测锁死。
+   排查脚本 `scripts/probe-qoder-tools.mjs`（只读，打印上述三个客户端函数的定义；
+   ⚠️ 解码函数名与 XOR 密钥**随版本会变**，脚本会自行探测）。回归用例
+   `tests/unit/qoder-tools.spec.ts`。
 
 ⚠️ **`src/qoder-auth-wasm.wasm`（298 KB）随插件分发**，构建时由 `scripts/copy-assets.mjs` 复制到 `lib/`（`tsc` 不搬 `.wasm`）。`build:all` 已含该步骤。
 

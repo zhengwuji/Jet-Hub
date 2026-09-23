@@ -29,7 +29,7 @@ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelIn
 import { randomUUID } from 'node:crypto'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
-import { QoderEncryptedInfer, type QoderInferRequest } from './qoder-wasm.js'
+import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import {
@@ -44,6 +44,100 @@ import {
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `QODER.id`）。 */
 export const PROVIDER = 'qoder'
+
+/**
+ * 把 DSH 的工具 schema 映射成加密端点认的 `tools[]`。
+ *
+ * 形态取自客户端 `$Hc(A)`：
+ * `{type:'function', function:{name, description?, parameters?}}` ——
+ * `description` / `parameters` **缺省时该键不出现**（不是填空串/空对象）。
+ *
+ * ⚠️ 这是 `options.tools` 的**唯一出口**。适配器若不下发它，模型在 wire 上
+ * 看不到任何函数定义，只能用正文里的 XML 文本臆造工具调用 —— 用户报障
+ * 「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」的根因。
+ *
+ * @param tools - DSH 的 `GenerateOptions.tools`（可能缺席）。
+ * @returns 可直接写入请求体顶层 `tools` 的数组；无工具时为空数组。
+ */
+export function buildQoderTools(
+  tools: readonly { name: string; description: string; parameters: Record<string, unknown> }[] | undefined,
+): QoderInferTool[] {
+  if (tools === undefined || tools.length === 0) return []
+  return tools.map((tool) => ({
+    type: 'function' as const,
+    function: {
+      name: tool.name,
+      ...(tool.description.length > 0 ? { description: tool.description } : {}),
+      ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
+    },
+  }))
+}
+
+/** {@link buildQoderHistory} 的入参：DSH 序列化后的 wire 消息（OpenAI 形态）。 */
+interface QoderWireMessage {
+  role?: unknown
+  content?: unknown
+  tool_calls?: unknown
+  tool_call_id?: unknown
+}
+
+/** 把 wire 消息的 content 归一化为字符串（工具调用消息的正文是空串）。 */
+function qoderContentText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((block): block is { type: string; text: unknown } =>
+        typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'text')
+      .map((block) => String(block.text))
+      .join('')
+  }
+  // `null`（assistant 只带 tool_calls 时的 OpenAI 规范值）与畸形值都退化为空串：
+  // 客户端 `t2c()` 的 content 恒为字符串（`udn(r, '')`）。
+  return ''
+}
+
+/**
+ * 把 `serializeMessages` 的 wire 消息转成加密端点的 `messages[]`。
+ *
+ * ## 真实缺陷（本次修复）
+ *
+ * 早期实现写成「只保留 `content` 为字符串的消息」：
+ *
+ * ```ts
+ * messages.filter((m) => typeof m.content === 'string')
+ * ```
+ *
+ * 这有两个后果，都会让**多步工具调用**彻底坏掉：
+ * 1. assistant 带工具调用时 `content` 是 **`null`**（OpenAI 规范）→ 整条消息
+ *    被丢弃，模型**看不到自己调用过什么**；
+ * 2. `role:'tool'` 消息的 `tool_call_id` 被一并丢掉 → 工具结果无法与调用配对。
+ *
+ * 于是模型只能反复重调同一个工具或凭空编造结果 —— 与 TRAE 那条已记录的
+ * 同型缺陷（「消息序列化漏做 → 模型看不到工具调用与结果」）完全一致。
+ *
+ * 形态对齐客户端：assistant 挂 `tool_calls`，`role:'tool'` 挂 `tool_call_id`。
+ */
+export function buildQoderHistory(messages: readonly QoderWireMessage[]): QoderInferMessage[] {
+  const history: QoderInferMessage[] = []
+  for (const message of messages) {
+    if (typeof message.role !== 'string') continue
+    const content = qoderContentText(message.content)
+    const toolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+      ? (message.tool_calls as QoderInferToolCall[])
+      : undefined
+    const toolCallId = typeof message.tool_call_id === 'string' ? message.tool_call_id : undefined
+    // 三者皆空的消息没有承载意义（如只有 reasoning 的帧），跳过以免发出
+    // 「空 assistant」这种会让上游困惑的条目。
+    if (content.length === 0 && toolCalls === undefined && toolCallId === undefined) continue
+    history.push({
+      role: message.role,
+      content,
+      ...(toolCalls === undefined ? {} : { tool_calls: toolCalls }),
+      ...(toolCallId === undefined ? {} : { tool_call_id: toolCallId }),
+    })
+  }
+  return history
+}
 
 /**
  * SSE 空闲超时（毫秒）。
@@ -272,10 +366,14 @@ export class QoderAdapter extends LlmAdapter {
     const userMessages = messages.filter((m) => m.role === 'user')
     const lastUser = userMessages.at(-1)
     const userText = typeof lastUser?.content === 'string' ? lastUser.content : ''
-    const history = messages
-      .filter((m): m is { role: string; content: string } =>
-        typeof m.role === 'string' && typeof m.content === 'string')
-      .map((m) => ({ role: m.role, content: m.content }))
+    // ⚠️ 必须走 buildQoderHistory：早期内联的「只留 content 为字符串」过滤器
+    // 会丢掉 assistant 的 tool_calls（content 为 null）与 tool 的 tool_call_id，
+    // 使多步工具调用彻底坏掉（模型看不到自己调用过什么）。
+    const history = buildQoderHistory(messages)
+    // ⚠️ 工具定义必须真的下发：加密端点的顶层 `tools`。不下发时模型只能
+    // 用正文里的 XML 文本臆造工具调用 → harness 认不出 → 任务终止
+    // （用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」）。
+    const tools = buildQoderTools(options.tools)
 
     const fallback = this.fallbackIndex.get(options.model)
 
@@ -296,6 +394,9 @@ export class QoderAdapter extends LlmAdapter {
         ...(systemText !== undefined ? { systemText } : {}),
         isReasoning: fallback?.supportsThinking ?? false,
         history,
+        // 工具定义：这是模型**唯一**能学到函数 schema 的通道，
+        // 缺了它模型只能用正文 XML 臆造调用（真实缺陷）。
+        tools,
         ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
         ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
         ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),

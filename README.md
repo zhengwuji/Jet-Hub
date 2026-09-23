@@ -934,6 +934,36 @@ wasm-bindgen 约定把它接起来**复用**（`src/qoder-wasm.ts`）。
 > **不入库**的内部文档 `docs/qoder-encryption-notes.md` 中 ——
 > 该文档含逆向分析，刻意不随仓库分发。
 
+### 工具调用（tools）
+
+加密端点认 **OpenAI 风格**的工具描述，落在请求体**顶层** `tools`：
+
+```jsonc
+"tools": [{ "type": "function",
+            "function": { "name": "read", "description": "…", "parameters": { … } } }]
+```
+
+assistant 的工具调用挂 `tool_calls`，工具结果用 `role:"tool"` + `tool_call_id`。
+
+⚠️ **真实缺陷**（用户报障）：「使用本插件的 qoder 的 qwen3.8-flash，
+执行任务出现任务调用 xml 泄露任务终止」。两处根因：
+
+1. 适配器**从不消费 `options.tools`**（其余四个 provider 都消费），且
+   `qoder-wasm.ts` 把请求体的 `tools` **硬编码为 `[]`** → 模型在 wire 上
+   拿不到任何函数 schema，只能用**正文里的 XML 文本**臆造工具调用，
+   harness 认不出 → 任务终止；
+2. history 过滤器写成「只留 `content` 为字符串的消息」，而 assistant 带工具
+   调用时 `content` 是 **`null`**（OpenAI 规范）→ 整条被丢，`role:"tool"` 的
+   `tool_call_id` 也被丢 → 模型看不到自己调用过什么，反复重调同一工具或
+   凭空编造结果（与 TRAE 那条同型缺陷一致）。
+
+⚠️ **别照抄 Anthropic 风格**：客户端另有 `tool_use` / `input_schema` /
+`tool_use_id` 一套，那是给 **Anthropic BYOK** 用的分支，本端点不吃。
+
+⚠️ **加密端点的请求体本地不可解**，无法靠抓包验证 —— 故 payload 构造抽成
+纯函数 `buildQoderInferPayload()`，由 `buildQoderTools()` /
+`buildQoderHistory()` 与端到端替身共同锁死（`tests/unit/qoder-tools.spec.ts`）。
+
 ### 模型列表：17 个目录 key（**实测数据**）
 
 `listModels` 是**静态表**（不发网络请求）—— 远端目录需签名，运行时不做。
