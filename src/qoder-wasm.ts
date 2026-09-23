@@ -105,6 +105,42 @@ export interface QoderInferRequest {
 export interface QoderInferMessage {
   role: string
   content: string
+  /**
+   * 助手消息里的工具调用（OpenAI wire 形态）。
+   *
+   * ⚠️ 历史工具调用**必须回放**给上游，否则模型看不到「自己调过什么」，
+   * 会重复调用同一个工具或声称没有工具 —— 这是 qwen3.8f「不会调工具」
+   * 的成因之一（另一半是 `tools` 恒空，见 `QoderInferAsk.tools`）。
+   */
+  tool_calls?: readonly QoderToolCall[]
+  /** `role: 'tool'` 消息回填哪一个调用（对应 `tool_calls[].id`）。 */
+  tool_call_id?: string
+}
+
+/** 工具调用（OpenAI wire 形态）。 */
+export interface QoderToolCall {
+  id: string
+  type: 'function'
+  function: {
+    name: string
+    /** ⚠️ 必须是**字符串**（OpenAI wire 规范），不是对象。 */
+    arguments: string
+  }
+}
+
+/**
+ * 工具定义（OpenAI wire 形态）。
+ *
+ * ⚠️ 这是**发给上游的**规格，不是 harness 内部的 `ToolSpec` ——
+ * 适配器负责把后者映射成这个形状。
+ */
+export interface QoderToolSpec {
+  type: 'function'
+  function: {
+    name: string
+    description?: string
+    parameters?: unknown
+  }
 }
 
 /** 构造加密推理请求的入参。 */
@@ -164,6 +200,107 @@ export interface QoderInferAsk {
    * —— 服务端按 `business.type` 选路由池。
    */
   business?: Record<string, unknown>
+  /**
+   * **本轮可用的工具定义。**
+   *
+   * ⚠️ 这是 qwen3.8f（`qfmodel`）「无法调用工具」的**第二个成因**
+   * （第一个见 `business`）：payload 里原本硬编码 `tools: []`，
+   * 且 `QoderInferAsk` 上没有这个字段，适配器**无处可传** ——
+   * 于是上游收到的永远是空工具数组，自然无从产出 `tool_calls`。
+   *
+   * 纯文本会话（无工具）时保持 `undefined`，payload 仍产出 `[]`，
+   * **与修复前逐字节一致**（向后兼容，见 `buildInferPayload`）。
+   */
+  tools?: readonly QoderToolSpec[]
+}
+
+/**
+ * 构造加密推理请求的**明文 payload**。
+ *
+ * 抽成模块级纯函数有两个原因：
+ * 1. `prepareInfer` 返回的是 WASM 加密后的 body，测试无法直接断言内容；
+ *    而「工具是否真的进了请求体」必须在**加密前**验证。
+ * 2. 纯函数可单测，不需要加载 WASM。
+ *
+ * ⚠️ 所有字段结构都是复刻官方 `G4A()` / `Uyc()` 的，改动需谨慎：
+ * `chat_context` 不能是空对象（早期传空对象得到
+ * `[FAIL]node:... msg:Execution failed`）。
+ */
+export function buildInferPayload(ask: QoderInferAsk): Record<string, unknown> {
+  const isReasoning = ask.isReasoning ?? false
+  const text = ask.userText
+  const requestId = crypto.randomUUID()
+
+  const parameters: Record<string, unknown> = {}
+  if (ask.maxTokens !== undefined) parameters.max_tokens = ask.maxTokens
+  if (ask.reasoningEffort !== undefined) {
+    parameters.reasoning_effort = ask.reasoningEffort
+    parameters.enable_thinking = ask.reasoningEffort !== 'none'
+  }
+  if (ask.contextWindow !== undefined) parameters.context_length = ask.contextWindow
+
+  // 历史消息：**保留工具字段**。
+  // 旧实现只拷 `{role, content}`，把 assistant 的 `tool_calls` 与
+  // `role:'tool'` 的 `tool_call_id` 全丢了 —— 模型因此看不到自己调过什么。
+  const messages: QoderInferMessage[] = []
+  for (const m of ask.history ?? []) {
+    const line: QoderInferMessage = { role: m.role, content: m.content }
+    if (m.tool_calls !== undefined && m.tool_calls.length > 0) line.tool_calls = m.tool_calls
+    if (m.tool_call_id !== undefined) line.tool_call_id = m.tool_call_id
+    messages.push(line)
+  }
+  if (messages.length === 0) messages.push({ role: 'user', content: text })
+
+  return {
+    request_id: requestId,
+    request_set_id: requestId,
+    chat_record_id: requestId,
+    session_id: crypto.randomUUID(),
+    stream: true,
+    chat_task: 'FREE_INPUT',
+    chat_context: {
+      text,
+      features: [],
+      extra: {
+        context: [],
+        modelConfig: { key: ask.modelKey, is_reasoning: isReasoning },
+        originalContent: text,
+      },
+      chatPrompt: '',
+      imageUrls: null,
+    },
+    is_reply: true,
+    is_retry: false,
+    source: 1,
+    version: '3',
+    agent_id: 'agent_common',
+    task_id: 'common',
+    session_type: ask.sessionType ?? 'qodercli',
+    aliyun_user_type: '',
+    model_config: {
+      key: ask.modelKey,
+      // 官方 `Uyc()` 的 model_config 有 **10 个字段**，此处逐项对齐
+      // （早期只传 6 个）。
+      display_name: ask.displayName ?? '',
+      model: '',
+      format: ask.format ?? 'openai',
+      is_vl: ask.isVl ?? true,
+      is_reasoning: isReasoning,
+      api_key: '',
+      url: '',
+      source: ask.source ?? 'system',
+      max_input_tokens: ask.maxInputTokens ?? ask.contextWindow ?? 200_000,
+    },
+    custom_model: null,
+    system: ask.systemText ? [{ type: 'text', text: ask.systemText }] : [],
+    messages,
+    // ⚠️ 修复点（原为硬编码 `tools: []`）。
+    // 无工具时仍产出 `[]`，保证纯文本会话与修复前逐字节一致。
+    tools: ask.tools === undefined ? [] : [...ask.tools],
+    parameters,
+    // `business` 决定服务端路由（`sec_scan` → 安全池，其余 → 默认池）。
+    ...(ask.business === undefined ? {} : { business: ask.business }),
+  }
 }
 
 /**
@@ -496,73 +633,7 @@ export class QoderEncryptedInfer {
    */
   prepareInfer(ask: QoderInferAsk): QoderInferRequest {
     const g = this.g
-    const isReasoning = ask.isReasoning ?? false
-    const text = ask.userText
-    const requestId = crypto.randomUUID()
-
-    // 复刻官方 `G4A()` 的请求体结构。`chat_context` 不是空对象 ——
-    // 它承载本次提问文本与模型配置；早期传空对象会得到
-    // `[FAIL]node:... msg:Execution failed`。
-    const parameters: Record<string, unknown> = {}
-    if (ask.maxTokens !== undefined) parameters.max_tokens = ask.maxTokens
-    if (ask.reasoningEffort !== undefined) {
-      parameters.reasoning_effort = ask.reasoningEffort
-      parameters.enable_thinking = ask.reasoningEffort !== 'none'
-    }
-    if (ask.contextWindow !== undefined) parameters.context_length = ask.contextWindow
-
-    const messages: QoderInferMessage[] = []
-    for (const m of ask.history ?? []) messages.push({ role: m.role, content: m.content })
-    if (messages.length === 0) messages.push({ role: 'user', content: text })
-
-    const payload = {
-      request_id: requestId,
-      request_set_id: requestId,
-      chat_record_id: requestId,
-      session_id: crypto.randomUUID(),
-      stream: true,
-      chat_task: 'FREE_INPUT',
-      chat_context: {
-        text,
-        features: [],
-        extra: {
-          context: [],
-          modelConfig: { key: ask.modelKey, is_reasoning: isReasoning },
-          originalContent: text,
-        },
-        chatPrompt: '',
-        imageUrls: null,
-      },
-      is_reply: true,
-      is_retry: false,
-      source: 1,
-      version: '3',
-      agent_id: 'agent_common',
-      task_id: 'common',
-      session_type: ask.sessionType ?? 'qodercli',
-      aliyun_user_type: '',
-      model_config: {
-        key: ask.modelKey,
-        // 官方 `Uyc()` 的 model_config 有 **10 个字段**，此处逐项对齐
-        // （早期只传 6 个）。
-        display_name: ask.displayName ?? '',
-        model: '',
-        format: ask.format ?? 'openai',
-        is_vl: ask.isVl ?? true,
-        is_reasoning: isReasoning,
-        api_key: '',
-        url: '',
-        source: ask.source ?? 'system',
-        max_input_tokens: ask.maxInputTokens ?? ask.contextWindow ?? 200_000,
-      },
-      custom_model: null,
-      system: ask.systemText ? [{ type: 'text', text: ask.systemText }] : [],
-      messages,
-      tools: [],
-      parameters,
-      // `business` 决定服务端路由（`sec_scan` → 安全池，其余 → 默认池）。
-      ...(ask.business === undefined ? {} : { business: ask.business }),
-    }
+    const payload = buildInferPayload(ask)
 
     const result = g.callPointer((stack) => {
       const host = g.writeString(this.host); const hostLen = g.lastLength()
