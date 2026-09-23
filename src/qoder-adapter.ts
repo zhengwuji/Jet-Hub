@@ -29,7 +29,7 @@ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelIn
 import { randomUUID } from 'node:crypto'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
-import { QoderEncryptedInfer, type QoderInferRequest } from './qoder-wasm.js'
+import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderToolSpec } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
 import { QODER, type QoderFallbackModel, type QoderModelPromotion, type QoderProduct } from './qoder-product.js'
 import {
@@ -272,10 +272,76 @@ export class QoderAdapter extends LlmAdapter {
     const userMessages = messages.filter((m) => m.role === 'user')
     const lastUser = userMessages.at(-1)
     const userText = typeof lastUser?.content === 'string' ? lastUser.content : ''
-    const history = messages
-      .filter((m): m is { role: string; content: string } =>
-        typeof m.role === 'string' && typeof m.content === 'string')
-      .map((m) => ({ role: m.role, content: m.content }))
+    // ⚠️ 历史里**必须保留工具消息**（原实现按 `typeof content === 'string'`
+    // 一刀切，把 assistant 的 `tool_calls` 与 `role:'tool'` 的结果全滤掉了）。
+    //
+    // 后果：模型看不到「自己调过什么、结果是什么」，于是重复调用同一工具，
+    // 或直接声称没有可用工具 —— 这是 qwen3.8f「不会调工具」的两个成因之一
+    // （另一个是请求体 `tools` 恒空，见 `qoder-wasm.ts` 的 `buildInferPayload`）。
+    //
+    // `serializeMessages` 产出的已是标准 OpenAI wire 形态，
+    // 这里只做类型收窄，不再二次加工。
+    const history: QoderInferMessage[] = []
+    for (const m of messages) {
+      const role = typeof m.role === 'string' ? m.role : undefined
+      if (role === undefined) continue
+      // role:'tool' —— 工具结果回填，必须带 tool_call_id 才能配对。
+      if (role === 'tool') {
+        const callId = typeof m.tool_call_id === 'string' ? m.tool_call_id : undefined
+        if (callId === undefined) continue
+        history.push({
+          role,
+          content: typeof m.content === 'string' ? m.content : '',
+          tool_call_id: callId,
+        })
+        continue
+      }
+      // assistant 的 tool_calls（`serializeMessages` 已转成 OpenAI 形态）。
+      if (m.tool_calls !== undefined && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        const calls = (m.tool_calls as Array<{ id?: unknown; function?: { name?: unknown; arguments?: unknown } }>)
+          .map((call) => ({
+            id: String(call.id ?? ''),
+            type: 'function' as const,
+            function: {
+              name: String(call.function?.name ?? ''),
+              arguments: typeof call.function?.arguments === 'string'
+                ? call.function.arguments
+                : JSON.stringify(call.function?.arguments ?? {}),
+            },
+          }))
+          .filter((call) => call.id.length > 0 && call.function.name.length > 0)
+        if (calls.length > 0) {
+          history.push({
+            role,
+            content: typeof m.content === 'string' ? m.content : '',
+            tool_calls: calls,
+          })
+          continue
+        }
+      }
+      // 其余消息沿用旧口径：只接受字符串正文。
+      if (typeof m.content === 'string') history.push({ role, content: m.content })
+    }
+
+    /**
+     * 本轮可用工具（透传给上游）。
+     *
+     * ⚠️ 修复点：原实现**从不传 tools**，于是 `qoder-wasm.ts` 的 payload
+     * 恒为 `tools: []` —— 上游根本不知道有哪些工具可调。
+     * `options.tools` 是 harness 的 `ToolSpec`，映射为 OpenAI wire 形态。
+     */
+    const tools: QoderToolSpec[] | undefined = options.tools === undefined
+      ? undefined
+      : options.tools
+        .filter((tool) => typeof tool.name === 'string' && tool.name.length > 0)
+        .map((tool) => ({
+          type: 'function' as const,
+          function: {
+            name: tool.name,
+            ...(tool.description !== undefined ? { description: tool.description } : {}),
+            ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {}),
+          },
+        }))
 
     const fallback = this.fallbackIndex.get(options.model)
 
@@ -296,6 +362,10 @@ export class QoderAdapter extends LlmAdapter {
         ...(systemText !== undefined ? { systemText } : {}),
         isReasoning: fallback?.supportsThinking ?? false,
         history,
+        // ⚠️ 修复点：工具定义必须进请求体（原实现从不传，payload 恒 `tools: []`）。
+        // 无工具时保持 `undefined`，`buildInferPayload` 仍产出 `[]`，
+        // 与修复前的纯文本会话**逐字节一致**。
+        ...(tools !== undefined && tools.length > 0 ? { tools } : {}),
         ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
         ...(options.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
         ...(fallback?.supportsImage !== undefined ? { isVl: fallback.supportsImage } : {}),
