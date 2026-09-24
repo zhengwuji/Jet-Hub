@@ -44,8 +44,20 @@ export const CONFIG_PATH = '/v3/config'
 export const LOGIN_TIMEOUT_MS = 5 * 60 * 1000
 /** 轮询间隔（1 秒，对齐 IDE 的 setTimeout(o,1e3)）。 */
 export const POLL_INTERVAL_MS = 1000
-/** auth/state 请求超时（5 秒，对齐 IDE 的 timeout:5e3）。 */
-export const STATE_REQUEST_TIMEOUT_MS = 5_000
+/**
+ * auth/state 请求超时（10 秒）。
+ *
+ * ⚠️ 原为 5 秒（对齐 IDE 的 `timeout:5e3`），实测**不够**：Jet Hub 对
+ * WorkBuddy（国际版）点「+ 新建账号」时，本请求发往 `www.workbuddy.ai`，
+ * 用 Node 的 `fetch`（undici，与本插件运行时一致）连测 6 次稳定耗时
+ * **5860–7525 ms**，即每一次都会撞上 5 秒超时，用户侧表现为
+ * 「无法获取 WorkBuddy (国际版) 登录地址（Host 网络请求失败）」。
+ * 放宽到 10 秒后覆盖上述区间并留出余量。
+ *
+ * 该常量由 buddy / workbuddy 共用：放宽只影响「失败时多等 5 秒」，
+ * 不会拖慢 CodeBuddy（`copilot.tencent.com` 实测数百毫秒即返回）。
+ */
+export const STATE_REQUEST_TIMEOUT_MS = 10_000
 /** 其余控制面请求超时（token/account/refresh/config）。 */
 export const REQUEST_TIMEOUT_MS = 60_000
 
