@@ -7,6 +7,7 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { isCodeArtsBenefitModel } from './models.js'
 import { signRequestHuawei } from './sign.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
@@ -1659,7 +1660,13 @@ export class CodeArtsAdapter extends LlmAdapter {
 /** 在 ctx.llm 上注册 codearts 提供商路由和适配器。 */
 export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): CodeArtsAdapter {
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: 'CodeArts Agent', settingsNs: 'llm-codearts', settingsPath: [] },
+    {
+      provider: PROVIDER,
+      displayName: 'CodeArts Agent',
+      // 0.1.7 起 settings 命名空间只能是 profile 条目 id（见 settingsNamespaceFor）。
+      settingsNs: settingsNamespaceFor(ctx, 'llm-codearts'),
+      settingsPath: [],
+    },
   ])
   const adapter = new CodeArtsAdapter(options)
   ctx.llm.registerAdapter([PROVIDER], adapter)

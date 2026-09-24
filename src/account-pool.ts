@@ -1,78 +1,24 @@
 import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import Schema from '@deepseek-ai/schemastery'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
+import { createJetHubStore } from './jet-hub-store.js'
+import type { JetHubStore, ModelDisableMap } from './jet-hub-store.js'
 import type {
   CodeArtsCredential,
   ProviderAccountEntry,
   ProviderAccountStatus,
 } from './types.js'
 
+// 兼容既有的导入路径：命名空间名与黑名单类型原本定义在本模块。
+export { JET_HUB_NS } from './jet-hub-store.js'
+export type { ModelDisableMap } from './jet-hub-store.js'
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     accountPool: AccountPool
   }
 }
-
-/** Jet Hub schema namespace（必须在 ctx.settings 中注册后才能读写） */
-export const JET_HUB_NS = 'jet-hub'
-
-/**
- * 模型黑名单：provider id → **被关闭**的模型 id 列表。
- *
- * 采用**黑名单制**：只有出现在这里、且 `disabled` 为 true 的模型会被隐藏，
- * 未记录的模型一律视为默认打开。这样服务端新增模型时无需任何配置即自动可见，
- * 不会像白名单那样把新模型静默挡在门外。
- */
-export type ModelDisableMap = Record<string, Record<string, boolean>>
-
-/** 账号池在 settings 中存储的值结构。 */
-interface JetHubSettingsValue {
-  accounts?: ProviderAccountEntry[]
-  /** 模型黑名单（见 {@link ModelDisableMap}）。 */
-  disabledModels?: ModelDisableMap
-}
-
-/** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
-interface SettingsScopeLike {
-  get(): unknown
-  replace(section: object): Promise<void>
-}
-
-/** ctx.settings 服务的最小接口。schema 必须是 schemastery schema。 */
-interface SettingsServiceLike {
-  register(ns: string, schema: unknown): SettingsScopeLike
-  describe(options?: { redactSecrets?: boolean }): Array<{ ns: string; value: unknown }>
-}
-
-/**
- * Jet Hub 的 settings schema。
- *
- * 必须是 **schemastery schema**，不能是裸函数。schemastery 对象既可调用
- * （`schema(value)` 解析，满足 SettingsProvider.resolve 的用法），又有
- * `toJSON()` 与 `redactSecrets()` 所需的结构；而裸函数只有前者 ——
- * `settings.describe()` 会对每个注册项无条件调用 `schema.toJSON()`，
- * 裸函数会让整条 describe() 抛
- * `TypeError: registration.schema.toJSON is not a function`，
- * 进而使模型设置页、主题设置，以及 sidebar 的
- * `/sidebar/api/settings.get`、`/api/shell.get` 全部 500。
- *
- * 账号列表是动态结构，此处用 `Schema.array(Schema.any())` 承接，
- * 单项字段由 AccountPool 自身在读写时保证。
- */
-const jetHubSchema = Schema.object({
-  accounts: Schema.array(Schema.any()).default([]),
-  // 模型黑名单：对象（provider id → 模型 id → boolean）而非数组。
-  //
-  // 为什么用 `Schema.dict(Schema.any())` 而不是 `Schema.array(...)`：与账号
-  // 列表同理，单项字段由 AccountPool 自身在读写时保证；这里只需让 settings
-  // 的 schema 校验不把动态结构（任意 provider、任意模型 id）拒之门外。
-  //
-  // 为什么带 `.default({})`：namespace 首次注册时配置文件里没有该字段，
-  // 没有默认值的话 `scope.get()` 会返回 undefined，需在读取处层层判空。
-  disabledModels: Schema.dict(Schema.any()).default({}),
-})
 
 /**
  * 空黑名单的共享只读实例。
@@ -83,96 +29,57 @@ const jetHubSchema = Schema.object({
 const EMPTY_MODEL_SET: ReadonlySet<string> = new Set<string>()
 
 /**
- * 把 settings 里读到的原始值归一化为 {@link ModelDisableMap}。
- *
- * 配置文件可能被手工编辑过，也可能残留老版本格式（如数组），因此这里
- * 逐层校验：任何一层不是对象就丢弃那一层，只保留"provider → 模型 → true"
- * 这种合法结构，其余一律忽略而不是抛错——设置页读不出黑名单不该让整个
- * 账号管理功能不可用。
- */
-function sanitizeDisabledModels(raw: unknown): ModelDisableMap {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
-  const result: ModelDisableMap = {}
-  for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
-    const perProvider: Record<string, boolean> = {}
-    for (const [modelId, flag] of Object.entries(value as Record<string, unknown>)) {
-      // 只把显式 true 视为"关闭"；false / 其他值既不算关闭，也不写回内存，
-      // 避免 `disabledModelsFor` 的判定与配置文件内容产生分歧。
-      if (flag === true) perProvider[modelId] = true
-    }
-    // 空表不保留：让配置文件里不留 `{ provider: {} }` 这类无意义噪音。
-    if (Object.keys(perProvider).length > 0) result[provider] = perProvider
-  }
-  return result
-}
-
-/**
  * AccountPool —— 多账号管理核心
  *
  * 职责：
- * - 账号列表 CRUD（索引存于 ctx.settings namespace jet-hub
- *   → 配置文件，凭据存于 ctx.credentials，各自独立）
+ * - 账号列表 CRUD（索引走 {@link JetHubStore}，凭据存于 ctx.credentials，
+ *   两者各自独立）
  * - 获取指定 provider + 模型的下一个可用账号
  *   算法：enabled=true 且模型不在重置期内 → 取第一个
  * - 更新模型重置时间（收到限流错误后调用）
  *
- * 注意：DSH 的 settings 服务要求 namespace 先注册再读写，
- * 因此构造时调用 ctx.settings.register(JET_HUB_NS, schema)。
- * 注册失败（服务缺失）时退化为内存态，保证不抛错。
+ * 持久化后端按 DSH 版本能力探测（见 `src/jet-hub-store.ts`）：0.1.7 起
+ * `ctx.settings` 不再允许插件注册 namespace，故改用插件自有状态文档；
+ * 两者都不可用时退化为内存态，保证不抛错。
  */
 export class AccountPool {
-  /** 已注册的 settings scope；未注册成功时为 undefined。 */
-  private scope: SettingsScopeLike | undefined
+  /** 持久化后端；两个后端都不可用时是仅内存实现。 */
+  private readonly store: JetHubStore
   /**
    * 账号列表的**权威进程内副本**。
    *
-   * 不直接依赖 `scope.get()`：settings 服务的 resolved 快照在 replace() 后
-   * 未必立即更新，而本类的每次写入都是「读 → 改 → 整体 replace」。
+   * 不直接把后端的读取结果当读源：后端的落盘快照在写入后未必立即反映到
+   * 下一次读取，而本类的每次写入都是「读 → 改 → 整体写回」。
    * 若以滞后快照为读源，并发/连续的 updateModelRateLimit 会互相覆盖
-   * （典型表现：多个账号触发限流后，settings.yaml 里一条 modelRateLimits
-   * 都没有）。因此首次从 scope 载入后，这份副本即为唯一读源。
+   * （典型表现：多个账号触发限流后，落盘文档里一条 modelRateLimits
+   * 都没有）。因此首次载入后，这份副本即为唯一读源。
    */
   private cache: ProviderAccountEntry[] = []
   /**
-   * 模型黑名单的**权威进程内副本**（与 {@link cache} 同理：settings 的
-   * resolved 快照在 replace() 后未必立即更新，因此加载一次后即以本副本为准）。
+   * 模型黑名单的**权威进程内副本**（与 {@link cache} 同理：载入一次后即以
+   * 本副本为准）。
    */
   private modelCache: ModelDisableMap = {}
-  /** 是否已从 settings scope 完成首次载入。 */
+  /** 是否已完成首次载入。 */
   private loaded = false
 
   constructor(private readonly ctx: Context) {
-    const settings = this.ctx.get('settings') as SettingsServiceLike | undefined
-    if (!settings || typeof settings.register !== 'function') {
-      this.ctx.logger?.warn?.('[jet-hub] settings 服务不可用，账号列表仅存在于内存中')
-      return
-    }
-    try {
-      this.scope = settings.register(JET_HUB_NS, jetHubSchema)
-    } catch (error) {
-      // 重复注册（如插件热重载）时降级为内存态。
-      this.ctx.logger?.warn?.(`[jet-hub] settings namespace 注册失败，降级运行: ${String(error)}`)
+    this.store = createJetHubStore(ctx)
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无可用持久化后端，账号列表与模型黑名单仅存在于内存中')
     }
   }
 
-  /** 首次访问时从 settings scope 载入账号列表。 */
+  /** 首次访问时从后端载入账号列表与黑名单。 */
   private ensureLoaded(): void {
     if (this.loaded) return
     this.loaded = true
-    if (!this.scope) return
-    const value = this.scope.get() as JetHubSettingsValue | undefined
-    const accounts = value?.accounts
-    if (Array.isArray(accounts)) {
-      this.cache = accounts as ProviderAccountEntry[]
-    } else {
-      this.ctx.logger?.warn?.(
-        `[jet-hub] 账号列表首次载入为空（scope 返回 ${JSON.stringify(value)}）`,
-      )
-    }
-    // 黑名单是后来才加入的字段：老配置文件里没有它，缺失时保持空表
+    const state = this.store.load()
+    if (state === undefined) return
+    this.cache = state.accounts
+    // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
     // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
-    this.modelCache = sanitizeDisabledModels(value?.disabledModels)
+    this.modelCache = state.disabledModels
   }
 
   /** 读取账号列表（进程内权威副本）。 */
@@ -184,17 +91,17 @@ export class AccountPool {
   /**
    * 持久化账号列表（同时更新进程内权威副本）。
    *
-   * **必须连同黑名单一起写回**：settings 的 `replace()` 是整体替换，
-   * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels` 抹掉。
+   * **必须连同黑名单一起写回**：两种后端都是整体写入，
+   * 只写 `{ accounts }` 会把同一文档里的 `disabledModels` 抹掉。
    */
   private async writeAccounts(accounts: ProviderAccountEntry[]): Promise<void> {
     this.cache = accounts
     this.loaded = true
-    if (!this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，账号变更未持久化')
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，账号变更未落盘')
       return
     }
-    await this.scope.replace({ accounts, disabledModels: this.modelCache })
+    await this.store.save({ accounts, disabledModels: this.modelCache })
   }
 
   /**
@@ -243,12 +150,12 @@ export class AccountPool {
   private async writeModels(disabledModels: ModelDisableMap): Promise<void> {
     this.modelCache = disabledModels
     this.loaded = true
-    if (!this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，模型黑名单变更未持久化')
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，模型黑名单变更未落盘')
       return
     }
-    // 与 writeAccounts 对称：整体 replace 必须携带账号列表，否则会被清空。
-    await this.scope.replace({ accounts: this.cache, disabledModels })
+    // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空。
+    await this.store.save({ accounts: this.cache, disabledModels })
   }
 
   /** 列出某个 provider 的所有账号（含状态信息） */

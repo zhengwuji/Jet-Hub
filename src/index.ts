@@ -12,6 +12,7 @@ import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
 import { AccountPool } from './account-pool.js'
+import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -33,40 +34,45 @@ export const name = 'codearts-auth'
 export const inject = ['credentials', 'commands', 'llm']
 
 /**
- * Provider 配置 namespace 的 schema。
+ * 插件 Config schema。
  *
- * `registerConfigurableProviders` 声明的 `settingsNs` 必须真实存在于
- * settings 服务中，否则模型设置页读到 undefined 的 namespace，
- * 在 `refFor → deriveKeyRef(provider)` 处会以
- * `provider.toUpperCase is not a function` 崩溃。
- * 两者都只需承接一个可选的 `providers` 映射，故共用同一宽松 schema。
+ * ⚠️ **DSH 0.1.7-rc.1 起，settings 表单的命名空间就是 profile 条目 id**
+ * （本插件的条目 id 是 `codearts-auth`），且只投影本条目 Config 中标记了
+ * `.volatile()` 的字段。因此这里保留一个 `providers` 映射：
+ * - 它是六个 provider 各自 `registerConfigurableProviders({ settingsNs })` 的
+ *   落地位置（0.1.7 下 `settingsNs` = 本条目 id），模型设置页据此把 provider
+ *   判定为「已配置」（判据见 `dsh-client-ui-settings-models` 的 `configured`）；
+ * - 本插件的凭据与账号管理**不**走这里（那是 Jet Hub 的账号池 +
+ *   `ctx.credentials`），故该字段只承接一个宽松映射，不参与业务读取。
  *
- * 注意：`settings.register()` 要求 schemastery schema —— `describe()` 会对每个
- * 注册项无条件调用 `schema.toJSON()` 与 `redactSecrets(schema, value)`。
- * 传入裸函数（`(value) => ...`）会让 `describe()` 抛
- * `TypeError: registration.schema.toJSON is not a function`，进而使所有
- * 依赖 settings 的界面（模型设置页、主题、sidebar 的 settings.get/shell.get）
- * 全部失败。因此这里必须用 `Schema.object({...})` 构造。
+ * 必须是 schemastery schema：`SettingsForms.describe()` 会对每个注册项调用
+ * `schema.toJSON()`，传入裸函数（`(value) => ...`）会让它抛
+ * `TypeError: ... .toJSON is not a function`，进而使所有依赖 settings 的界面
+ * （模型设置页、sidebar 的 settings.get/shell.get）全部失败。
  */
-const providerSettingsSchema = Schema.object({
-  providers: Schema.dict(Schema.any()).default({}),
+export const Config = Schema.object({
+  providers: Schema.dict(Schema.any()).default({}).volatile(),
 })
 
-/** 注册 provider 配置 namespace（已存在时忽略重复注册错误）。 */
+/**
+ * 注册 provider 配置 namespace（**仅老契约需要**）。
+ *
+ * - **≤0.1.6**：`ctx.settings` 允许插件注册任意 namespace，六个 provider 各占
+ *   一个（`llm-buddy` / `llm-workbuddy` / ...）。注册缺失会让模型设置页在
+ *   `refFor → deriveKeyRef(provider)` 处以
+ *   `provider.toUpperCase is not a function` 崩溃，故注册后回读 `describe()` 自检。
+ * - **0.1.7-rc.1**：settings 换成 `SettingsForms`，**没有 `register`**，命名
+ *   空间只能是 profile 条目 id —— 此时不再（也无法）注册；各 provider 的
+ *   `settingsNs` 由 `settingsNamespaceFor()` 指向本插件条目 id，模型设置页照常
+ *   工作。这里刻意**静默跳过**：旧实现在这条分支上会打一条误导性的
+ *   「settings 服务不可用」告警（启动日志实证）。
+ */
 function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
-  const settings = ctx.get('settings') as
-    | {
-      register: (ns: string, schema: unknown) => unknown
-      describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns: string }>
-    }
-    | undefined
-  if (!settings || typeof settings.register !== 'function') {
-    ctx.logger.warn('[codearts-auth] settings 服务不可用，provider namespace 未注册')
-    return
-  }
+  const settings = settingsOf(ctx)
+  if (!hasLegacyNamespaceRegistration(settings) || settings?.register === undefined) return
   for (const ns of namespaces) {
     try {
-      settings.register(ns, providerSettingsSchema)
+      settings.register(ns, Config)
     } catch (error) {
       ctx.logger.warn(`[codearts-auth] settings namespace "${ns}" 注册失败: ${String(error)}`)
     }
@@ -119,13 +125,20 @@ export function makeReadImage(ctx: Context) {
 
 /** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
 export function apply(ctx: Context): void {
-  // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
-  // 六个 namespace 分别对应：codearts 路由、CodeBuddy（buddy）路由、
-  // WorkBuddy（workbuddy）路由、LobsterAI（lobsterai）路由、Qoder（qoder）路由、
-  // TRAE（trae）路由 —— 后五者由 registerBuddyLlm / registerLobsteraiLlm /
-  // registerQoderLlm / registerTraeLlm 以 `llm-${product.id}` 派生，漏注册会让
-  // 模型设置页在 `refFor → deriveKeyRef(provider)` 处以
-  // `provider.toUpperCase is not a function` 崩溃。
+  // 本插件自带 Jet Hub 设置页，关闭 0.1.7 起由 Config schema 反渲染的自动表单
+  // （老契约没有 configure()，静默跳过）。
+  suppressAutoSettingsPage(ctx)
+
+  // provider 配置命名空间的注册**只在老契约（≤0.1.6）下需要**：
+  // 那时 `settings.register` 可用，六个 namespace 分别对应 codearts 路由、
+  // CodeBuddy（buddy）、WorkBuddy（workbuddy）、LobsterAI（lobsterai）、
+  // Qoder（qoder）、TRAE（trae）—— 后五者由 registerBuddyLlm /
+  // registerLobsteraiLlm / registerQoderLlm / registerTraeLlm 以
+  // `llm-${product.id}` 派生。
+  //
+  // 0.1.7-rc.1 起 settings 换成 SettingsForms（无 register），命名空间只能是
+  // profile 条目 id，故这里不做任何注册；各 provider 的 settingsNs 由
+  // `settingsNamespaceFor()` 解析为本插件条目 id。
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai', 'llm-qoder', 'llm-trae',
   )

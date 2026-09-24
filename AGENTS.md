@@ -545,6 +545,67 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
   `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
   v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
+## ⚠️ 持久化：DSH 0.1.7 移除 `settings.register()` 之后（Issue IKI7WT）
+
+**真实缺陷**：升级到 DSH **0.1.7-rc.1** 后，Jet Hub 的**账号列表与模型黑名单
+无法持久化**（重启即回到空列表，等于所有 provider 都"未登录"，模型目录也因
+门控被隐藏）。
+
+**根因**：0.1.7 把 `ctx.settings` 从 `SettingsProvider` 换成 **`SettingsForms`**：
+
+| | ≤0.1.6 | 0.1.7-rc.1 |
+|---|---|---|
+| 注册方式 | `settings.register(ns, schema)` → owner scope（`get`/`replace`） | **没有 `register`**；命名空间 = **profile 条目 id** |
+| 可见字段 | 该 namespace 的全部字段 | 只投影本条目 Config 中标了 **`.volatile()`** 的字段 |
+| 写入路径 | provider 文档（旧 `settings.yaml`） | `update/replace/mutate` → profile 的 `cordis.patch.yml` |
+
+因此 `if (typeof settings.register !== 'function')` 这条**看似安全的降级分支**
+恒成立：账号池退化为纯内存。启动日志实证
+`[jet-hub] settings 服务不可用，账号列表仅存在于内存中`（旧文案有误导性，
+实际是"API 没了"而不是"服务没挂"）。
+
+**修法**（`src/jet-hub-store.ts` + `src/settings-compat.ts`）：
+
+- 持久化后端按**能力探测**：`settings.register` 可用 → 沿用老契约（数据仍在
+  settings 文档，行为与 ≤0.1.6 完全一致）；否则 → 插件自有文档
+  **`$DSH_HOME/jet-hub/state.json`**（同步读 + 原子写 tmp+rename）。
+- ⚠️ **不要把这类运行时状态塞进插件 Config 的 volatile 字段**：限流每命中一次
+  就要写一次，而写 Config 会改写 profile 的 `cordis.patch.yml` 并触发 Loader
+  协调 —— 把易变数据混进用户手写的配置层，代价与风险都不划算。
+- **`settingsNs` 必须跟着改**：0.1.7 起它只能是 profile 条目 id，故
+  `settingsNamespaceFor(ctx, 'llm-<id>')` 解析为**本插件条目 id**
+  （官方适配器同做法：`ctx.fiber.entry?.options.id`）。拿不到条目 id 时退回旧名，
+  此时该 provider 在模型设置页显示为「未配置」，**不影响路由与收发**。
+- **必须导出带 `.volatile()` 字段的 `Config`**：`SettingsForms.describe()` 只收录
+  「有 volatile 字段」的条目，否则模型设置页把本插件的 provider 判为既非
+  "已配置"也非"可添加"。本插件自带 Jet Hub 页面，故同时调
+  `settings.configure({ auto: false }, ctx.fiber)` 关掉自动生成的表单。
+- ⚠️ **`.volatile()` 需要 schemastery ≥ 3.18.4**（本地曾是 3.18.2，只有
+  3.18.4 才有该方法）；且 `volatile()` 会把 cosmokit 的 `Volatile<T>` 带进
+  `Config` 的公开类型，故 `@deepseek-ai/cosmokit` 必须是本包依赖，否则
+  `tsc` 报 TS2742。
+
+**老数据恢复**（0.1.7 把 `$DSH_HOME/settings.yaml` 改名为 `.imported`，并按
+「section id = 条目 id」导入；`jet-hub` 不对应任何条目 → 该段**导入失败、成为
+孤儿**）：
+
+- 插件在状态文档**缺失**时，会从 `.credentials.yaml` 的 `refs:` 反推账号
+  （只读键名，不引 YAML 依赖 —— 运行时不保证能解析 `yaml`/`js-yaml`）。
+  这是**保底**：能还原"有哪些账号/用哪个 credentialRef"，
+  但**拿不回昵称、顺序、enabled 与限流标记**。
+- 精确还原用一次性脚本 `scripts/import-jet-hub-legacy-settings.mjs`
+  （默认**预演**，`--write` 才落盘）：直接解析旧文档的 `jet-hub` 段，
+  保留昵称/顺序/enabled/限流与黑名单；有任何条目缺
+  `id`/`provider`/`credentialRef` 就整体拒绝写入（不导入半截数据）。
+  ⚠️ 模型 id 含 `.` 与 `-`（如 `deepseek-v4.1-flash`），字段正则必须放行，
+  早期写成 `[\w]*` 会让限流标记**静默全丢**。
+- 排查脚本：`scripts/verify-jet-hub-persistence.mjs`（用**已构建 lib/** 以 0.1.7
+  契约验证落盘与跨实例读回）、`scripts/preview-jet-hub-recovery.mjs`
+  （只读预演凭据反推）。回归用例：`tests/unit/jet-hub-store.spec.ts`、
+  `tests/unit/account-pool.spec.ts`（「0.1.7 契约」段）。
+- ⚠️ 单测必须隔离状态目录：`vitest.config.ts` 把 `DSH_JET_HUB_STATE_DIR`
+  指向一次性临时目录，否则文件后端会污染真实 `~/.dsh`。
+
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
 同一 `jet-hub` 命名空间的 `disabledModels` 字段保存「被关闭的模型」，形如 `{ buddy: { 'glm-5.2': true } }`。要点：
@@ -555,6 +616,53 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 - `AccountPool` 的 `writeAccounts` / `writeModels` 都是**整体 replace**，两者必须互相携带对方的字段，否则一次账号操作会把模型开关清空（反之亦然）
 - `CodeArtsAdapter.listModels` 必须 `await this.ensureRemoteModels()`：早期用 `void` 丢弃 Promise，冷缓存时会误用静态兜底表
 - RPC：`model.list` / `model.setDisabled`（`src/jet-hub-rpc.ts`），前端在 `plugin-src/client/jet-hub.js` 的 `ModelListPanel`
+
+### ⚠️ 改完开关必须广播 `llm/adapters-updated`，否则界面要重启才更新
+
+**真实缺陷**（用户报障）：在 Jet Hub 关掉 LobsterAI 的若干模型后，**模型选择器里
+仍然看得到它们**；**重启 DSH 后**才正确消失。落盘侧一切正常
+（`state.json` 的 `disabledModels.lobsterai` 有 28 条），适配器侧也正常
+（`listModels` 每次实时读 `disabledModelsFor()`）。
+
+**根因在客户端缓存，不在本插件的适配器**：`dsh-client-ui-model-selection` 的
+`ModelCatalogDirectory` 把 `modelCatalog` 响应存进一个
+**`status === 'ready'` 即短路返回缓存**的 store（`lib/client.js` 的 `load()`：
+`if (state.status === 'ready' && state.value !== null) return Promise.resolve(state.value)`）。
+它只在三个**转发的宿主事件**上 `refresh()`：
+
+```js
+ctx.remote.$on('llm/adapters-updated',        () => this.catalog.refresh())
+ctx.remote.$on('settings/document-updated',   () => this.catalog.refresh())
+ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
+```
+
+⚠️ **0.1.7 起黑名单不再走 settings 文档**（改落插件自有文档
+`$DSH_HOME/jet-hub/state.json`，见上「持久化」章节），因此写开关**不触发上述
+任何一个事件** → 客户端长期复用旧目录，**直到重启**（`connection/reset` →
+`resetGeneration()`）才重拉。这正是「不重启不生效、重启就好」的成因。
+
+**修法**：`model.setDisabled` 写完黑名单后显式广播一次
+`ctx.emit('llm/adapters-updated')`（`src/jet-hub-rpc.ts`）。选它的理由：
+
+- 按契约它是**无载荷**的「目录可能变了，请重新读 `listModels`」通知
+  （dsh-llm README：*consumers re-read the registries*），语义完全吻合；
+- 它在 `API_REMOTE_FORWARDED_EVENTS` 白名单里（`dsh-api-remotes`），故会真的送达浏览器；
+- **不改变拓扑**，故 dsh-llm 的 invariant 监听（对每个 provider 读一次
+  `retryPolicy`）必然通过，不会误报 `INVARIANT`。
+
+⚠️ **广播必须包 try/catch**：通知失败不能反噬**已经落盘**的开关 —— 否则用户看到
+「切换失败」而实际已生效，再点一次又因幂等而看似「无效」，比不提示更难排查。
+
+⚠️ **`ctx.emit(name)` 不传 `thisArg`**，故 cordis 的 `dispatch` 里 `filter` 为
+`undefined`，所有监听器（含 api-remotes 的转发监听）都会命中 —— 这是该修法成立的
+前提（`EventsService.dispatch`：`hook.global || !filter || filter.call(...)`）。
+
+⚠️ **新增任何「只写插件自有文档、却影响模型目录」的端点时，都要照此广播**。
+判据是「这次写入会不会改变 `listModels` 的结果」，而不是「是否写了 settings」。
+
+回归用例：`tests/unit/jet-hub-rpc.spec.ts` 的三条 —— 关闭/打开都广播、校验失败
+不广播、广播抛错仍算成功（替身必须真的实现 `ctx.emit`，否则生产代码的广播会以
+`ctx.emit is not a function` 被 try/catch 静默吞掉，用例形同虚设）。
 
 ### ⚠️ 设置页目录必须走 `listAllModels`，不能复用 `listModels`
 

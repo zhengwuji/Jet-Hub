@@ -146,6 +146,73 @@ describe('plugin entry', () => {
   })
 })
 
+/** schemastery `toJSON()` 的序列化形态：子 schema 以 id 存于 `refs`，`dict` 存 id。 */
+interface SerializedSchema {
+  uid: string | number
+  refs: Record<string, {
+    type?: string
+    meta?: Record<string, unknown>
+    dict?: Record<string, string | number>
+  }>
+}
+
+/**
+ * DSH 0.1.7-rc.1 起 `ctx.settings` 是 `SettingsForms`：**没有 `register`**，
+ * 命名空间只能是 profile 条目 id。旧实现会在这条分支上打一条误导性的
+ * 「settings 服务不可用」告警，并把 provider 的 settingsNs 留成永不存在于
+ * settings 的 `llm-*`。这里锁死新契约下的行为（Gitee issue IKI7WT）。
+ */
+describe('0.1.7 settings 契约（SettingsForms，无 register）', () => {
+  /** 0.1.7 的 settings 形状：describe/configure 在，register 不在。 */
+  function make017Context(): { ctx: Context; llm: FakeLlm } {
+    const ctx = new Context()
+    ctx.provide('credentials', new FakeCredentials() as never)
+    ctx.provide('commands', new FakeCommands() as never)
+    const llm = new FakeLlm()
+    ctx.provide('llm', llm as never)
+    ctx.provide('settings', {
+      describe: () => [],
+      configure: () => () => {},
+    } as never)
+    return { ctx, llm }
+  }
+
+  it('apply 不抛错，且不再打「settings 服务不可用」告警', () => {
+    const { ctx } = make017Context()
+    const warns: string[] = []
+    const spy = vi.spyOn(ctx.logger, 'warn').mockImplementation(((...args: unknown[]) => {
+      warns.push(args.map(String).join(' '))
+    }) as never)
+    try {
+      expect(() => apply(ctx)).not.toThrow()
+    } finally {
+      spy.mockRestore()
+    }
+    expect(warns.filter(w => w.includes('settings 服务不可用'))).toEqual([])
+  })
+
+  it('provider 的 settingsNs 解析为本插件条目 id（无条目时退回旧名，但不再假设其存在）', () => {
+    const { ctx, llm } = make017Context()
+    apply(ctx)
+    const codearts = llm.configurableProviders.find(entry => entry.provider === 'codearts')
+    // 该替身没有 profile 条目（fiber.entry 缺失）→ 退回旧命名空间名。
+    expect(codearts?.settingsNs).toBe('llm-codearts')
+  })
+
+  it('Config 暴露 volatile 的 providers 字段（否则 settings.describe 不收录本条目）', () => {
+    const schema = (pluginEntry as {
+      Config?: { toJSON(): SerializedSchema }
+    }).Config
+    expect(schema).toBeDefined()
+    const json = schema!.toJSON()
+    const root = json.refs[String(json.uid)]
+    expect(root?.type).toBe('object')
+    // `dict` 存的是子 schema 在 refs 里的 id。
+    const providersRef = String(root?.dict?.['providers'])
+    expect(json.refs[providersRef]?.meta?.['volatile']).toBe(true)
+  })
+})
+
 describe('buddy plugin entry', () => {
   it('registers the buddyAuth service without slash commands', () => {
     // 登录/状态/续期都在 Jet Hub 设置页完成，命令式入口已移除。

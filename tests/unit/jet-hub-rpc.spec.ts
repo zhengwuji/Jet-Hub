@@ -861,6 +861,8 @@ describe('model.list / model.setDisabled 端点', () => {
      * 省略时退化为「listModels + 裸 id 补回」的历史行为。
      */
     modelAdapters?: Record<string, { listAllModels(): readonly { id: string; name: string }[] }>
+    /** 让 `ctx.emit` 抛错，验证「广播失败不反噬已落盘的开关」。 */
+    emitThrows?: boolean
   }) {
     // settings 替身：内存里保存 namespace 的值，语义与真实服务一致的
     // 「整体 replace」。
@@ -869,6 +871,8 @@ describe('model.list / model.setDisabled 端点', () => {
       ...options.disabledModels !== undefined ? { disabledModels: options.disabledModels } : {},
     }
     let handler: Handler | undefined
+    /** 端点通过 `ctx.emit` 广播过的事件名（按顺序）。 */
+    const emitted: string[] = []
 
     const pool = new AccountPool({
       get: (key: string) => key === 'settings'
@@ -925,6 +929,15 @@ describe('model.list / model.setDisabled 端点', () => {
       // 始终可用），使端点注册行为与 Web profile 下完全一致。
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
+      // `model.setDisabled` 写完黑名单后必须广播 `llm/adapters-updated`，
+      // 否则客户端那份 `status === 'ready'` 即短路的目录缓存永不失效 ——
+      // 表现为「关闭后选择器里仍看得到该模型，重启后才消失」（真实缺陷）。
+      // 替身必须真的实现 emit：若只声明不实现，生产代码的广播会以
+      // `ctx.emit is not a function` 被 try/catch 静默吞掉，用例便形同虚设。
+      emit: (event: string) => {
+        if (options.emitThrows === true) throw new Error('listener exploded')
+        emitted.push(event)
+      },
     }
 
     registerJetHubRpc(
@@ -949,7 +962,7 @@ describe('model.list / model.setDisabled 端点', () => {
       return body.result
     }
 
-    return { call, pool, storedValue: () => stored }
+    return { call, pool, storedValue: () => stored, emitted }
   }
 
   const MODELS = [
@@ -1124,6 +1137,58 @@ describe('model.list / model.setDisabled 端点', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('modelId')
+  })
+
+  /**
+   * 回归：**开关必须广播目录变更事件**，否则界面要重启才更新（用户报障）。
+   *
+   * 真实缺陷：`dsh-client-ui-model-selection` 的 `ModelCatalogDirectory` 把
+   * `modelCatalog` 响应缓存在一个 `status === 'ready'` 即短路返回的 store 里，
+   * 只在三个转发事件上 `refresh()`。0.1.7 起黑名单落在插件自有文档
+   * （不再经 settings 文档），于是写开关**不触发任何**那些事件 → 选择器一直
+   * 显示旧目录，直到重启（`connection/reset`）才重拉。
+   *
+   * 适配器侧本来就是对的（每次实时读黑名单），所以这个用例锁的是**通知**：
+   * 少了它，落盘与界面就会长期不一致，且没有任何报错。
+   */
+  it('model.setDisabled 广播 llm/adapters-updated（否则界面要重启才更新）', async () => {
+    const { call, emitted } = registerEndpoints({ models: MODELS })
+
+    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+    // 关闭要广播
+    expect(emitted).toContain('llm/adapters-updated')
+
+    // 重新打开同样要广播：两个方向都会改变可见目录。
+    emitted.length = 0
+    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
+    expect(emitted).toContain('llm/adapters-updated')
+  })
+
+  it('校验失败时不广播（没有实际变更就不该惊动目录）', async () => {
+    const { call, emitted } = registerEndpoints({ models: MODELS })
+
+    const result = await call('model.setDisabled', { provider: 'buddy', modelId: '' })
+
+    expect(result.ok).toBe(false)
+    expect(emitted).toEqual([])
+  })
+
+  /**
+   * 广播失败**不能反噬已经落盘的开关**。
+   *
+   * 若让监听器的异常冒泡，用户会看到「切换失败」，而黑名单其实已经写入 ——
+   * 再点一次又因幂等而看似「无效」，比不提示更难排查。故生产代码把 emit
+   * 包在 try/catch 里，本用例锁住这一行为。
+   */
+  it('广播抛错时开关仍算成功（已落盘的不回滚）', async () => {
+    const { call, storedValue, emitted } = registerEndpoints({ models: MODELS, emitThrows: true })
+
+    const result = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+
+    expect(result.ok).toBe(true)
+    expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+    // 抛错发生在 push 之前，故不会有记录 —— 但关键断言是上面的 ok/落盘。
+    expect(emitted).toEqual([])
   })
 
   it('llm 服务不可用时 model.list 返回可读错误（账号面板不受影响）', async () => {

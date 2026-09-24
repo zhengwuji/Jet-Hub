@@ -18,6 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -1588,15 +1589,20 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
  * 在 ctx.llm 上注册 CodeBuddy 系产品的 provider 路由与适配器。
  *
  * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
- * CodeBuddy 得到 `buddy` / `llm-buddy`（与改造前完全一致），
- * WorkBuddy 得到 `workbuddy` / `llm-workbuddy`。
- * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
- * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
+ * CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
+ * `settingsNs` 经 `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是各产品的
+ * `llm-<id>` 命名空间；0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，
+ * 故解析为本插件条目 id。
  */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? CODEBUDDY
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    {
+      provider: product.id,
+      displayName: product.displayName,
+      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
+      settingsPath: [],
+    },
   ])
   const adapter = new BuddyAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

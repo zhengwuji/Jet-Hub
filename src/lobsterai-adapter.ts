@@ -30,6 +30,7 @@ import {
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { parseRateLimitError } from './llm-adapter.js'
 import {
   LOBSTERAI_CHAT_PATH,
@@ -1566,15 +1567,19 @@ function displayNameFor(model: LobsteraiRemoteModel): string {
 /**
  * 在 `ctx.llm` 上注册 LobsterAI provider 路由与适配器。
  *
- * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动，得到
- * `lobsterai` / `llm-lobsterai`。`settingsNs` **必须**与 `src/index.ts` 的
- * `registerProviderSettings` 注册的 namespace 一致，否则模型设置页会因
- * 未注册 namespace 在 `refFor → deriveKeyRef(provider)` 处崩溃。
+ * 路由名与配置页展示名由产品配置驱动，得到 `lobsterai`。`settingsNs` 经
+ * `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是 `llm-lobsterai`；
+ * 0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，故解析为本插件条目 id。
  */
 export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    {
+      provider: product.id,
+      displayName: product.displayName,
+      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
+      settingsPath: [],
+    },
   ])
   const adapter = new LobsteraiAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

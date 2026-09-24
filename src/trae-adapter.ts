@@ -23,6 +23,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import {
   TRAE_DEFAULT_MODEL,
   TRAE_MAX_CONTEXT_TOKENS,
@@ -1528,7 +1529,13 @@ function trimTraeHistory(
 export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): TraeAdapter {
   const product = options.product ?? TRAE
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    {
+      provider: product.id,
+      displayName: product.displayName,
+      // 0.1.7 起 settings 命名空间只能是 profile 条目 id（见 settingsNamespaceFor）。
+      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
+      settingsPath: [],
+    },
   ])
   const adapter = new TraeAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

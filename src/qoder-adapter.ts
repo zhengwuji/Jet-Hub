@@ -28,6 +28,7 @@ import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'node:crypto'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { isQoderExpired, type QoderCredential } from './qoder.js'
 import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
 import { unwrapQoderEnvelopeStream } from './qoder-envelope.js'
@@ -569,15 +570,19 @@ export function qoderDisplayName(model: QoderFallbackModel, now: Date = new Date
 /**
  * 在 `ctx.llm` 上注册 Qoder provider 路由与适配器。
  *
- * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动，得到
- * `qoder` / `llm-qoder`。`settingsNs` **必须**与 `src/index.ts` 的
- * `registerProviderSettings` 注册的 namespace 一致，否则模型设置页会因
- * 未注册 namespace 在 `refFor → deriveKeyRef(provider)` 处崩溃。
+ * 路由名与配置页展示名由产品配置驱动，得到 `qoder`。`settingsNs` 经
+ * `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是 `llm-qoder`；
+ * 0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，故解析为本插件条目 id。
  */
 export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    {
+      provider: product.id,
+      displayName: product.displayName,
+      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
+      settingsPath: [],
+    },
   ])
   const adapter = new QoderAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

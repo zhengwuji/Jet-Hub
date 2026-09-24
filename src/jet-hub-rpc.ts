@@ -1258,7 +1258,12 @@ function registerJetHubEndpoints(
       }
 
       // 打开/关闭某个模型。写入后**不重建适配器**：适配器的 listModels 每次
-      // 都直接读账号池的黑名单，因此下一轮模型目录刷新即生效。
+      // 都直接读账号池的黑名单，因此下一次调用即返回新目录。
+      //
+      // ⚠️ 但「适配器立刻返回新目录」**不等于**「界面立刻更新」—— 客户端把
+      // `modelCatalog` 的响应缓存在带 `status === 'ready'` 短路的 store 里，
+      // 只在转发事件上失效（详见下方 emit 的注释）。不广播就等于开关只写进了
+      // 磁盘、界面一直显示旧目录。
       case 'model.setDisabled': {
         const req = payload as RpcModelSetDisabledRequest
         if (typeof req.provider !== 'string' || typeof req.modelId !== 'string' || req.modelId.length === 0) {
@@ -1268,6 +1273,34 @@ function registerJetHubEndpoints(
         ctx.logger.info(
           `[jet-hub] ${req.disabled === true ? '关闭' : '打开'}模型 ${req.provider}/${req.modelId}`,
         )
+        // ⚠️ **必须广播一次目录变更事件**，否则「关闭后选择器里仍能看到该模型，
+        // 重启后才消失」（真实缺陷，用户报障）。
+        //
+        // 根因在客户端而非适配器：`dsh-client-ui-model-selection` 的
+        // `ModelCatalogDirectory` 把 `modelCatalog` 响应存进一个
+        // `status === 'ready'` 即**短路返回缓存**的 store，只在三个转发的宿主
+        // 事件上 `refresh()`：`llm/adapters-updated` / `settings/document-updated`
+        // / `credentials/reference-updated`。
+        //
+        // 0.1.7 起黑名单落在插件自有文档 `$DSH_HOME/jet-hub/state.json`
+        // （不再经 settings 文档，见 jet-hub-store.ts），因此写开关**不会**
+        // 触发上述任何一个事件 → 客户端一直复用旧目录，直到重启
+        // （`connection/reset` → `resetGeneration()`）才重拉。
+        //
+        // 三者中 `llm/adapters-updated` 最贴合：按契约它是**无载荷**的
+        // 「目录可能变了，请重新读 listModels」通知（dsh-llm README：
+        // consumers re-read the registries），正是这里要表达的语义。
+        // 它也在 `API_REMOTE_FORWARDED_EVENTS` 白名单里，故会真的送达浏览器。
+        //
+        // 不改变拓扑，故 dsh-llm 的 invariant 监听（对每个 provider 读一次
+        // retryPolicy）必然通过，不会误报 INVARIANT。
+        try {
+          ctx.emit('llm/adapters-updated')
+        } catch (error) {
+          // 通知失败不能反噬**已经落盘**的开关：否则用户看到「切换失败」而
+          // 实际已生效，再点一次又因幂等而看似「无效」，比不提示更难排查。
+          ctx.logger.warn(`[jet-hub] 广播模型目录变更事件失败：${String(error)}`)
+        }
         const value: RpcModelSetDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),

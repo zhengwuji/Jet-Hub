@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from '../../src/account-pool.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -779,6 +782,79 @@ describe('AccountPool 模型黑名单', () => {
     const pool = new AccountPool({ get: () => undefined, logger: { warn: () => {}, info: () => {} } } as never)
     await pool.setModelDisabled('buddy', 'glm-5.2', true)
     expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+  })
+})
+
+/**
+ * Gitee issue IKI7WT 的回归：DSH 0.1.7-rc.1 把 `ctx.settings` 换成
+ * `SettingsForms`（**没有 `register`**，命名空间只能是 profile 条目 id）。
+ * 旧实现因此把账号列表与模型黑名单退化成纯内存 —— 重启即丢。
+ * 这里锁死「settings 无 register 时仍要落盘并跨实例存活」。
+ */
+describe('AccountPool · 0.1.7 契约（settings 无 register）', () => {
+  let stateDir: string
+  let previousDir: string | undefined
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'account-pool-017-'))
+    previousDir = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = stateDir
+  })
+
+  afterEach(() => {
+    if (previousDir === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+    else process.env.DSH_JET_HUB_STATE_DIR = previousDir
+    rmSync(stateDir, { recursive: true, force: true })
+  })
+
+  /** 0.1.7 的 SettingsForms 形状：有 describe/configure，但没有 register。 */
+  function make017Context() {
+    return {
+      get: (key: string) => key === 'settings'
+        ? { describe: () => [], configure: () => () => {} }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: true, writable: true, source: 'test' as const }),
+      },
+    }
+  }
+
+  it('账号列表与黑名单跨实例存活（本 issue 的核心断言）', async () => {
+    const first = new AccountPool(make017Context() as never)
+    await first.addAccount({
+      id: 'buddy-01700001',
+      provider: 'buddy',
+      nickname: '0.1.7 用例',
+      enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_01700001',
+      createdAt: Date.now(),
+      refreshable: true,
+    })
+    await first.setModelDisabled('buddy', 'glm-5.2', true)
+
+    // 新实例 = 模拟重启：必须从磁盘读回，而不是空列表。
+    const second = new AccountPool(make017Context() as never)
+    expect((await second.listAccounts('buddy')).map(a => a.id)).toEqual(['buddy-01700001'])
+    expect(second.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+  })
+
+  it('写黑名单时不会抹掉账号列表（整体写入语义）', async () => {
+    const pool = new AccountPool(make017Context() as never)
+    await pool.addAccount({
+      id: 'buddy-01700002',
+      provider: 'buddy',
+      nickname: 'x',
+      enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_01700002',
+      createdAt: Date.now(),
+      refreshable: true,
+    })
+    await pool.setModelDisabled('buddy', 'hy3', true)
+
+    const reloaded = new AccountPool(make017Context() as never)
+    expect((await reloaded.listAccounts('buddy')).map(a => a.id)).toEqual(['buddy-01700002'])
+    expect(reloaded.disabledModelsFor('buddy').has('hy3')).toBe(true)
   })
 })
 
