@@ -722,6 +722,125 @@ describe('AccountPool 模型黑名单', () => {
     expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'hy3', 'kimi-k2.6'])
   })
 
+  /**
+   * 批量开关（Jet Hub 模型列表的「打开全部 / 关闭全部」）。
+   *
+   * 两个方向的语义**刻意不对称**，这是需求明确规定的：
+   * - 关闭全部（`setModelsDisabled`）：按**当前列表**逐项写入黑名单；
+   * - 打开全部（`clearDisabledModels`）：直接**删除该 provider 的全部关闭项**，
+   *   不需要模型目录。
+   *
+   * 拆成两个方法而不是「一个带 disabled 布尔的方法」的理由：两者需要的入参本就
+   * 不同（关闭要 id 列表、打开不要），合并只会让调用方传一个打开时被忽略的参数。
+   * 不对称还有实质好处：打开全部若也按列表走，那些「曾被关闭、后来从服务端目录
+   * 里下线」的历史遗留键永远清不掉 —— 黑名单会积累死键，且残留键将来若被同名
+   * 模型复用会莫名隐藏它。
+   */
+  describe('批量开关（打开全部 / 关闭全部）', () => {
+    it('关闭全部：把给定 id 全部写入黑名单', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3', 'kimi-k2.6'])
+
+      expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'hy3', 'kimi-k2.6'])
+    })
+
+    it('关闭全部只写一次（不逐条落盘）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3', 'kimi-k2.6'])
+
+      // 逐条写会产生 3 次 replace；批量必须只写一次，否则 30 个模型就是
+      // 30 次整体重写 + 30 次目录广播。
+      expect(ctx.replacePayloads).toHaveLength(1)
+      expect(ctx.replacePayloads[0]!.disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, hy3: true, 'kimi-k2.6': true },
+      })
+    })
+
+    it('关闭全部保留该 provider 原有的其它关闭项', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { buddy: { 'old-model': true } },
+      }) as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2'])
+
+      expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'old-model'])
+    })
+
+    it('打开全部：清空该 provider 的全部关闭项', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { buddy: { 'glm-5.2': true, hy3: true } },
+      }) as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(pool.disabledModelsFor('buddy').size).toBe(0)
+    })
+
+    /**
+     * 打开全部**不看模型目录**：目录里已下线的历史遗留键同样要清掉。
+     *
+     * 若按当前目录删除，`gone-model` 这类「曾被关闭、如今已不在目录里」的键会
+     * 永远留在黑名单中，用户点「打开全部」却仍有残留。
+     */
+    it('打开全部：清掉不在当前目录里的历史遗留键', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { buddy: { 'glm-5.2': true, 'gone-model': true } },
+      }) as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(pool.listDisabledModels('buddy')).toEqual({})
+    })
+
+    it('打开全部后 provider 表整体消失（不留 { buddy: {} } 噪音）', async () => {
+      const ctx = createMockContext([], {
+        initialDisabledModels: { buddy: { 'glm-5.2': true } },
+      })
+      const pool = new AccountPool(ctx as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(ctx.replacePayloads.at(-1)!.disabledModels).toEqual({})
+    })
+
+    it('批量操作不影响其它 provider 的黑名单', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { workbuddy: { 'gpt-5.4': true } },
+      }) as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3'])
+      await pool.clearDisabledModels('buddy')
+
+      expect(pool.disabledModelsFor('buddy').size).toBe(0)
+      expect([...pool.disabledModelsFor('workbuddy')]).toEqual(['gpt-5.4'])
+    })
+
+    it('批量写黑名单不会抹掉账号列表（整体写入语义）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.addAccount({
+        id: 'buddy-bulk', provider: 'buddy', nickname: 'B', enabled: true,
+        credentialRef: 'BUDDY_ACCOUNT_BULK', createdAt: Date.now(), refreshable: true,
+      })
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3'])
+
+      expect(ctx.replacePayloads.at(-1)!.accounts).toHaveLength(1)
+      expect(await pool.listAllAccounts()).toHaveLength(1)
+    })
+
+    it('关闭全部传空列表时不写盘（没有变更就不该惊动落盘）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setModelsDisabled('buddy', [])
+
+      expect(ctx.replacePayloads).toHaveLength(0)
+    })
+
+    it('打开全部在本就为空时不写盘', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(ctx.replacePayloads).toHaveLength(0)
+    })
+  })
+
   it('从已有配置载入黑名单', () => {
     const pool = new AccountPool(createMockContext([], {
       initialDisabledModels: { buddy: { 'glm-5.2': true } },
@@ -783,6 +902,7 @@ describe('AccountPool 模型黑名单', () => {
     await pool.setModelDisabled('buddy', 'glm-5.2', true)
     expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
   })
+
 })
 
 /**

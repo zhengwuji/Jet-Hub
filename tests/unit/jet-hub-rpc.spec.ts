@@ -1206,6 +1206,200 @@ describe('model.list / model.setDisabled 端点', () => {
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('令牌已过期')
   })
+
+  /**
+   * 批量端点 `model.setAllDisabled`（Jet Hub 模型列表的「打开全部 / 关闭全部」）。
+   *
+   * 两个方向的语义**刻意不对称**，这是需求明确规定并写进
+   * `AccountPool.setModelsDisabled` / `clearDisabledModels` 的约定：
+   *
+   * - `disabled: true`（关闭全部）：按**当前目录**逐项加入黑名单，读目录因此是必需的；
+   * - `disabled: false`（打开全部）：直接清空该 provider 的黑名单，**不读目录** ——
+   *   否则「曾被关闭、后来从服务端目录里下线」的历史遗留键永远清不掉。
+   *
+   * 用一个带布尔的端点而不是两个端点：两者共享同一套校验、同一次广播、
+   * 同一份返回结构，唯一差异就是那个布尔。
+   */
+  describe('model.setAllDisabled（打开全部 / 关闭全部）', () => {
+    it('disabled:true 把目录里的模型全部写入黑名单', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+      // 落盘后 model.list 应显示全部关闭
+      const list = await call('model.list', { provider: 'buddy' })
+      const models = (list.value as { models: Array<{ disabled: boolean }> }).models
+      expect(models.every((m) => m.disabled)).toBe(true)
+    })
+
+    /**
+     * 目录来源必须是**未过滤**的全量目录。
+     *
+     * `listModels` 会按黑名单过滤，已关闭的模型不在其中。虽然它们本就在
+     * 黑名单里（合并语义让结果恰好正确），但目录少一项就意味着「批量关闭」
+     * 的集合不完整 —— 一旦将来有人把合并改成整体替换，漏掉的项会被静默打开。
+     */
+    it('disabled:true 以 listAllModels 的全量目录为准', async () => {
+      const catalog = [
+        { id: 'glm-5.2', name: 'GLM-5.2' },
+        { id: 'hy3', name: 'Hy3' },
+      ]
+      const { call, storedValue } = registerEndpoints({
+        models: catalog,
+        disabledModels: { buddy: { hy3: true } },
+        modelAdapters: { buddy: { listAllModels: () => catalog } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true, hy3: true } })
+    })
+
+    it('disabled:false 清空该 provider 的全部关闭项（含目录里没有的历史遗留键）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: {
+          buddy: { hy3: true, 'legacy-model': true },
+          workbuddy: { 'gpt-5.4': true },
+        },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+
+      expect(result.ok).toBe(true)
+      // buddy 整体清空（含不在 MODELS 里的 legacy-model），workbuddy 不受影响
+      expect(storedValue().disabledModels).toEqual({ workbuddy: { 'gpt-5.4': true } })
+    })
+
+    /**
+     * 打开全部**不依赖目录**，因此 llm 服务不在时也必须成功。
+     *
+     * 这是两个方向最实质的差异：若图省事让打开也先读目录，那么在模型目录
+     * 读不出来（凭据过期 / 远端故障）时，用户会连「把开关全部打开」这件
+     * 纯本地的事都做不了。
+     */
+    it('disabled:false 不依赖 llm 服务', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+        withoutLlm: true,
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({})
+    })
+
+    it('disabled:true 在 llm 不可用时回可读错误，且不落盘', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+        withoutLlm: true,
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('llm 服务不可用')
+      // 失败不得留下半套状态，也不该惊动目录
+      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+      expect(emitted).toEqual([])
+    })
+
+    /**
+     * 批量**只广播一次**。
+     *
+     * 若在前端循环调用单条端点，30 个模型会发 30 次请求、30 次
+     * `llm/adapters-updated`，客户端目录被反复刷新；批量端点的意义正在于此。
+     */
+    it('只广播一次 llm/adapters-updated（批量不等于逐条广播）', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+
+    it('打开全部同样广播（两个方向都改变可见目录）', async () => {
+      const { call, emitted } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+
+    it('provider 非字符串 → bad-request，不落盘也不广播', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { disabled: true })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('provider')
+      expect(storedValue().disabledModels).toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
+    /**
+     * `disabled` 必须显式给布尔，**不做默认值猜测**。
+     *
+     * 缺失时若默认成 `true`，一次字段名写错的前端改动会「静默关闭用户全部
+     * 模型」；默认成 `false` 则反向静默打开 —— 两个方向都是灾难性且难察觉的。
+     */
+    it('disabled 非布尔 → bad-request（不猜默认值）', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy' })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('disabled')
+      expect(emitted).toEqual([])
+    })
+
+    it('返回写入后的完整黑名单（与 model.setDisabled 同结构）', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.value).toEqual({
+        provider: 'buddy',
+        disabledModels: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+    })
+
+    it('黑名单按 provider 隔离（不影响其它 provider）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { workbuddy: { 'gpt-5.4': true } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(storedValue().disabledModels).toEqual({
+        workbuddy: { 'gpt-5.4': true },
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+    })
+
+    /** 广播抛错不能反噬已落盘的批量开关（与单条端点同一约定）。 */
+    it('广播抛错时批量开关仍算成功', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS, emitThrows: true })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+    })
+  })
 })
 
 /**

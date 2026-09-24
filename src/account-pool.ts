@@ -146,6 +146,51 @@ export class AccountPool {
     await this.writeModels(next)
   }
 
+  /**
+   * 批量关闭一批模型（Jet Hub 模型列表的「关闭全部」）。
+   *
+   * 语义是**按当前列表逐项加入黑名单**，与 {@link setModelDisabled} 的关闭方向
+   * 一致，只是**一次落盘**：逐条调用会写 N 次完整文档（30 个模型就是 30 次
+   * 整体重写 + 30 次目录广播），且中途失败会留下「关了一半」的黑名单。
+   *
+   * 空列表直接返回、不落盘：没有变更就不该产生一次无意义的写入与广播。
+   * 注意这与 {@link clearDisabledModels} **不对称** —— 后者的语义是「清空」，
+   * 即使传入空列表也仍有事可做（详见该方法注释）。
+   */
+  async setModelsDisabled(provider: string, modelIds: readonly string[]): Promise<void> {
+    if (modelIds.length === 0) return
+    // ⚠️ 必须先确保已载入：本类只在**读**方法里调 `ensureLoaded()`，若首次访问
+    // 就是写操作，`this.modelCache` 还是初始空表 —— 一次「关闭全部」会把
+    // 磁盘上已有的黑名单整体覆盖掉。
+    this.ensureLoaded()
+    const next: ModelDisableMap = { ...this.modelCache }
+    // 与已有条目合并：先前单独关闭的模型不能因为一次「关闭全部」而丢失。
+    const perProvider = { ...(next[provider] ?? {}) }
+    for (const id of modelIds) perProvider[id] = true
+    next[provider] = perProvider
+    await this.writeModels(next)
+  }
+
+  /**
+   * 清空某 provider 的全部关闭项（Jet Hub 模型列表的「打开全部」）。
+   *
+   * ⚠️ **刻意不看模型目录**：直接删掉该 provider 在黑名单里的**全部**键，
+   * 而不是按当前目录逐个删。理由是「曾被关闭、后来从服务端目录里下线」的
+   * 历史遗留键 —— 按目录删的话它们永远清不掉，黑名单会积累死键，残留键
+   * 将来若被同名模型复用还会莫名隐藏它。
+   *
+   * 该 provider 本就无关闭项时直接返回、不落盘。
+   */
+  async clearDisabledModels(provider: string): Promise<void> {
+    // 同 setModelsDisabled：写路径必须自己保证已载入，否则「本就为空」的判据
+    // 会建立在未载入的空表上（磁盘上有黑名单却被判成无事可做）。
+    this.ensureLoaded()
+    if (this.modelCache[provider] === undefined) return
+    const next: ModelDisableMap = { ...this.modelCache }
+    delete next[provider]
+    await this.writeModels(next)
+  }
+
   /** 持久化模型黑名单（同时更新进程内权威副本）。 */
   private async writeModels(disabledModels: ModelDisableMap): Promise<void> {
     this.modelCache = disabledModels
