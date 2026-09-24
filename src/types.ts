@@ -396,3 +396,91 @@ export interface LoginFlowOptions {
  * 定义与解析工具放在 buddy.ts（与 CodeBuddy 协议常量同处一处）。
  */
 export type { BuddyCredential } from './buddy.js'
+
+/**
+ * ========================================
+ * 账号备份（导出 / 导入）
+ * ========================================
+ */
+
+/** 备份文件格式标识（自包含，与 DSH 版本无关）。 */
+export const BACKUP_FORMAT = 'dsh-codearts-auth/backup'
+
+/** 备份格式版本：格式演进时递增并保留迁移逻辑。 */
+export const BACKUP_VERSION = 1
+
+/**
+ * 备份载荷（导出结果 / 导入输入）。
+ *
+ * 设计要点：
+ * - `credentials` 的值保存凭据 JSON **原文字符串**（与 `ctx.credentials`
+ *   存储形态一致），导入时 `set(ref, value)` 直接回写，不重新序列化，
+ *   避免字段丢失或变形；
+ * - `accounts` 是账号池索引（ProviderAccountEntry 原文），`disabledModels`
+ *   是模型黑名单 —— 两者与 `JetHubState` 同构，导入后整体替换；
+ * - 整个文件自包含且带 `format` / `version` 标记，因此与 DSH 版本无关：
+ *   换版本后导入时按**当前版本**的存储契约重建。
+ */
+export interface BackupPayload {
+  format: typeof BACKUP_FORMAT
+  version: typeof BACKUP_VERSION
+  /** 导出时间（ISO 8601），用于展示与可选的新旧校验。 */
+  exportedAt: string
+  /** credentialRef → 凭据 JSON 原文（字符串）。 */
+  credentials: Record<string, string>
+  /** 账号池索引（ProviderAccountEntry 原文）。 */
+  accounts: ProviderAccountEntry[]
+  /** 模型黑名单：provider id → 被关闭的模型 id → true。 */
+  disabledModels: Record<string, Record<string, boolean>>
+}
+
+/** RPC: 导出备份响应。 */
+export interface RpcBackupExportResponse {
+  payload: BackupPayload
+  /** 未能读取凭据的账号 id（凭据缺失/损坏，不中断导出）。 */
+  warnings: string[]
+}
+
+/** RPC: 导入备份请求。 */
+export interface RpcBackupImportRequest {
+  /** 备份载荷（明文 JSON 解析后的对象；加密文件在浏览器侧解密后传入）。 */
+  payload: unknown
+}
+
+/** RPC: 导入备份响应。 */
+export interface RpcBackupImportResponse {
+  /** 写入的凭据条数。 */
+  credentialsImported: number
+  /** 写入的账号数。 */
+  accountsImported: number
+  /** 跳过的凭据 ref（非法 ref 等）。 */
+  skipped: string[]
+  /**
+   * 导入的账号中「凭据已过期」的条数（账号条目的 `expiresAt <= 当前时刻`）。
+   * 这类账号即使 refresh_token 尚有效也会在下一次请求时先静默续期；若
+   * refresh_token 也已失效（导出后搁置过久 / CodeArts 一次性轮换），则需
+   * 重新登录。前端据此提示用户。
+   */
+  expiredAccounts: number
+  /**
+   * 导入的账号中「凭据缺失」的条数：账号条目存在，但其 credentialRef 不在
+   * 备份的 credentials 字典里。这类账号导入后无凭据可用，对应 provider 的
+   * 模型目录会被门控隐藏（像未登录一样）。前端据此提示用户重新登录该账号。
+   */
+  missingCredentials: number
+}
+
+/**
+ * RPC: 查询当前账号池统计（导入前的覆盖提示用）。
+ *
+ * `withoutExpiry` 统计缺 `expiresAt` 的账号条目——这正是 DSH 版本切换后
+ * 自动恢复（`bootstrapFromCredentialRefs`）产生的条目特征：反推只按凭据
+ * ref 名重建，不读凭据值，故拿不到有效期。正常登录的账号基本都带
+ * `expiresAt`。该数字用于导入前提示「有 N 个自动恢复的账号将被覆盖」。
+ */
+export interface RpcBackupStatusResponse {
+  /** 当前账号池的账号总数。 */
+  accounts: number
+  /** 缺 `expiresAt` 的账号条目数（疑似自动恢复产物）。 */
+  withoutExpiry: number
+}

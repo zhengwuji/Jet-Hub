@@ -468,6 +468,46 @@ describe('AccountPool', () => {
     // 三条记录都必须留存（fix 前这里会是 [undefined, undefined, t3] 或类似）
     expect(limits).toEqual([t1, t2, t3])
   })
+
+  describe('getStateSnapshot / replaceAll（备份导入用）', () => {
+    it('getStateSnapshot 返回账号与黑名单副本（与进程内解耦）', async () => {
+      await pool.addAccount(makeMockAccount())
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      const snapshot = pool.getStateSnapshot()
+      expect(snapshot.accounts.map(a => a.id)).toEqual(['buddy-001'])
+      expect(snapshot.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      // 修改快照不应污染进程内权威副本
+      snapshot.accounts.push(makeMockAccount({ id: 'buddy-002' }))
+      snapshot.disabledModels.buddy!['glm-5.3'] = true
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-001'])
+      expect(pool.disabledModelsFor('buddy').has('glm-5.3')).toBe(false)
+    })
+
+    it('replaceAll 整体替换账号与黑名单', async () => {
+      await pool.addAccount(makeMockAccount())
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      const incoming = [
+        makeMockAccount({ id: 'codearts-9', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_9' }),
+      ]
+      await pool.replaceAll(incoming, { trae: { 'qwen3.8-flash': true } })
+      // 旧账号与旧黑名单被整体清掉
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['codearts-9'])
+      expect(pool.disabledModelsFor('buddy').size).toBe(0)
+      expect(pool.disabledModelsFor('trae').has('qwen3.8-flash')).toBe(true)
+    })
+
+    it('replaceAll 归一化坏条目（丢弃缺 id/provider/credentialRef 的账号）', async () => {
+      await pool.addAccount(makeMockAccount())
+      // 手工编辑的备份可能带残缺条目：缺 credentialRef 的应被丢弃
+      const incoming = [
+        makeMockAccount(),
+        { id: 'broken', provider: 'buddy' } as ProviderAccountEntry,
+      ]
+      await pool.replaceAll(incoming, {})
+      const list = await pool.listAllAccounts()
+      expect(list.map(a => a.id)).toEqual(['buddy-001'])
+    })
+  })
 })
 
 describe('findAccountIdByCredential 的 provider 字段选择', () => {
