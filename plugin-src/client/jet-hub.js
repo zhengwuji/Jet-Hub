@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import { bulkButtonState } from './model-bulk.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -368,6 +369,13 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const [toggleError, setToggleError] = React.useState(null);
   // 正在提交的模型 id 集合：只禁用被点的那一行，避免整表锁死。
   const [busyIds, setBusyIds] = React.useState(() => new Set());
+  /**
+   * 批量开关（打开全部 / 关闭全部）是否正在提交。
+   *
+   * 与 `busyIds` 分开：批量期间要禁用**全部**单条开关与两个批量按钮 ——
+   * 黑名单是整体写入，并发提交必然互相覆盖（后写的那次会丢掉先写的改动）。
+   */
+  const [bulkBusy, setBulkBusy] = React.useState(false);
   const mounted = React.useRef(true);
 
   const load = React.useCallback(async () => {
@@ -426,6 +434,41 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const all = models || [];
   const hiddenCount = all.filter(m => m.disabled).length;
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
+  // 「已经是目标状态」时对应按钮必须禁用，否则点了看不到任何变化、像是坏了。
+  const bulk = bulkButtonState(models, bulkBusy);
+
+  /**
+   * 批量打开/关闭全部模型。
+   *
+   * 走**批量端点**而不是循环调用 `model.setDisabled`：后者会发 N 次请求、写 N 次
+   * 完整文档、广播 N 次 `llm/adapters-updated`，且中途失败会留下「关了一半」的
+   * 黑名单。批量端点只落盘一次、只广播一次。
+   *
+   * 「关闭全部」先二次确认：一次误点会关掉该 provider 的全部模型。反之
+   * 「打开全部」是恢复性操作，不弹确认（弹窗只会碍事）。
+   *
+   * 成功后**就地更新**列表状态（不等重新拉取）：端点返回的是权威黑名单，
+   * 但列表里还有展示名等字段，只能按 id 就地翻 `disabled`。
+   */
+  const setAllDisabled = async (disabled) => {
+    if (disabled && !confirm(`确认关闭全部 ${all.length} 个模型？关闭后它们不再出现在对话框的模型选择里。`)) {
+      return;
+    }
+    setBulkBusy(true);
+    setToggleError(null);
+    try {
+      await rpcCall('model.setAllDisabled', { provider, disabled });
+      if (!mounted.current) return;
+      setModels(prev => (prev || []).map(m => ({ ...m, disabled })));
+    } catch (caught) {
+      console.error('[jet-hub] bulk toggle failed:', caught);
+      if (!mounted.current) return;
+      // 与单条切换同一约定：失败只提示、保留列表，绝不把整张表换成错误页。
+      setToggleError(caught?.message || `批量${disabled ? '关闭' : '打开'}模型失败`);
+    } finally {
+      if (mounted.current) setBulkBusy(false);
+    }
+  };
 
   const dialog = React.createElement('div', {
     className: 'dim-jh-modalOverlay',
@@ -459,6 +502,22 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      // 批量工具条：只在列表可用时渲染。计数从标题挪到这里，避免与标题争宽。
+      phase === 'ready' && all.length > 0
+        ? React.createElement('div', { className: 'dim-jh-modelBulkBar' },
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '打开该 Provider 的全部模型开关（含此前被关闭的）。',
+              disabled: bulk.openAllDisabled,
+              onClick: () => void setAllDisabled(false),
+            }, bulkBusy ? '处理中…' : '打开全部'),
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '关闭该 Provider 的全部模型开关，关闭后它们不再出现在对话框的模型选择里。',
+              disabled: bulk.closeAllDisabled,
+              onClick: () => void setAllDisabled(true),
+            }, bulkBusy ? '处理中…' : '关闭全部'))
+        : null,
       toggleError
         ? React.createElement('div', {
             className: 'dim-jh-probeNotice',
@@ -483,7 +542,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                   all.map(model => React.createElement(ModelToggle, {
                     key: model.id,
                     model,
-                    busy: busyIds.has(model.id),
+                    // 批量提交期间一并禁用单条开关：黑名单是整体写入，
+                    // 并发提交必然互相覆盖（后写的会丢掉先写的改动）。
+                    busy: busyIds.has(model.id) || bulkBusy,
                     onToggle: (id, disabled) => void toggleModel(id, disabled),
                   }))))));
 

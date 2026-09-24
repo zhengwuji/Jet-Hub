@@ -89,6 +89,8 @@ import type {
   RpcModelListResponse,
   RpcModelSetDisabledRequest,
   RpcModelSetDisabledResponse,
+  RpcModelSetAllDisabledRequest,
+  RpcModelSetAllDisabledResponse,
 } from './types.js'
 
 /** Jet Hub RPC API 路径 */
@@ -532,6 +534,44 @@ export function registerJetHubRpc(
  */
 export interface ModelCatalogSource {
   listAllModels(): readonly { id: string; name: string }[]
+}
+
+/**
+ * 广播「模型目录可能已变化」。
+ *
+ * ⚠️ **改黑名单后必须调用**，否则「关闭后选择器里仍能看到该模型，重启后才消失」
+ * （真实缺陷，用户报障）。根因在客户端而非适配器：
+ * `dsh-client-ui-model-selection` 的 `ModelCatalogDirectory` 把 `modelCatalog`
+ * 响应存进一个 `status === 'ready'` 即**短路返回缓存**的 store，只在三个转发的
+ * 宿主事件上 `refresh()`：`llm/adapters-updated` / `settings/document-updated`
+ * / `credentials/reference-updated`。
+ *
+ * **本仓库当前兼容 0.1.5**，黑名单仍落在 `ctx.settings` 的 `jet-hub` 文档
+ * （`AccountPool.scope.replace()`，见 account-pool.ts），故一次开关写入**本来
+ * 就会**触发 `settings/document-updated` —— 这一层刷新在 0.1.5 上已由 settings
+ * 提供。这里额外广播的**必要性**在于 settings 服务不可用时的降级分支：那时
+ * `scope` 为 undefined、写入只落内存、文档事件不会发生，广播是唯一的刷新手段。
+ *
+ * 它同时为将来的 0.1.7 兼容铺路：0.1.7 起黑名单改落插件自有文档
+ * `$DSH_HOME/jet-hub/state.json`（不再经 settings 文档，见 jet-hub-store.ts），
+ * 写开关**不会**触发上述任何一个事件，此时广播就从「补充」变成「必需」。
+ *
+ * 三者中 `llm/adapters-updated` 最贴合：按契约它是**无载荷**的「目录可能变了，
+ * 请重新读 listModels」通知（dsh-llm README：*consumers re-read the registries*），
+ * 正是这里要表达的语义。它也在 `API_REMOTE_FORWARDED_EVENTS` 白名单里（0.1.5 的
+ * dsh-api-remotes 亦已包含该条目），故会真的送达浏览器。不改变拓扑，故 dsh-llm
+ * 的 invariant 监听（对每个 provider 读一次 `retryPolicy`）必然通过，不会误报
+ * INVARIANT。
+ *
+ * ⚠️ **通知失败不能反噬已经落盘的开关**：否则用户看到「切换失败」而实际已生效，
+ * 再点一次又因幂等而看似「无效」，比不提示更难排查。故这里自行吞掉异常只记日志。
+ */
+function broadcastCatalogChanged(ctx: Context): void {
+  try {
+    ctx.emit('llm/adapters-updated')
+  } catch (error) {
+    ctx.logger.warn(`[jet-hub] 广播模型目录变更事件失败：${String(error)}`)
+  }
 }
 
 /** 注册 Jet Hub 管理 API 端点。使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。 */
@@ -1258,7 +1298,12 @@ function registerJetHubEndpoints(
       }
 
       // 打开/关闭某个模型。写入后**不重建适配器**：适配器的 listModels 每次
-      // 都直接读账号池的黑名单，因此下一轮模型目录刷新即生效。
+      // 都直接读账号池的黑名单，因此下一次调用即返回新目录。
+      //
+      // ⚠️ 但「适配器立刻返回新目录」**不等于**「界面立刻更新」—— 客户端把
+      // `modelCatalog` 的响应缓存在带 `status === 'ready'` 短路的 store 里，
+      // 只在转发事件上失效（详见下方 emit 的注释）。不广播就等于开关只写进了
+      // 磁盘、界面一直显示旧目录。
       case 'model.setDisabled': {
         const req = payload as RpcModelSetDisabledRequest
         if (typeof req.provider !== 'string' || typeof req.modelId !== 'string' || req.modelId.length === 0) {
@@ -1268,7 +1313,73 @@ function registerJetHubEndpoints(
         ctx.logger.info(
           `[jet-hub] ${req.disabled === true ? '关闭' : '打开'}模型 ${req.provider}/${req.modelId}`,
         )
+        // 必须广播：否则开关只写进磁盘、界面一直显示旧目录（成因见该函数注释）。
+        broadcastCatalogChanged(ctx)
         const value: RpcModelSetDisabledResponse = {
+          provider: req.provider,
+          disabledModels: pool.listDisabledModels(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      /**
+       * 批量打开/关闭某 provider 的全部模型（Jet Hub 模型列表的
+       * 「打开全部 / 关闭全部」）。
+       *
+       * 两个方向的语义**刻意不对称**（需求明确规定）：
+       *
+       * - `disabled: true`（关闭全部）：按**当前目录**逐项加入黑名单，故需要读
+       *   模型目录。目录优先取适配器的 `listAllModels()`（不套黑名单的全量目录，
+       *   与 `model.list` 同源），缺失时退化为 `llm.listModels()`。
+       * - `disabled: false`（打开全部）：直接清空该 provider 的黑名单条目，
+       *   **不读目录** —— 这样「曾被关闭、后来从服务端目录里下线」的历史遗留键
+       *   才能被清掉（按目录删的话它们永远留在配置里）。
+       *
+       * 为什么不做成前端循环调用 `model.setDisabled`：那会发 N 次请求、写 N 次
+       * 完整文档、广播 N 次 `llm/adapters-updated`，且中途失败会留下「关了一半」
+       * 的黑名单。批量端点只落盘一次、只广播一次。
+       */
+      case 'model.setAllDisabled': {
+        const req = payload as RpcModelSetAllDisabledRequest
+        // ⚠️ `disabled` **不做默认值猜测**：缺失或非布尔一律拒绝。默认成 true 会
+        // 让一次字段名写错的前端改动静默关闭用户全部模型；默认成 false 则反向
+        // 静默打开 —— 两个方向都是灾难性且难察觉的。
+        if (typeof req.provider !== 'string' || typeof req.disabled !== 'boolean') {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: 'provider 与 disabled（布尔）必填' },
+          }
+        }
+        if (req.disabled) {
+          // 关闭全部：先取全量目录，再一次性写入黑名单。
+          let ids: string[]
+          const all = modelAdapters?.[req.provider]?.listAllModels()
+          if (all !== undefined) {
+            ids = all.map((model) => model.id)
+          } else {
+            const llm = llmServiceOf(ctx)
+            if (llm === undefined) {
+              // 目录读不出来就**不落盘**：否则会写入一个不完整的黑名单，
+              // 用户看到「关了一半」且无从判断原因。
+              return { ok: false, error: { code: 'bad-request', message: 'llm 服务不可用' } }
+            }
+            try {
+              ids = (await llm.listModels(req.provider)).map((model) => model.id)
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error)
+              return { ok: false, error: { code: 'bad-request', message: `读取模型列表失败：${reason}` } }
+            }
+          }
+          await pool.setModelsDisabled(req.provider, ids)
+          ctx.logger.info(`[jet-hub] 关闭 ${req.provider} 的全部 ${ids.length} 个模型`)
+        } else {
+          // 打开全部：纯本地操作，不读目录 —— 目录故障时用户仍应能把开关全打开。
+          await pool.clearDisabledModels(req.provider)
+          ctx.logger.info(`[jet-hub] 打开 ${req.provider} 的全部模型`)
+        }
+        // 只广播一次：批量不等于逐条广播。
+        broadcastCatalogChanged(ctx)
+        const value: RpcModelSetAllDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
         }

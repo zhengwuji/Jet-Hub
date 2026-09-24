@@ -329,6 +329,27 @@ export interface RpcModelSetDisabledResponse {
   disabledModels: Record<string, boolean>
 }
 
+/**
+ * RPC: 批量打开/关闭某 provider 的全部模型请求。
+ *
+ * 两个方向**刻意不对称**（见 `AccountPool.setModelsDisabled` /
+ * `clearDisabledModels`）：
+ * - `disabled: true` 关闭全部：按当前目录逐项加入黑名单，服务端需要读目录；
+ * - `disabled: false` 打开全部：直接清空该 provider 的黑名单，不读目录 ——
+ *   这样「曾被关闭、后来从服务端目录里下线」的历史遗留键才能被清掉。
+ *
+ * `disabled` **没有默认值**：缺失或非布尔一律拒绝。若默认成 `true`，一次字段名
+ * 写错的前端改动会静默关闭用户全部模型；默认成 `false` 则反向静默打开 ——
+ * 两个方向都是灾难性且难察觉的。
+ */
+export interface RpcModelSetAllDisabledRequest {
+  provider: string
+  disabled: boolean
+}
+
+/** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
+export type RpcModelSetAllDisabledResponse = RpcModelSetDisabledResponse
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string

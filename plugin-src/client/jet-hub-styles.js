@@ -144,6 +144,8 @@ const STYLES = `
 .dim-jh-modelPanelCount { font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-tertiary, #8f959e); }
 .dim-jh-modalHint { flex: none; margin: 10px 0 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 .dim-jh-modal .dim-jh-probeNotice { flex: none; margin: 10px 0 0; }
+/* 批量工具条（打开全部 / 关闭全部）：固定不滚动，紧跟在说明文字下方 */
+.dim-jh-modelBulkBar { flex: none; display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 /* 列表区独立滚动：头部与说明固定，模型多时只滚中间 */
 .dim-jh-modalBody { flex: 1 1 auto; min-height: 0; margin-top: 10px; overflow-y: auto; }
 .dim-jh-modalBody .dim-jh-empty { padding: 24px; }
