@@ -1284,6 +1284,46 @@ Muse Spark 1.3 Contributor · 免费
 `reasoning_effort: 'high'`，思考 token 计入 `completion_tokens`。想要完全不思考，
 在选择器里选 `None` 即可。
 
+### Gemini 系模型的两个 400（已修）
+
+`cline-free/gemini-3.8-flash` 曾「发消息即失败」。错误体里一次请求有**两个
+provider 尝试、两个不同的错误**，是两个独立根因：
+
+| provider | 错误 | 根因 |
+|---|---|---|
+| `vertex` | `maxOutputTokens 131072 超出 1..65537` | 兜底表数值填错，应为 **65536** |
+| `google` | `tools[..].properties[permission].enum[3]: cannot be empty` | 工具 schema 的 `enum` 含空串 |
+
+- **上限**：该模型不在客户端内嵌目录里，曾经照抄其它免费模型填了 `131072`；
+  实测上限是 **65536**。适配器的 `clampClineMaxTokens` 也会把越界值收敛。
+- **工具 schema**：harness 下发的工具集里某些 `enum` 带空字符串成员，Gemini 系
+  严格校验直接 400。插件从不自己造 enum（原样透传 `tool.parameters`），
+  但请求是我们发的，故由 `sanitizeClineToolParameters()` 递归清洗：
+  只删空串、保留数值枚举、全空则丢弃 `enum` 键、递归下钻嵌套层。
+
+⚠️ 故障**不是必现的** —— 上游会依次 fallback 多个 provider，命中哪个就暴露哪个
+错误。别因为「重发一次就通了」而误判为偶发故障。
+
+### 「API 密钥无效」不一定是真的凭据问题
+
+部分模型（实测 `cline-free/muse-spark-1.3-contributor`）在该地区不可用，Cline 返回：
+
+```
+403 {"error":"access forbidden: … is not available in your region","success":false}
+```
+
+⚠️ 这条 403 与凭据无关，但 DSH 客户端对 `AUTH` 错误码一律显示「API 密钥无效」，
+真实原因会被完全掩盖。
+
+插件已按响应体文案识别地域限制（不能只看状态码 —— 同一批 403 里也有真凭据问题），
+命中时**跳过无意义的续期**，并以 `PERMISSION_DENIED` 抛出真实原因，例如：
+
+```
+cline: access forbidden: cline-free/muse-spark-1.3-contributor is not available in your region
+```
+
+这类模型无法在本地区使用，可在 Jet Hub 的「显示列表」里关掉，换用其它免费模型。
+
 ### 积分余额
 
 Jet Hub 的 Cline 账号卡片会显示账户余额（`GET /api/v1/users/{accountId}/balance`）。

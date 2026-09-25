@@ -270,10 +270,18 @@ export function errorMessage(error: unknown): string {
 export function errorDetail(body: string): string {
   try {
     const data = JSON.parse(body) as Record<string, unknown>
+    // ⚠️ `error` 也要认：Cline 的部分错误体是 `{error: "<文案>", success: false}`
+    //（如地域限制 `{"error":"access forbidden: … is not available in your region"}`），
+    // 且它可能是**字符串**也可能是嵌套对象 —— 只认 code/message/msg 会把
+    // 整个 JSON 原样返回，用户看到一坨不可读的裸 JSON。
+    const nested = typeof data.error === 'object' && data.error !== null
+      ? (data.error as Record<string, unknown>).message
+      : data.error
     const parts = [
       typeof data.code === 'number' || typeof data.code === 'string' ? `code=${String(data.code)}` : undefined,
       typeof data.message === 'string' ? data.message : undefined,
       typeof data.msg === 'string' ? data.msg : undefined,
+      typeof nested === 'string' ? nested : undefined,
     ].filter((value): value is string => value !== undefined)
     if (parts.length > 0) return parts.join(' ')
   } catch {

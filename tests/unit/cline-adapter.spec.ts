@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { ClineAdapter, isClineRotatableFailure, recordsClineRateLimit } from '../../src/cline-adapter.js'
+import {
+  ClineAdapter,
+  isClineRotatableFailure,
+  recordsClineRateLimit,
+  sanitizeClineToolParameters,
+} from '../../src/cline-adapter.js'
 import { CLINE } from '../../src/cline-product.js'
 import { mergeClineModels, type ClineModel } from '../../src/cline-models.js'
 import type { ClineCredential } from '../../src/cline.js'
@@ -275,6 +280,55 @@ describe('ClineAdapter 请求构造', () => {
     expect(body.tools[0]!.function.name).toBe('read_file')
   })
 
+  it('工具 schema 的空串 enum 被清洗（否则 Gemini 系 400）', async () => {
+    const bodies: string[] = []
+    const adapter = makeAdapter({
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        bodies.push(String(init.body))
+        return sseResponse([JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })])
+      }) as unknown as typeof fetch,
+    })
+    // 复刻真实报障：harness 下发的 permission 参数 enum 含空串成员（第 4 项）。
+    // 上游原话：GenerateContentRequest.tools[0].function_declarations[34]
+    //           .parameters.properties[permission].enum[3]: cannot be empty
+    await collect(adapter, {
+      tools: [{
+        name: 'set_permission',
+        description: 'switch preset',
+        parameters: {
+          type: 'object',
+          properties: {
+            permission: { type: 'string', enum: ['read', 'write', 'execute', ''] },
+          },
+        },
+      }],
+    })
+    const body = JSON.parse(bodies[0]!) as {
+      tools: Array<{ function: { parameters: { properties: { permission: { enum: string[] } } } } }>
+    }
+    expect(body.tools[0]!.function.parameters.properties.permission.enum)
+      .toEqual(['read', 'write', 'execute'])
+  })
+
+  it('enum 清洗的三条边界（只删空串 / 保留数值 / 全空则丢弃键 / 递归下钻）', () => {
+    // ① 数值枚举不能被「只留字符串」的过滤整段丢掉
+    expect(sanitizeClineToolParameters({
+      properties: { level: { enum: [1, 2, 3] } },
+    })).toEqual({ properties: { level: { enum: [1, 2, 3] } } })
+    // ② 纯空白同样算空；③ 过滤后为空则整个 enum 键消失（空 enum 同样非法）
+    expect(sanitizeClineToolParameters({ mode: { enum: ['   ', 'ok'] } }))
+      .toEqual({ mode: { enum: ['ok'] } })
+    expect(sanitizeClineToolParameters({ mode: { enum: ['', '  '] } }))
+      .toEqual({ mode: {} })
+    // ④ 嵌套层（properties / items）里的 enum 同罪
+    expect(sanitizeClineToolParameters({
+      properties: { nested: { items: { enum: ['a', ''] } } },
+    })).toEqual({ properties: { nested: { items: { enum: ['a'] } } } })
+    // ⑤ 非对象原样透传
+    expect(sanitizeClineToolParameters('plain')).toBe('plain')
+    expect(sanitizeClineToolParameters(null)).toBe(null)
+  })
+
   it('max_tokens 收敛到安全上限（不编造、不超界）', async () => {
     const bodies: string[] = []
     const adapter = makeAdapter({
@@ -406,6 +460,60 @@ describe('ClineAdapter 限流与换号判定', () => {
     expect(recordsClineRateLimit(429, '')).toBe(true)
     expect(recordsClineRateLimit(402, '')).toBe(true)
     expect(recordsClineRateLimit(400, 'insufficient credit')).toBe(false)
+  })
+
+  it('地域限制（403 not available in your region）不被误判为凭据问题，且不白跑续期', async () => {
+    let refreshed = 0
+    const adapter = makeAdapter({
+      refresh: async () => { refreshed += 1 },
+      fetchImpl: (async () => new Response(
+        JSON.stringify({ error: 'access forbidden: cline-free/muse-spark-1.3-contributor is not available in your region', success: false }),
+        { status: 403 },
+      )) as unknown as typeof fetch,
+    })
+    await expect(collect(adapter)).rejects.toThrow(/region|不可用/)
+    // ⚠️ 该 403 与凭据无关，续期一次都是浪费 —— 修复前会白跑一次
+    expect(refreshed).toBe(0)
+  })
+
+  it('地域限制的错误码不是 AUTH（否则 UI 会显示「API 密钥无效」掩盖真实原因）', async () => {
+    // ⚠️ 客户端的 failureMessage() 是 `code === "AUTH" ? "API 密钥无效" : message`
+    // —— 只要被归成 AUTH，真实原因就彻底丢失。故这里断言**错误码**，
+    // 只断言 message 是恒真的（旧代码原样透传错误体，文案也匹配）。
+    const adapter = makeAdapter({
+      fetchImpl: (async () => new Response(
+        JSON.stringify({ error: 'access forbidden: x is not available in your region' }),
+        { status: 403 },
+      )) as unknown as typeof fetch,
+    })
+    let code = ''
+    try {
+      await collect(adapter)
+    } catch (error) {
+      code = String((error as { code?: string }).code ?? '')
+    }
+    expect(code).not.toBe('AUTH')
+    expect(code).toBe('PERMISSION_DENIED')
+  })
+
+  it('真正的 401 仍然会续期重试（地域判定不能误伤认证路径）', async () => {
+    let refreshed = 0
+    let call = 0
+    const adapter = makeAdapter({
+      resolveCredential: async () => (refreshed > 0
+        ? { ...cred, access_token: 'workos:new-token' }
+        : cred),
+      refresh: async () => { refreshed += 1 },
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        call += 1
+        // 第一次 401（凭据问题），第二次用新凭据成功
+        if (call === 1) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
+        return sseResponse([JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })])
+      }) as unknown as typeof fetch,
+    })
+    const chunks = await collect(adapter)
+    expect(refreshed).toBe(1)
+    expect(chunks.length).toBeGreaterThan(0)
   })
 
   it('限流时换到下一个账号并成功', async () => {

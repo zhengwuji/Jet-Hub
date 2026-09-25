@@ -162,12 +162,18 @@ const CLINE_FALLBACK_MODELS: readonly ClineFallbackModel[] = [
     description: 'Fast and efficient with 1M context window',
   },
   {
-    // ⚠️ 内嵌目录里**没有**这一条（只有远端 `free` 数组下发），
-    // 元数据取自远端 description + 同类模型的窗口实测口径。
+    // ⚠️ 内嵌目录里**没有**这一条（只有远端 `free` 数组下发），元数据取自
+    // 远端 description + 同名 `google/gemini-3.8-flash` 的目录实测值。
+    //
+    // ⚠️ **输出上限是 65536，不要照抄其它免费模型的 131072**（真实缺陷，
+    // 用户报障 2026-09-25）：给该模型发 `max_tokens=131072` 会被上游的
+    // vertex provider 以 400 拒绝 —— "has a maxOutputTokens value of 131072
+    // but the supported range is from 1 (inclusive) to 65537 (exclusive)"，
+    // 即上限就是 65536，与内嵌目录一致。
     id: 'cline-free/gemini-3.8-flash',
     name: 'Gemini 3.8 Flash',
     contextWindow: 1_048_576,
-    maxTokens: 131_072,
+    maxTokens: 65_536,
     supportsImage: true,
     isFree: true,
     description: "Google's most intelligent Flash model",

@@ -80,6 +80,49 @@ function clampClineMaxTokens(value: number | undefined): number | undefined {
 }
 
 /**
+ * 清洗工具参数 schema 里的 `enum`（递归）。
+ *
+ * ## 为什么必须清洗（实测 400，用户报障 2026-09-25）
+ *
+ * harness 下发的工具集里，某些参数的 `enum` 含**空字符串**成员。Gemini 系模型
+ * （经 `google` / `vertex` provider）对此**严格校验**，直接拒绝整个请求：
+ *
+ * ```
+ * GenerateContentRequest.tools[0].function_declarations[34]
+ *   .parameters.properties[permission].enum[3]: cannot be empty
+ * ```
+ *
+ * ⚠️ 该错误**只在部分 provider 上暴露**：上游一次请求会依次尝试多个 provider，
+ * 实测命中 vertex 时报「maxOutputTokens 越界」、命中 google 时报上述 enum 错误。
+ * 两者是**两个独立根因**，都要修，否则路由一漂移就复发。
+ *
+ * ⚠️ 本适配器**从不自己造 enum** —— `stream()` 原样透传
+ * `options.tools[].parameters`，故脏数据来自上游 harness。但请求是我们发的，
+ * 只能在我们这一侧拦住。
+ *
+ * ## 三条边界（都要守）
+ *
+ * - **只删空字符串**（含纯空白），其余成员原样保留 —— `enum` 可能是数字/布尔
+ *   数组，按「只留字符串」过滤会把合法的数值枚举整段丢掉；
+ * - 过滤后为空则**整个 `enum` 键丢弃**（空 `enum` 同样非法），而非留下 `[]`；
+ * - **递归下钻**：`properties` / `items` 等嵌套层里的 `enum` 同罪。
+ */
+export function sanitizeClineToolParameters(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeClineToolParameters)
+  if (value === null || typeof value !== 'object') return value
+  const out: Record<string, unknown> = {}
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (key === 'enum' && Array.isArray(raw)) {
+      const cleaned = raw.filter((item) => !(typeof item === 'string' && item.trim().length === 0))
+      if (cleaned.length > 0) out[key] = cleaned
+      continue
+    }
+    out[key] = sanitizeClineToolParameters(raw)
+  }
+  return out
+}
+
+/**
  * SSE 空闲超时（毫秒）。
  *
  * 分两阶段：等待首 token 的窗口与两次 chunk 之间的最大静默，均可用环境变量
@@ -381,7 +424,9 @@ export class ClineAdapter extends LlmAdapter {
         function: {
           name: tool.name,
           description: tool.description,
-          parameters: tool.parameters,
+          // ⚠️ parameters 必须清洗后再下发：harness 的工具 schema 里可能带
+          // 空串 `enum` 成员，Gemini 系会直接 400（见 sanitizeClineToolParameters）。
+          parameters: sanitizeClineToolParameters(tool.parameters),
         },
       }))
     }
@@ -403,9 +448,21 @@ export class ClineAdapter extends LlmAdapter {
     const body = JSON.stringify(bodyObj)
 
     // 3. 发送请求（401/403 时刷新一次凭据后重试）
+    //
+    // ⚠️ **403 必须先排除「地域限制」**：它与凭据无关，续期在这里永远无用，
+    // 且最终会被归成 AUTH（UI 显示「API 密钥无效」），真实原因彻底丢失。
+    // 命中时直接抛出带真实原因的错误（见 isClineRegionForbidden）。
     let currentAccountId = ''
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
+      const forbiddenText = await response.text().catch(() => '')
+      if (isClineRegionForbidden(response.status, forbiddenText)) {
+        throw new LlmError(
+          `cline: ${errorDetail(forbiddenText)}`,
+          'PERMISSION_DENIED',
+          { status: response.status },
+        )
+      }
       await this.options.refresh()
       const refreshed = await this.options.resolveCredential()
       if (refreshed === undefined || refreshed.access_token.length === 0) {
@@ -547,6 +604,46 @@ export const CLINE_CREDIT_MARKERS: readonly string[] = [
 export function recordsClineRateLimit(status: number, _body: string): boolean {
   return status === 429 || status === 402
 }
+
+/**
+ * 该失败是否是**与凭据无关的访问限制**（地域封锁 / 模型未开通）。
+ *
+ * ## 为什么必须单独识别（真实缺陷，用户报障 2026-09-25）
+ *
+ * Cline 对「该地区不可用」的模型返回 **403**，而 401/403 在本适配器里原本一律
+ * 被当作「凭据过期」：触发续期 → 重试 → 仍 403 → 最终 `httpErrorCode(403)`
+ * 归成 `AUTH` → DSH 渲染成「**API 密钥无效**」。
+ *
+ * 实测 `cline-free/muse-spark-1.3-contributor`：
+ *
+ * ```
+ * 403 {"error":"access forbidden: cline-free/muse-spark-1.3-contributor
+ *       is not available in your region","success":false}
+ * ```
+ *
+ * 后果有两个：① 真实原因（地域限制）被完全掩盖，用户以为要去重新登录；
+ * ② 每次请求都白跑一次续期（续期还会成功，所以不会提前报错，纯属浪费）。
+ *
+ * ⚠️ **不能按状态码一刀切**：同一批 403 里既有真的凭据问题，也有地域限制，
+ * 只能靠**响应体文案**区分。认三种表述（上游措辞可能微调，故取特征词）：
+ * `not available in your region` / `access forbidden` / `region not supported`。
+ *
+ * ⚠️ 命中时**跳过续期**，并让错误文案带出真实原因 —— 续期在这里永远无用，
+ * 反而拖慢失败反馈。
+ */
+export function isClineRegionForbidden(status: number, body: string): boolean {
+  if (status !== 403) return false
+  const lower = body.toLowerCase()
+  return CLINE_REGION_FORBIDDEN_MARKERS.some((marker) => lower.includes(marker))
+}
+
+/** 地域/访问限制文案标记（小写比对）。 */
+const CLINE_REGION_FORBIDDEN_MARKERS: readonly string[] = [
+  'not available in your region',
+  'access forbidden',
+  'region not supported',
+  'not available in your country',
+]
 
 /**
  * 在 `ctx.llm` 上注册 Cline provider 路由与适配器。

@@ -943,6 +943,82 @@ IDE 的模型选择器旁有思考强度菜单（`None / Low / Medium / High / E
 `scripts/probe-cline-effort-compare.mjs`（**消耗免费额度**，多次采样对比档位）。
 设计文档：`docs/superpowers/specs/2026-09-25-cline-reasoning-effort-design.md`。
 
+### ⚠️ 坑 5：Gemini 系有两个**独立**的 400，且各自只在部分 provider 上暴露
+
+用户报障（2026-09-25）：给 `cline-free/gemini-3.8-flash` 发消息即失败。错误体里
+一次请求有**两个 provider 尝试、两个不同的错误**：
+
+| provider | 错误 |
+|---|---|
+| `vertex` | `maxOutputTokens value of 131072 but the supported range is from 1 to 65537` |
+| `google` | `tools[0].function_declarations[34].parameters.properties[permission].enum[3]: cannot be empty` |
+
+⚠️ **不要只修一个** —— 上游会依次 fallback，命中哪个 provider 就暴露哪个错误，
+路由一漂移就复发。
+
+**根因 1（我们的错）：兜底表数值凭印象填。** `cline-free/gemini-3.8-flash` 不在
+sidecar 内嵌目录里，当初手工补表时照抄了其它免费模型的 `131072`；而同名
+`google/gemini-3.8-flash` 的实测值是 **65536**，上游上限即 65536。
+这与 Qoder 那条「本表数值必须逐条对照，不要凭印象填」是**同类错误**。
+
+**根因 2（必现）：工具 schema 的 `enum` 含空串。** harness 下发的工具集里某些
+参数的 `enum` 带空字符串成员，Gemini 系严格校验直接 400。
+⚠️ 本适配器**从不自己造 enum**（`stream()` 原样透传 `tool.parameters`），
+脏数据来自上游 harness —— 但请求是我们发的，只能在我们这侧拦住。
+`sanitizeClineToolParameters()` 递归清洗，三条边界：只删空串（保留数值枚举）、
+全空则丢弃 `enum` 键（空 `enum` 同样非法）、递归下钻 `properties` / `items`。
+
+⚠️ **排障时注意：这两个 400 都不是必现的。** 实测同一 `max_tokens=131072`
+连发 3 次都返回 200（那几轮没命中 vertex）。判定依据是错误体里的
+`providerMetadata.gateway.routing.modelAttempts[].providerAttempts[]`，
+不是重试次数 —— 别因为「重发一次就通了」而误判为偶发。
+
+⚠️ 顺带：本机 `~/.cline/data/settings/providers.json` 里的 `accessToken` **常常过期**
+（实测过期 1 小时，直接请求得到 401），排查前先续期；续期返回的是**裸** JWT，
+必须补 `workos:` 前缀才能用（坑 1）。
+
+排查 / 验证脚本：`scripts/probe-cline-gemini-400b.mjs`（对照复现两个根因）、
+`scripts/verify-cline-gemini-fix.mjs`（走已编译 `lib/` 的端到端验证，三个场景）。
+均**消耗免费额度**。
+
+### ⚠️ 坑 6：403 不都是凭据问题 —— 地域限制会被误报成「API 密钥无效」
+
+用户报障（2026-09-25）：`cline-free/muse-spark-1.3-contributor` 提示
+「**API 密钥无效**」，但凭据是好的。
+
+该中文文案**不是本插件抛的** —— 它来自 DSH 客户端 `failureMessage()`：
+
+```js
+return code === "AUTH" ? t("message.failure.auth") : message
+```
+
+即**只要错误码是 `AUTH`，真实原因就被替换成「API 密钥无效」**；非 `AUTH` 则
+原样显示 message。而 `httpErrorCode()` 把 401/403 **一律**映射成 `AUTH`。
+
+⚠️ Cline 对「该地区不可用」的模型也返回 **403**：
+
+```
+403 {"error":"access forbidden: cline-free/muse-spark-1.3-contributor
+     is not available in your region","success":false}
+```
+
+于是故障链是：403 → 当作凭据过期 → **白跑一次续期**（续期还会成功，所以不提前
+报错）→ 重试仍 403 → 归成 `AUTH` → UI 显示「API 密钥无效」。真实原因彻底丢失，
+用户以为要去重新登录。
+
+修法：`isClineRegionForbidden()` 按**响应体文案**识别（不能按状态码一刀切 ——
+同一批 403 里既有真凭据问题也有地域限制），命中时**跳过续期**并抛
+`PERMISSION_DENIED`（该码不在 DSH 默认可重试集合内，不会反复重试）。
+
+⚠️ 顺带修了 `errorDetail()`：Cline 的错误体是 `{error: "<文案>", success:false}`，
+而该函数原本只认 `code` / `message` / `msg` → 整个 JSON 原样返回，用户看到一坨
+裸 JSON。现已补 `error`（字符串与嵌套对象两种形态都认）。这是**共享函数**，
+Qoder 同样受益，改动已由全量单测覆盖。
+
+排查 / 验证脚本：`scripts/probe-cline-muse-403.mjs`（直接看真实状态码）、
+`scripts/verify-cline-region-fix.mjs`（走 `lib/` 验证错误码与续期次数）。
+均**消耗免费额度**。
+
 ### 登录：WorkOS 设备码（与 Qoder 同为轮询式，但判据形态不同）
 
 ```
