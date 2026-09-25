@@ -39,8 +39,14 @@ function makeEntry(overrides: Partial<ProviderAccountEntry> = {}): ProviderAccou
 function makePool(entries: ProviderAccountEntry[]) {
   const accounts = new Map(entries.map(e => [e.id, { ...e }]))
   const cleared: Array<{ accountId: string; modelIds?: readonly string[] }> = []
-  const pool: ProbePool & { cleared: typeof cleared; get(id: string): ProviderAccountEntry | undefined } = {
+  const updated: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+  const pool: ProbePool & {
+    cleared: typeof cleared
+    updated: typeof updated
+    get(id: string): ProviderAccountEntry | undefined
+  } = {
     cleared,
+    updated,
     get: (id) => accounts.get(id),
     findAccount: (id) => accounts.get(id),
     listAccountsByProvider: (provider) => [...accounts.values()].filter(a => a.provider === provider),
@@ -65,6 +71,16 @@ function makePool(entries: ProviderAccountEntry[]) {
       accounts.set(accountId, next)
       cleared.push({ accountId, modelIds })
       return removed
+    },
+    // 真实写回，供「仍受限时用上游新时刻覆盖旧值」的断言使用。
+    async updateModelRateLimit(accountId, modelId, resetAtMs) {
+      const entry = accounts.get(accountId)
+      if (entry === undefined) return
+      accounts.set(accountId, {
+        ...entry,
+        modelRateLimits: { ...entry.modelRateLimits, [modelId]: resetAtMs },
+      })
+      updated.push({ accountId, modelId, resetAtMs })
     },
   }
   return pool
@@ -110,6 +126,47 @@ describe('retestAccount', () => {
     expect(result.tested).toBe(0)
     expect(probe).not.toHaveBeenCalled()
     expect(pool.cleared).toEqual([])
+  })
+
+  /**
+   * 回归：限流是**滚动窗口**，上游每次都会把重置时刻往后推。若重测只报「仍受限」
+   * 而不把新时刻写回，存储会一直停在第一次的旧值 —— 旧值一旦过期，
+   * UI 的 `modelRateLimits[v] > Date.now()` 判为过期而**不再渲染「限额重置」**，
+   * 于是出现「弹窗说仍受限、账号卡片却空白」的矛盾，选号也会误判为可用。
+   */
+  it('仍受限时用上游给出的新重置时刻覆盖旧值（滚动窗口）', async () => {
+    const staleReset = Date.now() - 60_000 // 已过期的旧时刻
+    const freshReset = Date.now() + 45 * 60_000 // 上游推后到 45 分钟后
+    const pool = makePool([makeEntry({
+      modelRateLimits: { 'deepseek-v4.1-flash': staleReset },
+    })])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({
+      modelId, ok: false, message: '仍受限：频率限制', resetTimeMs: freshReset,
+    }))
+
+    const result = await retestAccount(pool, 'buddy-1', { probe })
+
+    expect(result.cleared).toEqual([])
+    // 关键：新时刻被写回并覆盖过期旧值 ⇒ UI 才会重新显示「限额重置」
+    expect(pool.updated).toEqual([
+      { accountId: 'buddy-1', modelId: 'deepseek-v4.1-flash', resetAtMs: freshReset },
+    ])
+    expect(pool.get('buddy-1')?.modelRateLimits).toEqual({ 'deepseek-v4.1-flash': freshReset })
+  })
+
+  it('仍受限但没有可解析的重置时刻时不写回（保留原标记）', async () => {
+    const staleReset = Date.now() + 3_600_000
+    const pool = makePool([makeEntry({
+      modelRateLimits: { 'deepseek-v4.1-flash': staleReset },
+    })])
+    const probe = vi.fn(async (_entry: ProviderAccountEntry, modelId: string) => ({
+      modelId, ok: false, message: '仍受限：频率限制', // 无 resetTimeMs
+    }))
+
+    await retestAccount(pool, 'buddy-1', { probe })
+
+    expect(pool.updated).toEqual([])
+    expect(pool.get('buddy-1')?.modelRateLimits).toEqual({ 'deepseek-v4.1-flash': staleReset })
   })
 
   it('账号不存在时返回错误而不抛异常', async () => {

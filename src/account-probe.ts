@@ -34,7 +34,7 @@ import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import { BuddyAdapter } from './buddy-adapter.js'
 import { LobsteraiAdapter } from './lobsterai-adapter.js'
 import { TraeAdapter } from './trae-adapter.js'
-import { CodeArtsAdapter, isRateLimited } from './llm-adapter.js'
+import { CodeArtsAdapter, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { productById } from './product.js'
 import { lobsteraiProductById } from './lobsterai-product.js'
 import type { BuddyCredential } from './buddy.js'
@@ -126,6 +126,13 @@ export interface ProbePool {
   resolveCredentialForAccount(id: string): Promise<ProbeCredential | undefined>
   /** 清除限流标记；modelIds 省略时清除全部。返回清除条数。 */
   clearModelRateLimits(accountId: string, modelIds?: readonly string[]): Promise<number>
+  /**
+   * 写入/更新某账号某模型的限流重置时刻。
+   *
+   * [patch-codearts-probe-ratelimit] 重测发现「仍受限」时需要它把上游给的
+   * **新**时刻写回，否则存储停在旧值、UI 不再显示限流。
+   */
+  updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number): Promise<void>
 }
 
 /** 探测依赖注入点（测试可覆盖）。 */
@@ -242,7 +249,17 @@ async function probeWithAdapter(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (isRateLimitFailure(error)) {
-      return { modelId, ok: false, message: `仍受限：${message}` }
+      // [patch-codearts-probe-ratelimit] 上游的重置时刻是**滚动**的：每次撞限流都会
+      // 把它往后推。这里必须把它解析出来一并回传，否则调用方只能保留存储里的旧值，
+      // 旧值过期后 UI 就不再渲染「限额重置」（表现为"重测说仍受限、卡片却没有"）。
+      // 解析失败（文案无时间）时不带该字段，调用方按「无法确认」处理、保留原标记。
+      const parsed = parseRateLimitError(message, modelId)
+      return {
+        modelId,
+        ok: false,
+        message: `仍受限：${message}`,
+        ...(parsed !== null ? { resetTimeMs: parsed.resetTimeMs } : {}),
+      }
     }
     return { modelId, ok: false, message: `无法确认：${message}` }
   }
@@ -293,6 +310,14 @@ export async function retestAccount(
   // 只有实测通过的模型才清除标记；仍受限/无法确认的一律保留。
   if (result.cleared.length > 0) {
     await pool.clearModelRateLimits(accountId, result.cleared)
+  }
+  // [patch-codearts-probe-ratelimit] 对「仍受限且上游给出了新重置时刻」的模型，
+  // 把**新时刻**写回存储。不写回的话，存储会一直停在第一次撞限流的旧时刻；
+  // 旧时刻过期后 UI 不再渲染「限额重置」（卡片空白），而账号实际仍在受限，
+  // 选号逻辑也会误判为可用。上游时刻是滚动的，每次重测都可能往后推。
+  for (const outcome of result.stillLimited) {
+    if (outcome.resetTimeMs === undefined) continue
+    await pool.updateModelRateLimit(accountId, outcome.modelId, outcome.resetTimeMs)
   }
   return result
 }
