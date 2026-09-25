@@ -1532,6 +1532,9 @@ export function JetHubPage({ close, rpcCall }) {
     setCheckinBusy(true);
     setCheckinNotice(null);
     const parts = [];
+    // 需要用户操作的提示（如「该账号尚未开通，请先用官方客户端登录一次」）。
+    // 单独收集、单独渲染：混进计数行会被读漏，而这类提示的价值就在于被看到。
+    const notes = [];
     let totalCredit = 0;
     let failed = 0;
     for (const provider of checkinProviders()) {
@@ -1554,7 +1557,7 @@ export function JetHubPage({ close, rpcCall }) {
           bits.push(`+${s.totalCredit}`);
         }
         if (s.alreadyClaimed > 0) bits.push(`${s.alreadyClaimed} 个今日已领`);
-        if (s.inactive > 0) bits.push(`${s.inactive} 个活动未开启`);
+        if (s.inactive > 0) bits.push(`${s.inactive} 个暂无活动`);
         if (s.failed > 0) {
           failed += s.failed;
           // 附上第一条失败原因：只给计数会让用户与排查者都无从下手
@@ -1564,6 +1567,26 @@ export function JetHubPage({ close, rpcCall }) {
           bits.push(`${s.failed} 个失败${reason ? `（${reason}）` : ''}`);
         }
         parts.push(`${label} ${bits.length > 0 ? bits.join('，') : '无账号'}`);
+
+        // ⚠️ **需要用户操作的提示必须单独列出，不能只留在计数里**。
+        //
+        // 真实缺陷（用户报障 2026-09-26）：用本插件 GitHub 授权**新注册**的
+        // Qoder 账号尚未在 Qoder 侧开通每日领取，后端已返回可操作文案
+        // （「请先用 Qoder 官方客户端登录一次该账号」），但汇总行只显示
+        // 「N 个暂无活动」—— 用户看不到该怎么办，只能来问。
+        //
+        // 判据用后端的**显式字段** `outcome.actionRequired`，
+        // **不要**改成「message 非空就展示」或去匹配文案内容：
+        // 前者会把所有 inactive 都单列（含「今天活动暂未开始」这类无需操作的），
+        // 后者会在文案改措辞时静默失效。语义定义见 `src/credits.ts`。
+        for (const item of res?.results || []) {
+          const outcome = item?.outcome || {};
+          if (outcome.actionRequired !== true) continue;
+          const msg = outcome.message;
+          if (typeof msg !== 'string' || msg.length === 0) continue;
+          // 去重：多个账号同因未开通时只提示一次，避免刷屏
+          if (!notes.includes(msg)) notes.push(msg);
+        }
       } catch (caught) {
         failed += 1;
         parts.push(`${label} 失败（${caught?.message || '未知原因'}）`);
@@ -1572,10 +1595,12 @@ export function JetHubPage({ close, rpcCall }) {
     }
     if (!mounted.current) return;
     setCheckinNotice({
-      tone: failed > 0 ? 'warn' : 'ok',
+      // 有待用户处理的提示时用 warn 色调，让那条提示更显眼
+      tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
       text: parts.length > 0
         ? `一键签到：${parts.join('，')}${totalCredit > 0 ? `（共 +${totalCredit} 积分）` : ''}`
         : '一键签到：没有可领取的渠道',
+      notes,
     });
     setCheckinBusy(false);
     // 领取会改变余额；递增版号让当前面板重新挂载并刷新账号与积分
@@ -1615,7 +1640,15 @@ export function JetHubPage({ close, rpcCall }) {
           'data-tone': checkinNotice.tone,
           role: checkinNotice.tone === 'error' ? 'alert' : 'status',
           style: { flex: 'none', margin: '12px 24px 0' },
-        }, React.createElement('div', null, checkinNotice.text))
+        },
+        React.createElement('div', null, checkinNotice.text),
+        // 需要用户操作的提示单列成列表（如「请先用 Qoder 官方客户端登录一次」）。
+        // 复用既有的 `dim-jh-probeDetails` 样式，不引入新样式。
+        (checkinNotice.notes || []).length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              checkinNotice.notes.map((note, index) =>
+                React.createElement('li', { key: index }, note)))
+          : null)
       : null,
     React.createElement('div', { className: 'dim-jh-layout' },
       React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },

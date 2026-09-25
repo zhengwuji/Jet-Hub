@@ -81,6 +81,87 @@ export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
 const QODER_CREDITS_TIMEOUT_MS = 15_000
 
 /**
+ * 账号尚未在 Qoder 侧「开通过」时的提示文案。
+ *
+ * ⚠️ **真实缺陷（用户报障，2026-09-26）**：用本插件经 GitHub 授权**新注册**
+ * 的 Qoder 账号，一键签到显示「当前没有可领取的活动」，用户以为是我们没做对
+ * （「需要 qoder 登录后在 `~\.qoder` 下建立对应用户的 … 才能正确领取」）。
+ *
+ * 实测证明**不是设备身份问题**（4 个 uid 经 `runtime-info.exe` 产出**完全相同**
+ * 的 token/type，即身份是设备级），而是**该账号在 Qoder 侧确实没有每日领取
+ * 活动**。对照数据（2026-09-26，同机同时刻）：
+ *
+ * | 账号 | 来源 | `~/.qoder/.models/<uid>` | `addOnQuota` | `CLAIM_BENEFIT` |
+ * |---|---|---|---|---|
+ *
+ * **判据取服务端信号**（不读本机文件）：本机目录信号虽也 4/4 命中，但用户
+ * 清过 `~/.qoder` 缓存、或在另一台机器上跑时会误报。
+ *
+ * 该文案要**可操作** —— 用户看完应知道「去 IDE 登录一次」，而不是面对
+ * 「没有可领取的活动」无从下手。
+ */
+const NOT_ACTIVATED_HINT =
+  '该账号尚未在 Qoder 侧开通每日领取（每日 100 Credits）。'
+  + '请先用 Qoder 官方客户端登录一次该账号，开通后再回来领取。'
+
+/**
+ * 判断账号是否「尚未开通每日领取」。
+ *
+ * 判据（两条**同时**满足才算，避免误报）：
+ * 1. 活动列表里**没有** `CLAIM_BENEFIT`（连已领的都没有）；
+ * 2. 用量响应里 `addOnQuota` 字段**不存在**（注意是缺失，不是 0 ——
+ *    已开通账号即使额度用尽也会有该字段，如 `{total:100, remaining:0}`）。
+ *
+ * ⚠️ 第 2 条用「字段是否存在」而非「remaining 是否为 0」：后者对
+ * 「额度用光」与「从未开通」不可区分，会把用光额度的老账号误报成未开通。
+ *
+ * @param campaigns 活动列表（undefined 表示未取到，此时不判定）
+ * @param usageBody 用量响应体（undefined 表示未取到，此时不判定）
+ */
+export function isQoderNotActivated(
+  campaigns: QoderCampaigns | undefined,
+  usageBody: unknown,
+): boolean {
+  // 取不到活动列表时无法判定 —— 保守返回 false（宁可少提示，不可误报）
+  if (campaigns === undefined) return false
+  const hasBenefit = campaigns.campaigns.some((c) => c.actionType === 'CLAIM_BENEFIT')
+  if (hasBenefit) return false
+
+  // 用量响应不可用时无法判定
+  if (typeof usageBody !== 'object' || usageBody === null) return false
+  const usage = (usageBody as Record<string, unknown>).qoderUsage
+  if (typeof usage !== 'object' || usage === null) return false
+  const record = usage as Record<string, unknown>
+  // `addOnQuota` 存在（哪怕是 0）即说明账号已开通 → 不是「未开通」
+  return record.addOnQuota === undefined
+}
+
+/**
+ * 拉取用量响应体（只读，失败返回 undefined）。
+ *
+ * 单独抽出来是给 `isQoderNotActivated` 喂判据用 —— 它需要一个**原始**响应，
+ * 而 `fetchQoderCreditBalance` 会把结果归一化成 `CreditBalance`
+ * （其中「查不到」与「余额 0」都可能变成 null，不足以区分开通与否）。
+ */
+export async function fetchQoderUsageRaw(
+  credential: QoderCredential,
+  product: QoderProduct,
+  fetcher: typeof fetch = fetch,
+): Promise<unknown> {
+  try {
+    const response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
+      method: 'GET',
+      headers: await creditsHeaders(credential, product),
+      signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS),
+    })
+    if (!response.ok) return undefined
+    return await response.json()
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * `/sash/` 端点（用量、活动）的公共请求头。
  *
  * ⚠️ **两个头都必需，缺一都会让服务端不下发「可领取」的活动**：
@@ -392,11 +473,22 @@ export async function fetchQoderCheckinStatus(
   const claimable = claimableCampaigns(parsed)
   const benefitCampaigns = parsed.campaigns.filter((c) => c.actionType === 'CLAIM_BENEFIT')
   const claimedBenefit = benefitCampaigns.filter((c) => c.claimStatus === 'CLAIMED')
+
+  // 无可领项且非「已领」时，进一步判断是否**未开通**（需要用户去官方客户端登录）。
+  // 判据与 `claimQoderDailyCheckin` 完全一致 —— 两处必须同源，否则状态查询说
+  // 「未领取」而领取时报「未开通」，用户会困惑。
+  const todayCheckedIn = claimedBenefit.length > 0 && claimable.length === 0
+  let actionRequired = false
+  if (!todayCheckedIn && claimable.length === 0) {
+    const usage = await fetchQoderUsageRaw(credential, product, fetcher)
+    actionRequired = isQoderNotActivated(parsed, usage)
+  }
+
   return {
     active: true,
     // 真有「领过」的领分类活动、且当前无可领项 ⇒ 今天已领。
     // 列表为空 / 仅 VIEW_DETAILS / 请求头不完整导致的空态，一律判**未领**。
-    todayCheckedIn: claimedBenefit.length > 0 && claimable.length === 0,
+    todayCheckedIn,
     streakDays: 0,
     dailyCredit: claimable[0]?.amount ?? benefitCampaigns[0]?.amount ?? 0,
     todayCredit: 0,
@@ -406,6 +498,8 @@ export async function fetchQoderCheckinStatus(
     activityName: benefitCampaigns[0]?.campaignKey ?? '',
     themeName: '',
     endTime: '',
+    // 只在为 true 时才带上该字段，保持既有响应形状最小变化
+    ...actionRequired ? { actionRequired: true } : {},
   }
 }
 
@@ -520,14 +614,26 @@ export async function claimQoderDailyCheckin(
 
   const targets = claimableCampaigns(parsed)
   if (targets.length === 0) {
-    // 区分两种「没领到」：确实领过 → already-claimed；压根没东西可领 → inactive。
+    // 区分三种「没领到」：
+    //   ① 确实领过      → already-claimed
+    //   ② 账号未开通    → inactive，但要给出**可操作**的提示（见 NOT_ACTIVATED_HINT）
+    //   ③ 只是暂时没活动 → inactive
     // 判据同 fetchQoderCheckinStatus（抓包实证：领取后该活动变 CLAIMED）。
     const claimedBefore = parsed.campaigns.some(
       (c) => c.actionType === 'CLAIM_BENEFIT' && c.claimStatus === 'CLAIMED',
     )
-    return claimedBefore
-      ? { kind: 'already-claimed', message: '今天已领取' }
-      : { kind: 'inactive', message: '当前没有可领取的活动' }
+    if (claimedBefore) return { kind: 'already-claimed', message: '今天已领取' }
+
+    // 未开通时额外查一次用量（只读）以确认 —— 两条判据同时满足才提示，
+    // 避免把「活动刚好刷新中」误报成「未开通」。
+    const usage = await fetchQoderUsageRaw(credential, product, fetcher)
+    if (isQoderNotActivated(parsed, usage)) {
+      // ⚠️ `actionRequired: true` 是给 UI 的**显式信号**（而非让它去猜文案）：
+      // 这条 inactive 需要用户去官方客户端登录一次，必须单独醒目展示。
+      // 理由与前端约定见 `credits.ts` 的 `ClaimOutcome.actionRequired`。
+      return { kind: 'inactive', message: NOT_ACTIVATED_HINT, actionRequired: true }
+    }
+    return { kind: 'inactive', message: '当前没有可领取的活动' }
   }
 
   let total = 0

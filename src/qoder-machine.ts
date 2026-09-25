@@ -158,26 +158,33 @@ function parseFile(path: string): QoderMachineIdentity | undefined {
  *
  * ## 主路径：**实时**调 `runtime-info.exe` 生成
  *
- * ⚠️ **真实缺陷（用户报障，2026-09-26）**：加入**第二个** Qoder 账号后，
- * 一键领取对它报「当前没有可领取的活动」，而 IDE 里该账号**可以领**。
+ * ⚠️ **真实缺陷（用户报障，2026-09-26）**：新注册/新登录的 Qoder 账号，
+ * 一键领取报「当前没有可领取的活动」，而 IDE 里该账号**可以领**。
  *
- * 根因：初版实现**读磁盘上的 `machine_token.json`**，而那是
- * `runtime-info.exe` 的一份**陈旧缓存** —— 实测开发机上它停在 179 天前，
- * 且**跑 exe 也不会更新它**。用陈旧身份请求时服务端**不下发可领活动**：
+ * 根因有**两层**，第二层才是真正的：
  *
- * | 身份来源 | 第二个账号（`jinshui51`）的 `/sash/api/v1/me/campaigns` |
- * |---|---|
- * | 磁盘缓存（`f677427e14…`） | `claimable:false`，**仅 1 条 `VIEW_DETAILS`** |
- * | **实时生成**（`15e6683914…`） | `claimable:true`，含 **`CLAIM_BENEFIT/CLAIMABLE/100`** |
+ * **① 初版读磁盘缓存**（`machine_token.json`）—— 那是 `runtime-info.exe` 的
+ * 一份**陈旧缓存**（实测停在 179 天前，且**跑 exe 也不会更新它**）。
+ * 改为实时 spawn 后**部分**账号恢复，但新账号仍失败。
  *
- * native 的真实做法（asar 实证）是**每次按需 spawn**：
- * `runtime-info.exe --account-stdin`，把 `{account}` 写进 stdin，
- * 由该可执行文件（UMID 模块）实时产出 `machineToken` / `machineType`。
- * 故这里照做。
+ * **② 实时 spawn 时漏了 `environment` 位置参数**（真正的根因）。
+ * 必须调 `runtime-info.exe <environment> --account-stdin`；漏掉第一个参数会
+ * 拿到**另一套身份**，服务端因而只回 1 条 `VIEW_DETAILS`：
  *
- * ⚠️ **identity 实测是设备级、不随账号变化**（三个不同 uid 生成结果相同），
- * 所以不需要按账号分缓存；但**进程内必须缓存** —— 单次 spawn 实测约 **3.8 秒**，
- * 每次请求都跑会让积分查询慢到不可用。
+ * | 调用 | machineType | 服务端下发的活动 |
+ * |---|---|---|
+ * | 只传 `--account-stdin`（漏 env） | `15e6683914666dab9f` | 仅 1 条 `VIEW_DETAILS` |
+ * | **`3 --account-stdin`（IDE 实际）** | **`3582ddfb14d9bf289a`** | **`CLAIM_BENEFIT/CLAIMABLE/100`** |
+ *
+ * 后者与 IDE 实时抓包（`qoder-live.pcapng`）**逐字节一致**。取值与理由见
+ * {@link RUNTIME_INFO_ENVIRONMENT}。
+ *
+ * ⚠️ **曾因此得出错误结论**：漏参数时对**任何**账号都返回同一套 fallback
+ * 身份，看起来「identity 是设备级、与账号无关」。该推断是**错的** ——
+ * 身份随 `environment` 变化，必须与 IDE 用同一值。
+ *
+ * 不过「**进程内缓存**」这一点仍然成立且必需：单次 spawn 实测约 **3.8 秒**，
+ * 每次请求都跑会让积分查询慢到不可用；且同一进程内 identity 不会变。
  *
  * ## 退路：实时拿不到时才读磁盘缓存
  *
@@ -272,6 +279,57 @@ function locateRuntimeInfo(override?: string): string | undefined {
 }
 
 /**
+ * `runtime-info.exe` 的第一个位置参数 `environment`。
+ *
+ * ⚠️ **不可省略**（真实缺陷，2026-09-26 由实时抓包定位）。asar 源码：
+ *
+ * ```js
+ * function LWe(t) {
+ *   const e = t.platform === 'darwin' || t.platform === 'win32'
+ *   const A = lI(t.executablePath,
+ *     e ? [String(t.environment), '--account-stdin'] : [String(t.environment)],
+ *     …)
+ * }
+ * function O3e(t, e) {
+ *   return OWe({ …, environment: e === 'global' ? 3 : 0 })
+ * }
+ * ```
+ *
+ * 即**环境值是第一个参数、`--account-stdin` 在其后**。
+ *
+ * ## 漏传它会拿到「另一套身份」，且症状极具迷惑性
+ *
+ * 实测（同一账号，只改这一个参数）：
+ *
+ * | 调用 | machineType | machineCode | 服务端下发的活动 |
+ * |---|---|---|---|
+ * | 只传 `--account-stdin`（漏 env） | `15e6683914666dab9f` | `7a08a919764bd8648a` | 仅 1 条 `VIEW_DETAILS` |
+ * | **`3 --account-stdin`（IDE 实际）** | **`3582ddfb14d9bf289a`** | **`c1ecbb8c76c9ad3616`** | **`CLAIM_BENEFIT/CLAIMABLE/100`** |
+ *
+ * 后者的 token/type/code **与 IDE 抓包逐字节一致**（`qoder-live.pcapng`）。
+ *
+ * ⚠️ **这曾导致一个错误的结论**：漏参数时对**任何**账号都返回同一套
+ * fallback 身份，于是看起来「身份是设备级、与账号无关」。我当时据此写下
+ * 了错误注释 —— 现在改为：身份**随 environment 变化**，且必须与 IDE 用同一个值。
+ *
+ * 取 `3`（对应源码的 `'global'` 分支）：本机 IDE 抓包实测用的就是它。
+ */
+const RUNTIME_INFO_ENVIRONMENT = '3'
+
+/**
+ * 构造 `runtime-info.exe` 的参数。
+ *
+ * 顺序**必须**是 `[environment, '--account-stdin']` —— 与 asar 源码一致。
+ *
+ * ⚠️ **导出仅供测试**：`runtime-info-args` 的回归用例直接断言这个数组，
+ * 因为单测路径刻意禁用了真实 spawn（见 `vitest.config.ts`），
+ * 若不可导出就**无法用单测锁住参数形态** —— 而漏参数正是本函数出过的缺陷。
+ */
+export function runtimeInfoArgs(): readonly string[] {
+  return [RUNTIME_INFO_ENVIRONMENT, '--account-stdin']
+}
+
+/**
  * 从 `runtime-info.exe` 的输出里取出身份。
  *
  * 输出形如（单行 JSON）：
@@ -281,8 +339,8 @@ function locateRuntimeInfo(override?: string): string | undefined {
  * ```
  *
  * ⚠️ 即便 `accountOutcome` 不是 `success`（如 `invalid_input`），
- * `machineToken` / `machineType` 仍然返回 —— 实测设备身份与账号无关，
- * 故不因账号字段而丢弃可用身份。
+ * `machineToken` / `machineType` 仍然返回 —— 实测该身份与传入的
+ * `account` 字段无关（由 environment 与设备决定），故不因账号字段而丢弃。
  */
 function parseRuntimeInfoOutput(out: string): QoderMachineIdentity | undefined {
   const start = out.indexOf('{')
@@ -312,7 +370,7 @@ function readFromRuntimeInfo(override?: string): QoderMachineIdentity | undefine
   const exe = locateRuntimeInfo(override)
   if (exe === undefined) return undefined
   try {
-    const out = execFileSync(exe, ['--account-stdin'], {
+    const out = execFileSync(exe, [...runtimeInfoArgs()], {
       input: JSON.stringify({ account: '' }),
       encoding: 'utf8',
       timeout: RUNTIME_INFO_TIMEOUT_MS,
@@ -338,7 +396,7 @@ async function readFromRuntimeInfoAsync(override?: string): Promise<QoderMachine
     }
     let child
     try {
-      child = spawn(exe, ['--account-stdin'], { windowsHide: true })
+      child = spawn(exe, [...runtimeInfoArgs()], { windowsHide: true })
     } catch {
       done(undefined)
       return

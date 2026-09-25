@@ -28,7 +28,12 @@ import { TRAE } from './trae-product.js'
 import { CLINE } from './cline-product.js'
 import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobsterai.js'
 import type { LobsteraiCredential } from './lobsterai.js'
-import { isQoderRefreshable, qoderCredentialExpiresAtMs } from './qoder.js'
+import {
+  fetchQoderUserNickname,
+  isQoderRefreshable,
+  qoderCredentialExpiresAtMs,
+  withQoderNickname,
+} from './qoder.js'
 import type { QoderCredential } from './qoder.js'
 import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
 import { isTraeRefreshable, traeCredentialExpiresAtMs } from './trae.js'
@@ -807,10 +812,24 @@ function registerJetHubEndpoints(
           })
           started.result.then(async (loginResult) => {
             const credential = parseQoderCredential(loginResult.access)
+            // ⚠️ 设备码轮询响应**不带 `user_name`**，故 `credential.nickname` 恒为空
+            // —— 必须补一次 userinfo 才能拿到真实名字，否则账号卡片只能显示
+            // `qoder-xxxx`（多账号无法区分）。见 `fetchQoderUserNickname` 的说明。
+            //
+            // ⚠️ **失败不阻塞登录**：昵称只是展示信息，拿不到就退回账号 id
+            //（与 `toLoginFlowResult` 对过期时间的处理同原则）。
+            let nickname = credential?.nickname
+            if ((nickname === undefined || nickname.length === 0) && credential !== undefined) {
+              nickname = await fetchQoderUserNickname(credential, QODER)
+              // 写回**凭据**（不只账号条目）：账号条目会随 Jet Hub 的账号操作
+              // 整体重写，而凭据里存一份才能在续期后与其它面板都稳定拿到。
+              if (nickname !== undefined && loginResult.access.length > 0) {
+                const updated = withQoderNickname(credential, nickname)
+                await ctx.credentials.set(credentialRef(refName), JSON.stringify(updated))
+              }
+            }
             await pool.updateAccount(id, {
-              nickname: credential?.nickname !== undefined && credential.nickname.length > 0
-                ? credential.nickname
-                : id,
+              nickname: nickname !== undefined && nickname.length > 0 ? nickname : id,
               expiresAt: credential !== undefined ? qoderCredentialExpiresAtMs(credential) : undefined,
               refreshable: credential !== undefined && isQoderRefreshable(credential),
             })

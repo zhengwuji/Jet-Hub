@@ -35,6 +35,7 @@ import {
   resolveQoderMachineIdentityAsync,
   withQoderMachineHeaders,
   withQoderMachineHeadersAsync,
+  runtimeInfoArgs,
 } from '../../src/qoder-machine.js'
 
 /** 真实的 `machine_token.json` 形状（取自开发机，token 已截断）。 */
@@ -167,5 +168,55 @@ describe('withQoderMachineHeaders', () => {
   it('异步版拿不到身份时原样返回', async () => {
     const input = { 'Cosy-ClientType': '10' }
     await expect(withQoderMachineHeadersAsync(input)).resolves.toEqual(input)
+  })
+})
+
+/**
+ * ⚠️ **`runtime-info.exe` 的参数形态回归（2026-09-26 真实缺陷）**。
+ *
+ * ## 为什么必须单独锁这个
+ *
+ * 本文件所有其它用例都把 `QODER_RUNTIME_INFO` 指到不存在的路径（见 `beforeEach`），
+ * 以**禁用真实 spawn**（否则每条用例 3.8 秒、且结果随开发机是否装了桌面端而变）。
+ * 代价是：**真实调用参数从未被执行到** —— 这正是「漏传 `environment`」这个
+ * 缺陷能长期潜伏的原因。
+ *
+ * ## 缺陷本身
+ *
+ * 正确形态是 `runtime-info.exe <environment> --account-stdin`，其中
+ * `environment` 是**第一个位置参数**（asar：`O3e` 传 `e === 'global' ? 3 : 0`）。
+ * 漏掉它（只传 `--account-stdin`）会拿到**另一套身份**：
+ *
+ * | 调用 | machineType | 服务端下发的活动 |
+ * |---|---|---|
+ * | 只传 `--account-stdin`（漏 env） | `15e6683914666dab9f` | 仅 1 条 `VIEW_DETAILS` |
+ * | **`3 --account-stdin`（IDE 实际）** | **`3582ddfb14d9bf289a`** | **`CLAIM_BENEFIT/CLAIMABLE/100`** |
+ *
+ * 后者与 IDE 实时抓包（`qoder-live.pcapng`）**逐字节一致**。
+ *
+ * 故这里直接断言参数数组 —— 它不依赖 spawn，快且稳定，又能精确锁住这个坑。
+ */
+describe('runtimeInfoArgs（参数形态回归）', () => {
+  it('第一个参数是 environment，且 --account-stdin 在其后', () => {
+    const args = [...runtimeInfoArgs()]
+    expect(args).toHaveLength(2)
+    // ⚠️ 顺序不可颠倒：environment 必须在最前（源码 `[String(environment), '--account-stdin']`）
+    expect(args[0]).toBe('3')
+    expect(args[1]).toBe('--account-stdin')
+  })
+
+  it('environment 取值为 3（对应源码 global 分支，与 IDE 抓包一致）', () => {
+    // 值若改成 0/1/2 会拿到不同身份（实测 0 与漏参数同为 fallback 那套），
+    // 故这里显式锁死 '3'。
+    expect(runtimeInfoArgs()[0]).toBe('3')
+  })
+
+  it('绝不能退化成只传 --account-stdin（缺陷原形）', () => {
+    const args = [...runtimeInfoArgs()]
+    expect(args, '参数里缺少 --account-stdin').toContain('--account-stdin')
+    // 关键：长度必须为 2；只有 1 个元素即为「漏 environment」
+    expect(args.length, '漏了 environment 位置参数').toBeGreaterThan(1)
+    expect(args[0], '第一参不能是 --account-stdin（那是漏 environment 的形态）')
+      .not.toBe('--account-stdin')
   })
 })

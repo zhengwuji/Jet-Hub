@@ -102,17 +102,29 @@ describeGate('Qoder 积分探针（只读，不领取）', () => {
 
   /**
    * ⚠️ **核心断言（缺陷①②的行为契约）**：**逐账号**用真实产品函数
-   * （`fetchQoderCheckinStatus`）查签到状态，每个账号都必须能拿到领分类活动。
+   * （`fetchQoderCheckinStatus`）查签到状态。
    *
-   * 判据：`dailyCredit > 0`（可领）或 `todayCheckedIn`（已领）——
-   * 两者都说明服务端**认可了设备身份并下发了 `CLAIM_BENEFIT`**。
-   * 身份不被认可时服务端只回 `VIEW_DETAILS`，`dailyCredit` 为 0 且未标已领。
+   * 每个账号必须落入以下**三种合法状态之一**（否则判为缺陷）：
    *
-   * 缺陷②的表现正是「首个账号正常、后续账号拿不到」，
-   * 故必须**逐账号**断言；只测第一个账号会让它漏网。
+   * | 状态 | 判据 | 含义 |
+   * |---|---|---|
+   * | 已开通·可领 | `dailyCredit > 0` | 服务端认可设备身份并下发了可领活动 |
+   * | 已开通·已领 | `todayCheckedIn` | 同上，今天已领过 |
+   * | **未开通** | `actionRequired === true` | **账号本身在 Qoder 侧没有每日领取**，需用户先去官方客户端登录一次 |
+   *
+   * ⚠️ **第三种是合法状态，不能当失败**（2026-09-26 用户实测确认）：
+   * 用本插件经 GitHub 授权**新注册**的账号在 Qoder 侧确实没有该活动
+   * （只有一条 `VIEW_DETAILS`），这**不是**设备身份问题 ——
+   * 实测 4 个不同 uid 经 `runtime-info.exe` 产出**完全相同**的身份。
+   *
+   * 而「拿不到活动却**没有** `actionRequired` 标记」才是缺陷②
+   * （首个账号正常、后续账号拿不到，即身份未被服务端认可）。
+   *
+   * 故必须**逐账号**断言；只测第一个账号会让缺陷②漏网。
    */
-  it('每个账号都能看到领分类活动（多账号回归，缺陷①②）', async () => {
+  it('每个账号都处于合法状态：可领 / 已领 / 明确未开通（多账号回归，缺陷①②）', async () => {
     const problems: string[] = []
+    let notActivated = 0
     for (const entry of credentials) {
       // 清缓存：强制每个账号都重新解析一次身份
       // （身份实测是设备级、清不清结果相同，但清掉能顺带验证解析对每个账号都成功）
@@ -123,22 +135,49 @@ describeGate('Qoder 积分探针（只读，不领取）', () => {
         console.log(`  ✗ ${entry.uid}: 查询失败`)
         continue
       }
-      const sawBenefit = status.dailyCredit > 0 || status.todayCheckedIn
+      const hasBenefit = status.dailyCredit > 0 || status.todayCheckedIn
+      // 未开通是**合法状态**，但必须被显式标记出来 —— 否则就是缺陷②
+      const declaredNotActivated = status.actionRequired === true
+      const ok = hasBenefit || declaredNotActivated
+      if (declaredNotActivated) notActivated += 1
+
       console.log(
-        `  ${sawBenefit ? '✓' : '✗'} ${entry.uid}:`
+        `  ${ok ? '✓' : '✗'} ${entry.uid}:`
         + ` dailyCredit=${status.dailyCredit}`
         + ` todayCheckedIn=${status.todayCheckedIn}`
+        + ` actionRequired=${declaredNotActivated}`
         + ` activity=${status.activityName || '(无)'}`,
       )
-      if (!sawBenefit) {
-        problems.push(`${entry.uid}: 未看到领分类活动（dailyCredit=0 且未标记已领）`)
+      if (!ok) {
+        problems.push(
+          `${entry.uid}: 拿不到领分类活动，且**未**标记 actionRequired`
+          + '（dailyCredit=0、未标已领、也未声明未开通）',
+        )
       }
     }
     expect(
       problems,
-      '以下账号的服务端未下发领分类活动 —— 设备身份可能未生效（缺陷①②）：\n'
+      '以下账号既拿不到领分类活动、又没被标记为「未开通」——\n'
+      + '这正是缺陷②的形态（设备身份未被服务端认可），而非账号本身的限制：\n'
       + problems.map((p) => `  · ${p}`).join('\n'),
     ).toEqual([])
+
+    // 显式记录分布，便于人工核对（未开通是合法状态，不是错误）
+    console.log(
+      `  分布：${credentials.length - notActivated} 个已开通，`
+      + `${notActivated} 个明确未开通（需用户先用官方客户端登录）`,
+    )
+  })
+
+  /**
+   * ⚠️ **`actionRequired` 必须真的能在真实响应里被触发**（若一个都没有，
+   * 说明该字段的判据可能失效，用例会静默变成「永远验证不到」）。
+   *
+   * 不 fail —— 全部账号都已开通是合法状态。仅提示，避免「跑了 e2e 以为覆盖了」。
+   */
+  it('提示：本机是否有「未开通」账号（决定 actionRequired 判据是否被真实触发）', () => {
+    console.log('  （见上一条用例的「分布」行；若全部已开通，则该分支未被真实触发）')
+    expect(credentials.length).toBeGreaterThan(0)
   })
 
   /**
