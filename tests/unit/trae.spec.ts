@@ -1181,6 +1181,10 @@ describe('TRAE 计费字段解析（display_contact_config）', () => {
 
   describe('parseTraeBatchModelList 接线', () => {
     it('倍率与活动折扣被写进模型条目', () => {
+      // end_at 必须是「当前时刻之后」的未来时间：readActivityDiscount 未显式传
+      // nowSec 时用默认 Date.now()，写死过去的日期会让测试随真实时间过期
+      //（2026-09-25 恰好越过硬编码的 1_790_265_540 后此用例开始失败）。
+      const futureEnd = Math.floor(Date.now() / 1000) + 3_600
       const models = parseTraeBatchModelList({
         function_configs: [{
           function: 'solo_agent',
@@ -1195,7 +1199,7 @@ describe('TRAE 计费字段解析（display_contact_config）', () => {
                 enable: true,
                 data: {
                   current: { discount_type: 'limited', before_consumption_rate: 0.8, consumption_rate: 0.08 },
-                  limited: { end_at: 1_790_265_540 },
+                  limited: { end_at: futureEnd },
                 },
               },
             }),
@@ -1205,7 +1209,7 @@ describe('TRAE 计费字段解析（display_contact_config）', () => {
       expect(models).toHaveLength(1)
       expect(models[0]!.creditsRate).toBe(0.08)
       expect(models[0]!.originalCreditsRate).toBe(0.8)
-      expect(models[0]!.discountEndsAtSec).toBe(1_790_265_540)
+      expect(models[0]!.discountEndsAtSec).toBe(futureEnd)
     })
 
     it('无计费字段时不产生倍率键（保持 undefined，不填 0）', () => {

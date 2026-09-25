@@ -3,6 +3,7 @@ import * as React from 'react';
 import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { bulkButtonState } from './model-bulk.js';
+import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -1130,6 +1131,372 @@ function ProviderPanel({ provider, rpcCall }) {
       : null);
 }
 
+/**
+ * 账号备份（导出 / 恢复）。
+ *
+ * 放在 Jet Hub 页面头部（关闭按钮旁），面向「更换 DSH 版本」的迁移场景：
+ * 导出把全部账号的密钥/凭据与模型黑名单打包成一个自包含 JSON，导入整体
+ * 还原。加密在浏览器侧完成（PBKDF2 + AES-GCM，见 backup-crypto.js）——
+ * 明文 JSON 不经过 RPC / 日志，加密与否由用户在导出弹窗里选择（默认加密）。
+ *
+ * 弹窗被拦截 / 口令错误等失败只提示、不清空已选文件，用户可以修正后重试。
+ */
+function BackupPanel({ rpcCall, onImported }) {
+  // 当前打开的弹窗：null | 'export' | 'import'
+  const [dialog, setDialog] = React.useState(null);
+  // 导出弹窗：是否加密 + 两次口令
+  const [encrypt, setEncrypt] = React.useState(true);
+  const [pass1, setPass1] = React.useState('');
+  const [pass2, setPass2] = React.useState('');
+  // 导入弹窗：已选文件（解析后的对象 + 是否加密容器）
+  const [importFile, setImportFile] = React.useState(null);
+  const [importPass, setImportPass] = React.useState('');
+  // 当前账号池统计（backup.status）：缺 expiresAt 的条目疑似版本切换自动恢复
+  // 的产物，导入会整体覆盖它们——用于确认文案里显式提示。
+  const [backupStatus, setBackupStatus] = React.useState(null);
+  // 导入两步式：false = 口令/提示页，true = 确认页（应用内二次确认，替代 confirm()）
+  const [confirmStep, setConfirmStep] = React.useState(false);
+  // 解密后的备份载荷（确认页展示账号数 & 导入时使用）
+  const [decryptedPayload, setDecryptedPayload] = React.useState(null);
+  // 正在提交（导出/解密/导入进行中，禁用按钮）
+  const [busy, setBusy] = React.useState(false);
+  // 弹窗内提示（成功 / 失败 / 口令不一致等）
+  const [notice, setNotice] = React.useState(null);
+  const fileRef = React.useRef(null);
+  const mounted = React.useRef(true);
+
+  React.useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  const closeDialog = () => {
+    if (!mounted.current) return;
+    setDialog(null);
+    setNotice(null);
+    setBusy(false);
+    setEncrypt(true);
+    setPass1('');
+    setPass2('');
+    setImportFile(null);
+    setImportPass('');
+    setBackupStatus(null);
+    setConfirmStep(false);
+    setDecryptedPayload(null);
+  };
+
+  const safeNotice = (next) => { if (mounted.current) setNotice(next); };
+
+  /** 导出：RPC 取载荷 → （可选）加密 → 浏览器下载。 */
+  const doExport = async () => {
+    if (encrypt && pass1.length === 0) {
+      safeNotice({ tone: 'warn', text: '请设置备份口令' });
+      return;
+    }
+    if (encrypt && pass1 !== pass2) {
+      safeNotice({ tone: 'warn', text: '两次输入的口令不一致' });
+      return;
+    }
+    setBusy(true);
+    setNotice(null);
+    try {
+      // 必须传空对象而非省略 payload：callManagementRpc 会把 payload 序列化进
+      // 请求体，后端校验要求 payload 键存在；传 undefined 会被 JSON 序列化丢弃，
+      // 导致后端报 "Invalid Jet Hub management request."
+      const res = await rpcCall('backup.export', {});
+      const payload = res.payload;
+      const warnings = res.warnings || [];
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      let data = payload;
+      let filename = `dsh-codearts-backup-${stamp}.json`;
+      if (encrypt) {
+        data = await encryptBackup(payload, pass1);
+        filename = `dsh-codearts-backup-${stamp}.enc.json`;
+      }
+      downloadJson(filename, data);
+      const extra = warnings.length > 0 ? `，${warnings.length} 个账号凭据缺失（已跳过）` : '';
+      // 不自动关闭：让用户看到成功结果（含跳过提示），再手动关闭
+      safeNotice({ tone: 'ok', text: `已导出 ${payload.accounts.length} 个账号${encrypt ? '（已加密）' : '（明文）'}${extra}` });
+    } catch (caught) {
+      console.error('[jet-hub] backup export failed:', caught);
+      safeNotice({ tone: 'error', text: `导出失败：${caught?.message || '未知错误'}` });
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  /** 选择文件：读取并解析；加密容器留在弹窗里等口令。 */
+  const onFileSelected = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    safeNotice(null);
+    try {
+      const text = await readFileAsText(file);
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        safeNotice({ tone: 'error', text: `${file.name} 不是有效的 JSON 备份文件` });
+        return;
+      }
+      if (!mounted.current) return;
+      setImportFile({ name: file.name, encrypted: isEncryptedBackup(parsed), parsed });
+      setDialog('import');
+      setImportPass('');
+      // 拉取当前账号池统计：确认导入前提示「有 N 个自动恢复账号将被覆盖」。
+      // 失败不阻断导入——提示只是辅助信息，拿不到就静默跳过。
+      try {
+        const status = await rpcCall('backup.status', {});
+        if (mounted.current) setBackupStatus(status || null);
+      } catch (caught) {
+        console.warn('[jet-hub] backup.status failed:', caught);
+      }
+    } catch (caught) {
+      console.error('[jet-hub] read backup file failed:', caught);
+      safeNotice({ tone: 'error', text: `读取文件失败：${caught?.message || '未知错误'}` });
+    }
+  };
+
+  /** 导入第一步：解密（如需）→ 进入应用内确认页。整体替换，不是合并。 */
+  const stepImport = async () => {
+    if (!importFile) return;
+    if (importFile.encrypted) {
+      if (importPass.length === 0) {
+        safeNotice({ tone: 'warn', text: '请输入备份口令' });
+        return;
+      }
+      setBusy(true);
+      setNotice(null);
+      try {
+        const payload = await decryptBackup(importFile.parsed, importPass);
+        if (!mounted.current) return;
+        setDecryptedPayload(payload);
+      } catch (caught) {
+        console.error('[jet-hub] backup decrypt failed:', caught);
+        safeNotice({ tone: 'error', text: '解密失败：口令错误或备份文件已被篡改' });
+        setBusy(false);
+        return;
+      }
+      setBusy(false);
+    } else {
+      setDecryptedPayload(importFile.parsed);
+    }
+    // 进入确认页（应用内二次确认，替代浏览器 confirm()）
+    setConfirmStep(true);
+    setNotice(null);
+  };
+
+  /** 导入第二步：确认后执行导入 RPC。 */
+  const confirmImport = async () => {
+    const payload = decryptedPayload;
+    if (!payload) return;
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await rpcCall('backup.import', { payload });
+      const parts = [`已导入 ${res.accountsImported} 个账号`, `${res.credentialsImported} 条凭据`];
+      if (res.skipped.length > 0) parts.push(`${res.skipped.length} 条凭据跳过`);
+      // 已过期的账号：refresh_token 仍有效时会自动静默续期；若也已失效则需重新登录
+      if (res.expiredAccounts > 0) {
+        parts.push(`${res.expiredAccounts} 个凭据已过期（失效账号需重新登录）`);
+      }
+      // 凭据缺失的账号：对应 provider 目录会被隐藏（像未登录一样），需重新登录
+      if (res.missingCredentials > 0) {
+        parts.push(`${res.missingCredentials} 个账号凭据缺失（需重新登录）`);
+      }
+      // 账号已整体替换：通知 JetHubPage 重新挂载 ProviderPanel 刷新列表；
+      // 不自动关闭弹窗，让用户看到导入结果。
+      onImported?.();
+      safeNotice({ tone: 'ok', text: parts.join('，') });
+    } catch (caught) {
+      console.error('[jet-hub] backup import failed:', caught);
+      safeNotice({ tone: 'error', text: `导入失败：${caught?.message || '未知错误'}` });
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  // 弹窗通用结构：遮罩 + 对话框。点击遮罩关闭（与 ModelListPanel 同款）。
+  const renderDialog = () => {
+    const isExport = dialog === 'export';
+    const title = isExport ? '导出备份' : '导入备份';
+    const subtitle = isExport
+      ? '全部 provider 的账号密钥与凭据'
+      : importFile?.name || '';
+    const body = isExport ? (
+      React.createElement(React.Fragment, null,
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '备份文件包含全部账号的密钥与 refresh_token，请',
+          React.createElement('strong', { className: 'dim-jh-emph-warn' }, '妥善保管'),
+          '。'),
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '备份是导出时刻的凭据快照：refresh_token 会随续期轮换或过期，建议导出后尽快迁移，导入后失效的账号需重新登录。'),
+        React.createElement('label', { className: 'dim-jh-checkRow' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: encrypt,
+            onChange: (event) => setEncrypt(event.target.checked),
+          }),
+          '加密备份文件（推荐）'),
+        encrypt
+          ? React.createElement('div', { className: 'dim-jh-formRows' },
+              React.createElement('input', {
+                className: 'dim-jh-input',
+                type: 'password',
+                placeholder: '备份口令（用于解密，请牢记）',
+                value: pass1,
+                onChange: (event) => setPass1(event.target.value),
+              }),
+              React.createElement('input', {
+                className: 'dim-jh-input',
+                type: 'password',
+                placeholder: '再次输入口令',
+                value: pass2,
+                onChange: (event) => setPass2(event.target.value),
+              }))
+          : null)
+    ) : !isExport && confirmStep ? (
+      // 导入确认页（应用内二次确认）：展示覆盖警告与提示
+      React.createElement(React.Fragment, null,
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '导入将',
+          React.createElement('strong', { className: 'dim-jh-emph-danger' }, '覆盖'),
+          '当前全部账号与模型开关（共 ',
+          React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${decryptedPayload?.accounts?.length ?? 0}`),
+          ' 个账号），且',
+          React.createElement('strong', { className: 'dim-jh-emph-danger' }, '不可撤销'),
+          '。'),
+        backupStatus?.withoutExpiry > 0
+          ? React.createElement('p', { className: 'dim-jh-modalHint' },
+              '当前有 ',
+              React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${backupStatus.withoutExpiry}`),
+              ' 个账号缺少有效期信息（可能是版本切换后自动恢复的），导入将',
+              React.createElement('strong', { className: 'dim-jh-emph-warn' }, '整体覆盖'),
+              '它们。')
+          : null)
+    ) : importFile?.encrypted ? (
+      React.createElement(React.Fragment, null,
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '该备份已加密，请输入导出时设置的口令。'),
+        React.createElement('input', {
+          className: 'dim-jh-input',
+          type: 'password',
+          placeholder: '备份口令',
+          value: importPass,
+          onChange: (event) => setImportPass(event.target.value),
+        }))
+    ) : (
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        '该备份为明文文件，导入将覆盖当前全部账号与模型开关。')
+    );
+
+    return React.createElement('div', {
+      className: 'dim-jh-modalOverlay',
+      onClick: (event) => { if (event.target === event.currentTarget) closeDialog(); },
+    },
+      React.createElement('div', {
+        className: 'dim-jh-modal',
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': title,
+      },
+        React.createElement('div', { className: 'dim-jh-modalHead' },
+          React.createElement('div', { className: 'dim-jh-modalTitle' },
+            React.createElement('strong', null, title),
+            subtitle.length > 0
+              ? React.createElement('span', { className: 'dim-jh-modalSubtitle' }, subtitle)
+              : null),
+          React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              onClick: closeDialog,
+            }, '关闭'))),
+        React.createElement('div', { className: 'dim-jh-modalBody' },
+          body,
+          notice
+            ? React.createElement('div', {
+                className: 'dim-jh-probeNotice',
+                'data-tone': notice.tone,
+                role: notice.tone === 'error' ? 'alert' : 'status',
+              }, React.createElement('div', null, notice.text))
+            : null,
+          React.createElement('div', { className: 'dim-jh-modalActions' },
+            isExport
+              ? React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  'data-kind': 'primary',
+                  disabled: busy,
+                  onClick: () => void doExport(),
+                }, busy ? '生成中…' : '生成备份文件')
+              : confirmStep
+                ? React.createElement(React.Fragment, null,
+                    React.createElement('button', {
+                      className: 'dim-jh-btn',
+                      disabled: busy,
+                      onClick: () => { setConfirmStep(false); setNotice(null); },
+                    }, '返回'),
+                    React.createElement('button', {
+                      className: 'dim-jh-btn',
+                      'data-kind': 'primary',
+                      disabled: busy,
+                      onClick: () => void confirmImport(),
+                    }, busy ? '导入中…' : '确认导入'))
+                : React.createElement('button', {
+                    className: 'dim-jh-btn',
+                    'data-kind': 'primary',
+                    disabled: busy,
+                    onClick: () => void stepImport(),
+                  }, busy ? '处理中…' : '下一步')))));
+  };
+
+  return React.createElement(React.Fragment, null,
+    React.createElement('button', {
+      className: 'dim-jh-btn',
+      title: '导出全部账号的密钥与凭据，便于更换 DSH 版本后导入恢复。',
+      onClick: () => {
+        setDialog('export');
+        setNotice(null);
+      },
+    }, '备份'),
+    React.createElement('button', {
+      className: 'dim-jh-btn',
+      title: '从备份文件恢复账号与凭据（会覆盖当前全部账号）。',
+      onClick: () => fileRef.current?.click(),
+    }, '恢复'),
+    React.createElement('input', {
+      ref: fileRef,
+      type: 'file',
+      accept: '.json,application/json',
+      style: { display: 'none' },
+      onChange: onFileSelected,
+    }),
+    dialog !== null ? renderDialog() : null);
+}
+
+/** 触发浏览器下载一个 JSON 文件。 */
+function downloadJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** 读取文件为文本。 */
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+}
+
 export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
@@ -1145,10 +1512,17 @@ export function JetHubPage({ close, rpcCall }) {
       React.createElement('div', { className: 'dim-jh-brand' },
         React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub'),
         React.createElement('p', { className: 'dim-jh-brandDesc' }, 'Provider 凭据管理与多账号支持')),
-      close ? React.createElement('button', {
-        className: 'dim-jh-btn',
-        onClick: close,
-      }, '关闭') : null),
+      React.createElement('div', { className: 'dim-jh-headerActions' },
+        React.createElement(BackupPanel, {
+          rpcCall,
+          // 导入成功会整体替换账号，ProviderPanel 只在挂载时拉列表；
+          // 递增版号强制重新挂载，让账号列表与模型目录立即反映新状态。
+          onImported: () => setVersion(v => v + 1),
+        }),
+        close ? React.createElement('button', {
+          className: 'dim-jh-btn',
+          onClick: close,
+        }, '关闭') : null)),
     React.createElement('div', { className: 'dim-jh-layout' },
       React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         PROVIDERS.map(p => React.createElement('button', {

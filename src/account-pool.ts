@@ -2,8 +2,8 @@ import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
-import { createJetHubStore } from './jet-hub-store.js'
-import type { JetHubStore, ModelDisableMap } from './jet-hub-store.js'
+import { createJetHubStore, sanitizeAccounts, sanitizeDisabledModels } from './jet-hub-store.js'
+import type { JetHubStore, JetHubState, ModelDisableMap } from './jet-hub-store.js'
 import type {
   CodeArtsCredential,
   ProviderAccountEntry,
@@ -653,6 +653,49 @@ export class AccountPool {
     const entry = this.readAccounts().find(a => a.id === accountId)
     const value = entry?.traeCheckinDeviceGeneration
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+  }
+
+  /**
+   * 读取当前完整状态快照（账号列表 + 模型黑名单）。
+   *
+   * 供备份导出使用：返回的副本与进程内权威副本解耦，调用方修改返回值
+   * 不会污染池的运行时状态。`disabledModels` 是嵌套结构，必须深拷贝
+   * （浅拷贝会让内层 provider 表仍共享引用）。
+   */
+  getStateSnapshot(): JetHubState {
+    this.ensureLoaded()
+    const disabledModels: ModelDisableMap = {}
+    for (const [provider, models] of Object.entries(this.modelCache)) {
+      disabledModels[provider] = { ...models }
+    }
+    return {
+      accounts: [...this.cache],
+      disabledModels,
+    }
+  }
+
+  /**
+   * 整体替换账号列表与模型黑名单（备份导入用）。
+   *
+   * 与 {@link writeAccounts} / {@link writeModels} 的约定一致：整体写入时
+   * 必须同时携带账号与黑名单，否则会把另一份数据抹掉。这里一次落盘完成
+   * 两件事，避免中间态。
+   *
+   * ⚠️ 导入数据来自用户提供的备份文件（可能被手工编辑），因此先经
+   * `sanitizeAccounts` / `sanitizeDisabledModels` 归一化：只保留可用的
+   * 账号条目与显式 `true` 的黑名单项，坏条目直接丢弃而不是写进池里
+   * 反复触发选号失败。
+   */
+  async replaceAll(accounts: readonly ProviderAccountEntry[], disabledModels: ModelDisableMap): Promise<void> {
+    const next = sanitizeAccounts(accounts)
+    this.cache = next
+    this.modelCache = sanitizeDisabledModels(disabledModels)
+    this.loaded = true
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，备份导入仅存在于内存中')
+      return
+    }
+    await this.store.save({ accounts: next, disabledModels: this.modelCache })
   }
 }
 

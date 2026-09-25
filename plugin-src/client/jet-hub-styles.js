@@ -143,6 +143,9 @@ const STYLES = `
 .dim-jh-modelPanelActions { flex: none; display: flex; align-items: center; gap: 8px; }
 .dim-jh-modelPanelCount { font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-tertiary, #8f959e); }
 .dim-jh-modalHint { flex: none; margin: 10px 0 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 弹窗提示里的强调词：danger=危险操作（覆盖/不可撤销），warn=警示（妥善保管） */
+.dim-jh-emph-danger { color: #b3261e; font-weight: 600; }
+.dim-jh-emph-warn { color: #b45309; font-weight: 600; }
 .dim-jh-modal .dim-jh-probeNotice { flex: none; margin: 10px 0 0; }
 /* 批量工具条（打开全部 / 关闭全部）：固定不滚动，紧跟在说明文字下方 */
 .dim-jh-modelBulkBar { flex: none; display: flex; align-items: center; gap: 8px; margin-top: 10px; }
@@ -167,6 +170,18 @@ const STYLES = `
 .dim-jh-switch:checked::after { transform: translateX(14px); }
 .dim-jh-switch:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
 .dim-jh-switch:disabled { opacity: 0.5; cursor: default; }
+
+/* ── 账号备份（导出 / 恢复）── */
+/* 口令输入框：宽度撑满弹窗内容区，避免在窄面板下挤坏布局 */
+.dim-jh-input { box-sizing: border-box; width: 100%; padding: 6px 10px; border: 1px solid var(--dsw-alias-border-l2, #d0d3d9); border-radius: 6px; background: var(--dsw-alias-bg-input, #fff); font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-jh-input:focus { outline: none; border-color: #1677ff; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 20%, transparent); }
+/* 加密勾选行：勾选框 + 文案一行排开 */
+.dim-jh-checkRow { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); cursor: pointer; }
+.dim-jh-checkRow input[type="checkbox"] { margin: 0; accent-color: #1677ff; }
+/* 两次口令输入：纵向堆叠 */
+.dim-jh-formRows { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 4px; }
+/* 弹窗底部动作区：右对齐（生成/确认按钮） */
+.dim-jh-modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 `
 
 let injected = false
