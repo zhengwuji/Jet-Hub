@@ -1,6 +1,6 @@
 import * as React from 'react';
 
-import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
+import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { bulkButtonState } from './model-bulk.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
@@ -1501,9 +1501,84 @@ export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
   const [version, setVersion] = React.useState(0);
+  // 一键签到：busy 防重复点击，notice 显示上一次结果摘要。
+  const [checkinBusy, setCheckinBusy] = React.useState(false);
+  const [checkinNotice, setCheckinNotice] = React.useState(null);
+  const mounted = React.useRef(true);
+  React.useEffect(() => () => { mounted.current = false; }, []);
 
   const selectProvider = (id) => {
     setSelected(id);
+    setVersion(v => v + 1);
+  };
+
+  /**
+   * 一键签到**所有支持签到的渠道**。
+   *
+   * 逐个渠道 `await` 现有 `credits.claimAll`（不新增后端端点）。
+   *
+   * ⚠️ **必须串行**，不能 `Promise.all`：单渠道内部已是「逐账号顺序执行
+   * （并发易触发风控）」（见 `src/jet-hub-rpc.ts`），而这是**真实领积分**的
+   * 写操作，跨渠道并发会同时发出多路领取请求，触发风控的代价是用户当天领不到。
+   *
+   * 渠道集合由能力表推导（`checkinProviders()`）—— workbuddy / cline 后端
+   * 没有签到接口，**绝不能**出现在请求列表里（那会产生必然失败的请求，
+   * 正是 CodeArts 历史缺陷的形态）。
+   *
+   * 单渠道失败只计入 failed，**不中断后续渠道**（与后端「单账号失败不中断
+   * 整体」同型）。但后端对**无账号**的渠道本就是零请求，故不额外预查账号。
+   */
+  const checkinAll = async () => {
+    setCheckinBusy(true);
+    setCheckinNotice(null);
+    const parts = [];
+    let totalCredit = 0;
+    let failed = 0;
+    for (const provider of checkinProviders()) {
+      const label = PROVIDERS.find(p => p.id === provider)?.label || provider;
+      try {
+        const res = await rpcCall('credits.claimAll', { provider });
+        const s = res?.summary || {};
+        // ⚠️ **每个非零计数都必须出现在提示里**。
+        //
+        // 早期只判 `claimed` / `alreadyClaimed` / `failed` 三个分支，于是
+        // 「活动未开启」（`inactive > 0`）的渠道会**整条从提示里消失** ——
+        // 用户看到的是「一键签到：A 今日已领，B 今日已领」，完全不知道 C 渠道
+        // 执行过、更不知道它为什么没结果。
+        //
+        // 同理，一个渠道可能**同时**有成功与失败（多账号），逐个列出而不
+        // 用 else-if 短路，否则后者的信息被前者的分支吞掉。
+        const bits = [];
+        if (s.claimed > 0) {
+          totalCredit += s.totalCredit;
+          bits.push(`+${s.totalCredit}`);
+        }
+        if (s.alreadyClaimed > 0) bits.push(`${s.alreadyClaimed} 个今日已领`);
+        if (s.inactive > 0) bits.push(`${s.inactive} 个活动未开启`);
+        if (s.failed > 0) {
+          failed += s.failed;
+          // 附上第一条失败原因：只给计数会让用户与排查者都无从下手
+          const reason = (res?.results || [])
+            .map(item => item?.outcome?.message)
+            .find(msg => typeof msg === 'string' && msg.length > 0);
+          bits.push(`${s.failed} 个失败${reason ? `（${reason}）` : ''}`);
+        }
+        parts.push(`${label} ${bits.length > 0 ? bits.join('，') : '无账号'}`);
+      } catch (caught) {
+        failed += 1;
+        parts.push(`${label} 失败（${caught?.message || '未知原因'}）`);
+      }
+      if (!mounted.current) return;
+    }
+    if (!mounted.current) return;
+    setCheckinNotice({
+      tone: failed > 0 ? 'warn' : 'ok',
+      text: parts.length > 0
+        ? `一键签到：${parts.join('，')}${totalCredit > 0 ? `（共 +${totalCredit} 积分）` : ''}`
+        : '一键签到：没有可领取的渠道',
+    });
+    setCheckinBusy(false);
+    // 领取会改变余额；递增版号让当前面板重新挂载并刷新账号与积分
     setVersion(v => v + 1);
   };
 
@@ -1513,6 +1588,14 @@ export function JetHubPage({ close, rpcCall }) {
         React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub'),
         React.createElement('p', { className: 'dim-jh-brandDesc' }, 'Provider 凭据管理与多账号支持')),
       React.createElement('div', { className: 'dim-jh-headerActions' },
+        // 一键签到在备份/恢复**左侧**（需求指定位置）
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: '依次签到全部支持签到的渠道（CodeBuddy / LobsterAI / CodeArts / Qoder / TRAE）。'
+            + '串行执行以避免触发风控。',
+          disabled: checkinBusy,
+          onClick: () => void checkinAll(),
+        }, checkinBusy ? '签到中…' : '一键签到'),
         React.createElement(BackupPanel, {
           rpcCall,
           // 导入成功会整体替换账号，ProviderPanel 只在挂载时拉列表；
@@ -1523,6 +1606,17 @@ export function JetHubPage({ close, rpcCall }) {
           className: 'dim-jh-btn',
           onClick: close,
         }, '关闭') : null)),
+    // 签到结果放在页头下方横跨整宽：页头是 flex 且不换行，塞进去会挤压按钮。
+    // `flex: none` 是必需的 —— `dim-jh-page` 是 column flex 且 `dim-jh-layout`
+    // 带 `flex: 1`，不锁住的话提示条会被压扁（与 modal 内同款做法）。
+    checkinNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': checkinNotice.tone,
+          role: checkinNotice.tone === 'error' ? 'alert' : 'status',
+          style: { flex: 'none', margin: '12px 24px 0' },
+        }, React.createElement('div', null, checkinNotice.text))
+      : null,
     React.createElement('div', { className: 'dim-jh-layout' },
       React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         PROVIDERS.map(p => React.createElement('button', {

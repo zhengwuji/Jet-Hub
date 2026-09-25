@@ -104,3 +104,21 @@ export function supportsCreditBalance(provider) {
 export function supportsDailyCheckin(provider) {
   return CREDITS_CAPABILITIES[provider]?.dailyCheckin === true;
 }
+
+/**
+ * 全部**支持每日签到**的渠道 id 列表，顺序固定（= 本表声明顺序）。
+ *
+ * 供 Jet Hub 页头的「一键签到」遍历使用。
+ *
+ * ⚠️ **必须从本表推导，不要另写一份渠道字面量**：
+ * 本表已是能力判定的唯一真相源，且 `credits-capabilities.spec.ts` 守着它与
+ * `PROVIDERS` 同步。硬编码 `['codearts','buddy',…]` 会在将来某渠道开放或
+ * 下线签到时**静默漂移** —— 表现为「新渠道永远不被签到」或
+ * 「对已下线渠道发必然失败的请求」（后者正是 CodeArts 历史缺陷的形态）。
+ *
+ * 顺序即执行顺序（调用方串行执行），故它同时决定了请求的先后；
+ * 保持本表声明顺序即可，不额外排序。
+ */
+export function checkinProviders() {
+  return Object.keys(CREDITS_CAPABILITIES).filter(supportsDailyCheckin);
+}
