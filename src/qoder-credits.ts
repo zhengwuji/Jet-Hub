@@ -80,17 +80,26 @@ export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
 const QODER_CREDITS_TIMEOUT_MS = 15_000
 
 /**
- * 积分相关端点的公共请求头。
+ * `/sash/` 端点（用量、活动）的公共请求头。
  *
- * 实测（抓包）这三个头就是全部所需 —— **不需要 WASM 签名**，
- * 也不需要 `cosy-machine*` 那一组（活动页的 webview 请求才带）。
+ * 实测只需 Bearer + `Cosy-ClientType`（**不需要 WASM 签名**，
+ * 也不需要 `cosy-machine*` 那一组）。
+ *
+ * ⚠️ **`Cosy-ClientType` 必须用 `sashClientType`（`'10'` = 桌面 app 身份），
+ * 不能用 `clientMetadata.client_type`（`'5'` = CLI 身份）** —— 服务端按该头
+ * 决定是否下发活动数据。用 `'5'` 时 `/sash/api/v1/me/campaigns` 恒返回
+ * `campaigns:[]`，导致「今天已领取」误报（真实缺陷，2026-09-25 定位；
+ * 复现与验证数据见 `QoderProduct.sashClientType` 注释与 AGENTS.md）。
+ *
+ * 用量端点（`/sash/api/v2/me/usage`）实测两种取值返回一致，一起改是安全的
+ * （2026-09-25 对照实验）。
  */
 function creditsHeaders(credential: QoderCredential, product: QoderProduct): Record<string, string> {
   return {
     Accept: 'application/json',
     Authorization: `Bearer ${qoderBearerToken(credential)}`,
-    // 源码 `Bx()` 的固定头；服务端按它区分客户端形态。
-    'Cosy-ClientType': product.clientMetadata.client_type,
+    // 桌面 app 身份；服务端据此下发活动列表（见上方注释）。
+    'Cosy-ClientType': product.sashClientType,
     'User-Agent': 'Qoder',
   }
 }

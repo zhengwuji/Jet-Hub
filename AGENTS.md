@@ -101,6 +101,31 @@ POST {openApiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body **空*
 
 请求头同上（Bearer + `Cosy-ClientType`，**无需签名**）。
 
+⚠️ **`Cosy-ClientType` 必须是 `'10'`（桌面 app 身份），不能是 `'5'`（CLI 身份）
+—— 服务端按该头决定是否下发活动数据**（真实缺陷，2026-09-25 定位）：
+
+| `Cosy-ClientType` | `/sash/api/v1/me/campaigns` 响应 |
+|---|---|
+| `'5'` | `{"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}` |
+| `'10'` | `{"showCampaign":true,"claimable":true,"campaignUrl":"…","campaigns":[完整条目]}` |
+
+同一账号、同一 token、同一端点，**只改这一个头**即可复现/消除差异
+（2026-09-25 对照实验，见 `QoderProduct.sashClientType`）。
+
+⚠️ **用户症状是「插件报今日已领取、但官方能领」**：`campaigns:[]` 会让
+`claimableCampaigns()` 筛出 0 个 → `claimQoderDailyCheckin` 返回
+`already-claimed`，**把「服务端没下发数据」误报成「今天已领」**。
+排查时**不要只看这个文案就下结论**，先确认请求头取值。
+
+⚠️ **`'10'` 的来源是官方常量**，不是猜的：Qoder 桌面端 `app.asar` 里有
+`Mh = Object.freeze({ clientType: 10, businessProduct: 'app', sessionType: 'app' })`，
+其运行日志也记录 `"path":"/sash/api/v1/me/campaigns","clientType":10`。
+
+⚠️ **不要合并两处 client_type**：`clientMetadata.client_type`（`'5'` + `cli`）
+是**推理请求体**加密信封 `metadata` 用的（源码 `Fp()` 的 CLI 默认值），
+与 `/sash/` 的 HTTP 头**是两个不同身份**。改动前先在 `qoder-adapter.ts`
+确认用途，别把推理那条链路一起改掉。
+
 ⚠️ **幂等判据是响应体的 `replayed`，不是 HTTP 状态码**：重复领取同样返回
 **200**，但 `replayed:true`、**不含 `benefit`**，且 `claimedAt` 是**上一次
 领取的旧时间**（实测请求发生在 09-21、而 `claimedAt` 是 09-18）。

@@ -47,7 +47,7 @@ describe('Qoder 积分余额', () => {
     expect(String(call[0])).toBe(`https://openapi.qoder.sh${QODER_USAGE_PATH}`)
     const headers = (call[1] as { headers: Record<string, string> }).headers
     expect(headers.Authorization).toBe('Bearer tok')
-    expect(headers['Cosy-ClientType']).toBe('5')
+    expect(headers['Cosy-ClientType']).toBe('10')
   })
 
   it('userQuota 与 addOnQuota 同时非零时相加', async () => {

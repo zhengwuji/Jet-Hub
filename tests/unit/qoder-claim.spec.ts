@@ -7,7 +7,6 @@ import {
 } from '../../src/qoder-credits.js'
 import { QODER } from '../../src/qoder-product.js'
 import type { QoderCredential } from '../../src/qoder.js'
-
 /**
  * 2026-09-21 由抓包（keylog 解密）解出的真实响应。
  *
@@ -89,6 +88,37 @@ describe('Qoder 活动列表解析', () => {
       claimStatus: 'CLAIMABLE',
       amount: 100,
     })
+  })
+
+  /**
+   * ⚠️ **真实缺陷回归（2026-09-25，用户报障）**：插件必须用**桌面 app 身份**
+   * （`Cosy-ClientType: 10`）请求活动端点。
+   *
+   * 服务端按该头决定是否下发活动数据 —— 用 CLI 身份（`'5'`）时响应恒为
+   * `{"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}`，
+   * 插件随后筛出 0 个可领活动并**误报「今日已领取」**，而官方客户端
+   * （同一账号、同一 token）能正常看到并领取。
+   *
+   * 实测对照（2026-09-25，同一账号同一 token，仅改此头）：
+   *   `5`  → `campaigns:[]`
+   *   `10` → `campaigns:[2 条完整条目]`（含 `CLAIM_BENEFIT` / `CLAIMABLE`）
+   *
+   * 本用例锁死该取值，防止回退到 `clientMetadata.client_type`（CLI 身份）。
+   */
+  it('活动端点必须带桌面 app 身份（Cosy-ClientType=10）—— 回归锁', async () => {
+    const fetcher = vi.fn(async () => json(CAMPAIGNS_BODY))
+    await fetchQoderCheckinStatus(cred, QODER, fetcher as never)
+    const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers['Cosy-ClientType']).toBe('10')
+    // 明确不等于推理用的 CLI 身份，避免将来两处被"顺手"合并。
+    expect(init.headers['Cosy-ClientType']).not.toBe(QODER.clientMetadata.client_type)
+  })
+
+  it('领取端点同样带 app 身份（Cosy-ClientType=10）—— 回归锁', async () => {
+    const fetcher = vi.fn(async () => json(CLAIMED_OK))
+    await claimQoderCampaign(cred, QODER, 'c1', fetcher as never)
+    const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers['Cosy-ClientType']).toBe('10')
   })
 
   it('形状非法返回 undefined（与「无活动」区分）', () => {

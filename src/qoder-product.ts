@@ -188,6 +188,28 @@ export interface QoderProduct {
     business_type: string
     scene: string
   }
+  /**
+   * `/sash/` 端点（用量、活动）的 `Cosy-ClientType` 头取值。
+   *
+   * ⚠️ **与 `clientMetadata.client_type` 不是同一个身份，不要合并**：
+   *
+   * - `clientMetadata.client_type`（`'5'` + `business_product:'cli'`）对应源码
+   *   `Fp()` 的 **CLI** 默认值，用于**推理请求体**的加密信封 `metadata`；
+   * - 本值（`'10'`）对应官方**桌面客户端**身份 —— 源码里是一个冻结常量
+   *   `Mh = Object.freeze({ clientType: 10, businessProduct: 'app', sessionType: 'app' })`，
+   *   官方拿它请求 `/sash/api/v1/me/campaigns`（实测日志：`"clientType":10`）。
+   *
+   * 服务端**按这个头决定是否下发活动数据**（真实缺陷，2026-09-25 定位）：
+   *
+   * | `Cosy-ClientType` | `/sash/api/v1/me/campaigns` 响应 |
+   * |---|---|
+   * | `'5'`（旧值） | `{"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}` |
+   * | `'10'`（本值） | `{"showCampaign":true,"claimable":true,"campaignUrl":"…","campaigns":[完整条目]}` |
+   *
+   * ⚠️ 同一账号、同一 token、同一端点，**只改这一个头**即可复现/消除差异，
+   * 详见 AGENTS.md「Qoder 每日领取」章节。
+   */
+  sashClientType: string
   /** `User-Agent` 头取值前缀（源码拼 `qoder/{version}`）。 */
   userAgentPrefix: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
@@ -323,6 +345,8 @@ export const QODER: QoderProduct = {
     business_type: 'agent',
     scene: 'assistant',
   },
+  // 官方桌面客户端身份（源码常量 `Mh.clientType`）。仅用于 `/sash/` 端点。
+  sashClientType: '10',
   userAgentPrefix: 'qoder',
   defaultCredentialRef: 'QODER_ACCESS_TOKEN',
   fallbackModels: QODER_FALLBACK_MODELS,
