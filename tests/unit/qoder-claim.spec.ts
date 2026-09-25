@@ -126,6 +126,39 @@ const cred = {} as QoderCredential
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
+/**
+ * 在「machine 身份受控」的环境下跑一段断言。
+ *
+ * ⚠️ **必须同时把 `QODER_RUNTIME_INFO` 指到不存在的路径**。
+ *
+ * machine 身份有两条来源：① 实时 spawn `runtime-info.exe`（真实身份）；
+ * ② 磁盘 `machine_token.json`（退路）。若只设文件路径而不禁用 exe，
+ * 每次调用都会**真的去 spawn 开发机上的可执行文件**（实测约 0.8~3.8 秒），
+ * 且拿到的是**实时身份**而非下面的 fixture —— 用例于是既慢又与断言不符。
+ *
+ * 禁用后即可精确断言「插件确实把身份透传到了请求头里」这件事本身。
+ */
+async function withControlledMachineIdentity(body: () => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-claim-mach-'))
+  const file = join(dir, 'machine_token.json')
+  writeFileSync(file, JSON.stringify({ token: 'tok-abc', type: 'type-xyz' }))
+  const prevFile = process.env.QODER_MACHINE_TOKEN_PATH
+  const prevExe = process.env.QODER_RUNTIME_INFO
+  process.env.QODER_MACHINE_TOKEN_PATH = file
+  process.env.QODER_RUNTIME_INFO = join(dir, 'no-such-runtime-info')
+  resetQoderMachineIdentityCache()
+  try {
+    await body()
+  } finally {
+    if (prevFile === undefined) delete process.env.QODER_MACHINE_TOKEN_PATH
+    else process.env.QODER_MACHINE_TOKEN_PATH = prevFile
+    if (prevExe === undefined) delete process.env.QODER_RUNTIME_INFO
+    else process.env.QODER_RUNTIME_INFO = prevExe
+    resetQoderMachineIdentityCache()
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
 describe('Qoder 活动列表解析', () => {
   it('提取 campaignId / actionType / claimStatus / amount', () => {
     const parsed = parseQoderCampaigns(CAMPAIGNS_BODY)!
@@ -181,47 +214,24 @@ describe('Qoder 活动列表解析', () => {
    * machine 头族；逐项消融确认这两个头**缺一即失效**。
    */
   it('活动端点必须带成对的 machine 头（Token + Type）—— 回归锁', async () => {
-    // 用受控 fixture 提供身份，避免结果取决于开发机是否装了 Qoder 桌面端。
-    const dir = mkdtempSync(join(tmpdir(), 'qoder-claim-mach-'))
-    const file = join(dir, 'machine_token.json')
-    writeFileSync(file, JSON.stringify({ token: 'tok-abc', type: 'type-xyz' }))
-    const prev = process.env.QODER_MACHINE_TOKEN_PATH
-    process.env.QODER_MACHINE_TOKEN_PATH = file
-    resetQoderMachineIdentityCache()
-    try {
+    await withControlledMachineIdentity(async () => {
       const fetcher = vi.fn(async () => json(CAMPAIGNS_BODY))
       await fetchQoderCheckinStatus(cred, QODER, fetcher as never)
       const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
       expect(init.headers['Cosy-MachineToken']).toBe('tok-abc')
       expect(init.headers['Cosy-MachineType']).toBe('type-xyz')
-    } finally {
-      if (prev === undefined) delete process.env.QODER_MACHINE_TOKEN_PATH
-      else process.env.QODER_MACHINE_TOKEN_PATH = prev
-      resetQoderMachineIdentityCache()
-      rmSync(dir, { recursive: true, force: true })
-    }
+    })
   })
 
   /** 领取端点同样要带（claim 也走 `/sash/`）。 */
   it('领取端点必须带成对的 machine 头 —— 回归锁', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'qoder-claim-mach2-'))
-    const file = join(dir, 'machine_token.json')
-    writeFileSync(file, JSON.stringify({ token: 'tok-abc', type: 'type-xyz' }))
-    const prev = process.env.QODER_MACHINE_TOKEN_PATH
-    process.env.QODER_MACHINE_TOKEN_PATH = file
-    resetQoderMachineIdentityCache()
-    try {
+    await withControlledMachineIdentity(async () => {
       const fetcher = vi.fn(async () => json(CLAIMED_OK))
       await claimQoderCampaign(cred, QODER, 'c1', fetcher as never)
       const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
       expect(init.headers['Cosy-MachineToken']).toBe('tok-abc')
       expect(init.headers['Cosy-MachineType']).toBe('type-xyz')
-    } finally {
-      if (prev === undefined) delete process.env.QODER_MACHINE_TOKEN_PATH
-      else process.env.QODER_MACHINE_TOKEN_PATH = prev
-      resetQoderMachineIdentityCache()
-      rmSync(dir, { recursive: true, force: true })
-    }
+    })
   })
 
   it('形状非法返回 undefined（与「无活动」区分）', () => {

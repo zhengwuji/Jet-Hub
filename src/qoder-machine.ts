@@ -65,9 +65,19 @@
  * 就在本机、格式稳定，直接读更可靠（实测有效）。
  */
 
-import { readFileSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+
+/**
+ * `runtime-info.exe` 的单次超时（毫秒）。
+ *
+ * 实测正常耗时约 **3.8 秒**（它是 bun/Go 单文件程序，启动开销占大头）。
+ * 取 20 秒是给冷启动/杀软扫描留余量；超时即放弃并退回磁盘缓存 ——
+ * 宁可少发一次头（回到修复前行为），也不要让积分查询长时间挂住。
+ */
+const RUNTIME_INFO_TIMEOUT_MS = 20_000
 
 /** 设备身份的两个必需值。 */
 export interface QoderMachineIdentity {
@@ -92,9 +102,14 @@ let cached: QoderMachineIdentity | null | undefined
 /**
  * `machine_token.json` 的候选路径。
  *
- * 顺序即优先级；`QODER_MACHINE_TOKEN_PATH` 可覆盖（**供单测隔离与排查用**：
- * 默认路径落在用户真实 `%APPDATA%` 下，测试必须能指向 fixture，
- * 否则用例结果会随开发机是否装了 Qoder 桌面端而变）。
+ * ⚠️ **这只是「拿不到实时身份」时的最后退路**，不是主路径 ——
+ * 实测该文件会长期陈旧（开发机上停在 179 天前且跑 `runtime-info.exe`
+ * **不会**更新它），照它发头会让服务端**不下发可领活动**（见
+ * {@link resolveQoderMachineIdentity} 的说明）。
+ *
+ * `QODER_MACHINE_TOKEN_PATH` 可覆盖（供单测隔离与排查用：默认路径落在用户真实
+ * `%APPDATA%` 下，测试必须能指向 fixture，否则用例结果会随开发机是否装了
+ * Qoder 桌面端而变）。
  */
 function candidatePaths(): readonly string[] {
   const override = process.env.QODER_MACHINE_TOKEN_PATH
@@ -141,10 +156,49 @@ function parseFile(path: string): QoderMachineIdentity | undefined {
 /**
  * 解析本机 Qoder 设备身份；拿不到返回 `undefined`。
  *
- * 结果被缓存（含「拿不到」这一结果），故可安全地在每个请求里调用。
+ * ## 主路径：**实时**调 `runtime-info.exe` 生成
+ *
+ * ⚠️ **真实缺陷（用户报障，2026-09-26）**：加入**第二个** Qoder 账号后，
+ * 一键领取对它报「当前没有可领取的活动」，而 IDE 里该账号**可以领**。
+ *
+ * 根因：初版实现**读磁盘上的 `machine_token.json`**，而那是
+ * `runtime-info.exe` 的一份**陈旧缓存** —— 实测开发机上它停在 179 天前，
+ * 且**跑 exe 也不会更新它**。用陈旧身份请求时服务端**不下发可领活动**：
+ *
+ * | 身份来源 | 第二个账号（`jinshui51`）的 `/sash/api/v1/me/campaigns` |
+ * |---|---|
+ * | 磁盘缓存（`f677427e14…`） | `claimable:false`，**仅 1 条 `VIEW_DETAILS`** |
+ * | **实时生成**（`15e6683914…`） | `claimable:true`，含 **`CLAIM_BENEFIT/CLAIMABLE/100`** |
+ *
+ * native 的真实做法（asar 实证）是**每次按需 spawn**：
+ * `runtime-info.exe --account-stdin`，把 `{account}` 写进 stdin，
+ * 由该可执行文件（UMID 模块）实时产出 `machineToken` / `machineType`。
+ * 故这里照做。
+ *
+ * ⚠️ **identity 实测是设备级、不随账号变化**（三个不同 uid 生成结果相同），
+ * 所以不需要按账号分缓存；但**进程内必须缓存** —— 单次 spawn 实测约 **3.8 秒**，
+ * 每次请求都跑会让积分查询慢到不可用。
+ *
+ * ## 退路：实时拿不到时才读磁盘缓存
+ *
+ * 未安装 Qoder 桌面端（无 exe）时退回读 `machine_token.json`；
+ * 两者都拿不到则返回 `undefined`，调用方**不带这两个头**（保守降级）。
+ *
+ * 结果被缓存（含「拿不到」这一结果）。
+ *
+ * @param forceExecutable 仅供测试注入（跳过真实 spawn）
  */
-export function resolveQoderMachineIdentity(): QoderMachineIdentity | undefined {
+export function resolveQoderMachineIdentity(
+  forceExecutable?: string,
+): QoderMachineIdentity | undefined {
   if (cached !== undefined) return cached ?? undefined
+  // 主路径：实时生成
+  const live = readFromRuntimeInfo(forceExecutable)
+  if (live !== undefined) {
+    cached = live
+    return live
+  }
+  // 退路：磁盘缓存（可能陈旧，但聊胜于无）
   for (const path of candidatePaths()) {
     const identity = parseFile(path)
     if (identity !== undefined) {
@@ -154,6 +208,160 @@ export function resolveQoderMachineIdentity(): QoderMachineIdentity | undefined 
   }
   cached = null
   return undefined
+}
+
+/**
+ * 异步版：语义与 {@link resolveQoderMachineIdentity} 相同，但**不阻塞事件循环**。
+ *
+ * ⚠️ 积分端点在 Cordis 里是 async 上下文，而 spawn 要 ~3.8 秒 —— 用同步
+ * `execFileSync` 会把整个事件循环卡住（连带 Web GUI 的其他请求），
+ * 故生产路径用本函数。
+ */
+export async function resolveQoderMachineIdentityAsync(
+  forceExecutable?: string,
+): Promise<QoderMachineIdentity | undefined> {
+  if (cached !== undefined) return cached ?? undefined
+  const live = await readFromRuntimeInfoAsync(forceExecutable)
+  if (live !== undefined) {
+    cached = live
+    return live
+  }
+  for (const path of candidatePaths()) {
+    const identity = parseFile(path)
+    if (identity !== undefined) {
+      cached = identity
+      return identity
+    }
+  }
+  cached = null
+  return undefined
+}
+
+/**
+ * 定位 `runtime-info.exe`。
+ *
+ * 路径形态：`~/.qoder/.bin/umid-<platform>-<hash>/runtime-info.exe`
+ * —— **目录名带哈希**（随版本变），故必须枚举而不能写死。
+ *
+ * 非 Windows 平台的可执行文件名为 `runtime-info`（无 `.exe`）。
+ *
+ * ⚠️ `QODER_RUNTIME_INFO` 可覆盖（**供单测隔离**：默认会真的 spawn 开发机上
+ * 的可执行文件，单测必须能把它指到不存在的路径以强制走磁盘缓存退路，
+ * 否则用例结果随「开发机是否装了 Qoder 桌面端」而变，且每次跑 3.8 秒）。
+ * 指向不存在的路径即等价于「未安装」。
+ */
+function locateRuntimeInfo(override?: string): string | undefined {
+  const fromEnv = process.env.QODER_RUNTIME_INFO
+  const candidate = override ?? (fromEnv !== undefined && fromEnv.length > 0 ? fromEnv : undefined)
+  if (candidate !== undefined) {
+    // 显式指定的路径必须真实存在，否则视为「没有可执行文件」而走退路。
+    return existsSync(candidate) ? candidate : undefined
+  }
+  const binDir = join(homedir(), '.qoder', '.bin')
+  let entries: string[]
+  try {
+    entries = readdirSync(binDir)
+  } catch {
+    // 未安装 Qoder 桌面端：正常降级
+    return undefined
+  }
+  const dir = entries.find((name) => name.startsWith('umid-'))
+  if (dir === undefined) return undefined
+  const exe = join(binDir, dir, process.platform === 'win32' ? 'runtime-info.exe' : 'runtime-info')
+  return existsSync(exe) ? exe : undefined
+}
+
+/**
+ * 从 `runtime-info.exe` 的输出里取出身份。
+ *
+ * 输出形如（单行 JSON）：
+ * ```json
+ * {"machineToken":"P1gA…","machineType":"15e6…","machineCode":"7a08…",
+ *  "vmInfo":{…},"accountOutcome":"success"}
+ * ```
+ *
+ * ⚠️ 即便 `accountOutcome` 不是 `success`（如 `invalid_input`），
+ * `machineToken` / `machineType` 仍然返回 —— 实测设备身份与账号无关，
+ * 故不因账号字段而丢弃可用身份。
+ */
+function parseRuntimeInfoOutput(out: string): QoderMachineIdentity | undefined {
+  const start = out.indexOf('{')
+  if (start < 0) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(out.slice(start))
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined
+  const record = parsed as Record<string, unknown>
+  const token = record.machineToken
+  const type = record.machineType
+  if (typeof token !== 'string' || token.length === 0) return undefined
+  if (typeof type !== 'string' || type.length === 0) return undefined
+  return { token, type }
+}
+
+/**
+ * 同步实时生成身份（供同步调用方与测试）。
+ *
+ * ⚠️ 实测约 **3.8 秒**，生产路径请用异步版（见
+ * {@link resolveQoderMachineIdentityAsync}），否则会阻塞事件循环。
+ */
+function readFromRuntimeInfo(override?: string): QoderMachineIdentity | undefined {
+  const exe = locateRuntimeInfo(override)
+  if (exe === undefined) return undefined
+  try {
+    const out = execFileSync(exe, ['--account-stdin'], {
+      input: JSON.stringify({ account: '' }),
+      encoding: 'utf8',
+      timeout: RUNTIME_INFO_TIMEOUT_MS,
+      windowsHide: true,
+    })
+    return parseRuntimeInfoOutput(out)
+  } catch {
+    // 超时 / spawn 失败：交给退路（磁盘缓存）或降级
+    return undefined
+  }
+}
+
+/** 异步实时生成身份（生产路径）。 */
+async function readFromRuntimeInfoAsync(override?: string): Promise<QoderMachineIdentity | undefined> {
+  const exe = locateRuntimeInfo(override)
+  if (exe === undefined) return undefined
+  return await new Promise<QoderMachineIdentity | undefined>((resolve) => {
+    let settled = false
+    const done = (value: QoderMachineIdentity | undefined): void => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    let child
+    try {
+      child = spawn(exe, ['--account-stdin'], { windowsHide: true })
+    } catch {
+      done(undefined)
+      return
+    }
+    const timer = setTimeout(() => {
+      // 超时即放弃并 kill，避免留下孤儿进程
+      try { child.kill() } catch { /* 忽略 */ }
+      done(undefined)
+    }, RUNTIME_INFO_TIMEOUT_MS)
+    timer.unref?.()
+
+    let stdout = ''
+    child.stdout?.on('data', (chunk) => { stdout += String(chunk) })
+    // stderr 不用于判定，但必须消费掉，否则管道填满会让子进程阻塞
+    child.stderr?.on('data', () => {})
+    child.once('error', () => { clearTimeout(timer); done(undefined) })
+    child.once('close', () => {
+      clearTimeout(timer)
+      done(parseRuntimeInfoOutput(stdout))
+    })
+    child.stdin?.on('error', () => {})
+    child.stdin?.end(JSON.stringify({ account: '' }))
+  })
 }
 
 /** 仅供测试：清空缓存（生产代码不需要）。 */
@@ -166,6 +374,9 @@ export function resetQoderMachineIdentityCache(): void {
  *
  * 拿不到身份时**原样返回**，不写空串 —— 发空头会让服务端可能按非法设备处理，
  * 漏发才是安全的降级（与修复前行为一致）。
+ *
+ * 同步版：只在身份**已缓存**时才会命中；否则请用
+ * {@link withQoderMachineHeadersAsync}。
  */
 export function withQoderMachineHeaders(headers: Record<string, string>): Record<string, string> {
   const identity = resolveQoderMachineIdentity()
@@ -173,6 +384,20 @@ export function withQoderMachineHeaders(headers: Record<string, string>): Record
   return {
     ...headers,
     // 两者必须同时出现（见模块头部消融表：缺一即拿不到可领活动）。
+    'Cosy-MachineToken': identity.token,
+    'Cosy-MachineType': identity.type,
+  }
+}
+
+/** 异步版：生产路径用（首次会真实 spawn，约 3.8 秒，之后走缓存）。 */
+export async function withQoderMachineHeadersAsync(
+  headers: Record<string, string>,
+  forceExecutable?: string,
+): Promise<Record<string, string>> {
+  const identity = await resolveQoderMachineIdentityAsync(forceExecutable)
+  if (identity === undefined) return headers
+  return {
+    ...headers,
     'Cosy-MachineToken': identity.token,
     'Cosy-MachineType': identity.type,
   }

@@ -68,7 +68,7 @@
  */
 
 import { roundCredits, type CheckinStatus, type ClaimOutcome, type CreditBalance, type CreditPackage } from './credits.js'
-import { withQoderMachineHeaders } from './qoder-machine.js'
+import { withQoderMachineHeadersAsync } from './qoder-machine.js'
 import { qoderBearerToken, type QoderCredential } from './qoder.js'
 import type { QoderProduct } from './qoder-product.js'
 
@@ -105,9 +105,16 @@ const QODER_CREDITS_TIMEOUT_MS = 15_000
  * 其中 native 请求确实带了完整 machine 头族；详见 `qoder-machine.ts` 模块注释。
  *
  * 用量端点（`/sash/api/v2/me/usage`）对这些头**不敏感**，一并带上无副作用。
+ *
+ * ⚠️ 本函数是**异步**的：machine 身份要实时 spawn `runtime-info.exe` 生成
+ * （首次约 3.8 秒，之后走进程内缓存），同步实现会阻塞事件循环。
+ * 详见 `qoder-machine.ts`。
  */
-function creditsHeaders(credential: QoderCredential, product: QoderProduct): Record<string, string> {
-  return withQoderMachineHeaders({
+async function creditsHeaders(
+  credential: QoderCredential,
+  product: QoderProduct,
+): Promise<Record<string, string>> {
+  return await withQoderMachineHeadersAsync({
     Accept: 'application/json',
     Authorization: `Bearer ${qoderBearerToken(credential)}`,
     // 桌面 app 身份（`'10'`）；服务端据此进入活动下发分支。
@@ -189,7 +196,7 @@ export async function fetchQoderCreditBalance(
   try {
     response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
       method: 'GET',
-      headers: creditsHeaders(credential, product),
+      headers: await creditsHeaders(credential, product),
       signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS),
     })
   } catch {
@@ -328,7 +335,7 @@ async function loadCampaigns(
   try {
     response = await fetcher(`${product.openApiBase}${QODER_CAMPAIGNS_PATH}`, {
       method: 'GET',
-      headers: creditsHeaders(credential, product),
+      headers: await creditsHeaders(credential, product),
       signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS),
     })
   } catch {
@@ -447,7 +454,7 @@ export async function claimQoderCampaign(
   try {
     response = await fetcher(url, {
       method: 'POST',
-      headers: { ...creditsHeaders(credential, product), 'Content-Type': 'application/json' },
+      headers: { ...await creditsHeaders(credential, product), 'Content-Type': 'application/json' },
       body: '',
       signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS),
     })

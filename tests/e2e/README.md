@@ -33,6 +33,7 @@
 | `codearts-credits-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` | **只读**：凭据结构、**账户类型检测**（`is_credit_package`）、积分余额、活动列表。**绝不领取** |
 | `codearts-claim-probe.e2e.spec.ts` | `DSH_CODEARTS_E2E=1` + `DSH_CODEARTS_CLAIM_E2E_CONFIRM=yes` | 真实领取积分（会改动当日领取状态；**不消耗模型积分**，重复运行幂等） |
 | `qoder-probe.e2e.spec.ts` | `DSH_QODER_E2E=1` | **只读**：凭据结构（含 `machine_id`）、令牌对 `/api/v1/userinfo` 的有效性、静态兜底模型表。**不发模型请求、不续期** |
+| `qoder-credits-probe.e2e.spec.ts` | `DSH_QODER_E2E=1` | **只读**：**逐账号**签到状态（`dailyCredit` / `todayCheckedIn` / 活动 key），并校验**设备身份（`Cosy-MachineToken` + `Cosy-MachineType`）确实生效**。**绝不领取**。⚠️ 覆盖「多账号下第二个账号看不到可领活动」这一缺陷 —— 单测配置刻意禁用了 `runtime-info.exe`（见下「Qoder 设备身份为何只能在 e2e 里验证」），故它唯一的自动化回归就在这里 |
 | `trae-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | **只读**：凭据结构（含 machine_id / device_id）、积分余额、签到状态、远端模型列表。**不签到、不发模型请求** |
 | `trae-claim-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` + `DSH_TRAE_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
 | `cline-probe.e2e.spec.ts` | `DSH_CLINE_E2E=1` | **只读**：凭据结构（含 `account_id` 与 `workos:` 前缀）、**前缀不可剥的现场证据**（带前缀 200 / 剥掉 401）、积分余额（打印原始值供核对单位）、远端 `free` 集合与 `/models` 目录。**不发模型请求、不续期** |
@@ -78,6 +79,9 @@ pnpm test:e2e:codearts-claim
 
 # 安全：Qoder 只读探针（凭据结构/令牌有效性/模型表，不发模型请求、不续期）
 pnpm test:e2e:qoder
+
+# 安全：Qoder 积分只读探针（逐账号签到状态 + 设备身份是否生效；绝不领取）
+pnpm test:e2e:qoder-credits
 
 # ⚠️ 发一次 Qoder 推理请求（默认 qmodel_38max（Qwen3.8-Max）**免费**，不消耗积分）
 pnpm test:e2e:qoder-chat
@@ -132,6 +136,33 @@ DSH_CLINE_CHAT_E2E_ALL_FREE=1       可选：才遍历其余 4 个免费模型
 > Qoder 官方客户端用**硬件指纹**派生 `machine_id`，而本插件用**随机 UUID**
 > （见设计文档 §8）。若续期返回 4xx（非 401），说明服务端校验了设备标识，
 > 该假设被推翻 —— 此时必须改用硬件指纹派生，否则用户每天都要重新登录。
+
+## Qoder 设备身份为何只能在 e2e 里验证
+
+Qoder 的 `/sash/` 端点要求一对待定的设备身份头
+（`Cosy-MachineToken` + `Cosy-MachineType`，**缺一即失效**），
+由桌面端的 `runtime-info.exe` **实时生成**。
+
+⚠️ **单测刻意禁用了这个可执行文件**：`vitest.config.ts` 把 `QODER_RUNTIME_INFO`
+指向不存在的路径。理由有三 ——
+
+1. 单次 spawn 实测约 **3.8 秒**，不禁用会让整个单测套件明显变慢；
+2. 用例结果会随「开发机是否装了 Qoder 桌面端」而变；
+3. 断言会拿到**实时身份**而非用例准备的 fixture，从而假失败。
+
+代价是：**「实时生成身份」这条主路径在单测里根本不执行**。
+所以下面两件事**只能**在 e2e 里验证（`vitest.e2e.config.ts` 不设该变量）：
+
+- 实时生成的身份能否让服务端**下发可领活动**（`CLAIM_BENEFIT`）；
+- **多账号**场景下每个账号是否都能拿到（历史缺陷②：初版读陈旧的
+  `machine_token.json` 缓存，导致第二个账号在一键领取里被报
+  「当前没有可领取的活动」，而 IDE 里可领）。
+
+因此 `qoder-credits-probe.e2e.spec.ts` 的**逐账号**断言不可改成只测第一个账号
+—— 那正是缺陷②唯一会漏网的地方。
+
+> 单账号时该缺陷**不可能**被覆盖：探针会打印提示而不 fail（单账号是合法状态），
+> 别把提示当噪音删掉。
 
 ## 限流真实性判定
 
