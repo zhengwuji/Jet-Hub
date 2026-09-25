@@ -99,32 +99,57 @@ GET  {openApiBase}/sash/api/v1/me/campaigns
 POST {openApiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body **空**
 ```
 
-请求头同上（Bearer + `Cosy-ClientType`，**无需签名**）。
+**请求头（`/sash/` 端点必需四项）**：`Authorization: Bearer` + `Cosy-ClientType: '10'`
++ **`Cosy-MachineToken` + `Cosy-MachineType`（成对）**，**无需签名**。
 
-⚠️ **`Cosy-ClientType` 必须是 `'10'`（桌面 app 身份），不能是 `'5'`（CLI 身份）
-—— 服务端按该头决定是否下发活动数据**（真实缺陷，2026-09-25 定位）：
+⚠️ **两个条件缺一不可，且是「必要但不充分」的叠加关系**（真实缺陷，
+2026-09-25 定位并**端到端修复验证**：插件领取成功、余额 0→100）：
 
-| `Cosy-ClientType` | `/sash/api/v1/me/campaigns` 响应 |
+| 请求头 | `/sash/api/v1/me/campaigns` 响应 |
 |---|---|
-| `'5'` | `{"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}` |
-| `'10'` | `{"showCampaign":true,"claimable":true,"campaignUrl":"…","campaigns":[完整条目]}` |
+| `Cosy-ClientType: '5'`（CLI 身份） | `{"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}` |
+| `Cosy-ClientType: '10'` + 无 machine 头 | `showCampaign:true, claimable:false`，**1 条 `VIEW_DETAILS`** |
+| `Cosy-ClientType: '10'` + MachineToken + MachineType | `claimable:true`，**2 条**，含 `CLAIM_BENEFIT/CLAIMABLE/amount:100` |
+| ＋MachineToken/MachineType **去掉任一个** | ❌ 退回 1 条（**必须成对**） |
+| 单独加 `Cosy-MachineId`/`Version`/`OS`/`Hostname`/`Code` | ❌ 均无效（**都不是必需项**） |
 
-同一账号、同一 token、同一端点，**只改这一个头**即可复现/消除差异
-（2026-09-25 对照实验，见 `QoderProduct.sashClientType`）。
+⚠️ **`'10'` 单独不够** —— 这是被 PR !11 的错误结论误导过的地方。它只让服务端
+回一条 `VIEW_DETAILS`（`claimable:false`），**没有** `CLAIM_BENEFIT`，于是插件
+筛出 0 个可领活动并误报「今天已领」。**真正决定下发可领活动的是成对的
+machine 头**。实现见 `src/qoder-machine.ts`。
 
-⚠️ **用户症状是「插件报今日已领取、但官方能领」**：`campaigns:[]` 会让
-`claimableCampaigns()` 筛出 0 个 → `claimQoderDailyCheckin` 返回
-`already-claimed`，**把「服务端没下发数据」误报成「今天已领」**。
-排查时**不要只看这个文案就下结论**，先确认请求头取值。
+⚠️ **值的来源可自给自足，不需要抓包**：`%APPDATA%\Qoder\SharedClientCache\
+cache\machine_token.json` 的 `token` → `Cosy-MachineToken`、`type` →
+`Cosy-MachineType`。实测该文件即使 `updateAt` 很旧（179 天前）token 仍有效。
+读不到时**保守降级**（不带这两个头，回到修复前行为）——纯插件登录、未装
+Qoder 桌面端的用户没有该文件，不能让积分功能整体失败。
 
 ⚠️ **`'10'` 的来源是官方常量**，不是猜的：Qoder 桌面端 `app.asar` 里有
 `Mh = Object.freeze({ clientType: 10, businessProduct: 'app', sessionType: 'app' })`，
-其运行日志也记录 `"path":"/sash/api/v1/me/campaigns","clientType":10`。
+native 另有 `rl = Object.freeze({ clientType: 10, businessProduct: 'app' })`。
 
 ⚠️ **不要合并两处 client_type**：`clientMetadata.client_type`（`'5'` + `cli`）
 是**推理请求体**加密信封 `metadata` 用的（源码 `Fp()` 的 CLI 默认值），
 与 `/sash/` 的 HTTP 头**是两个不同身份**。改动前先在 `qoder-adapter.ts`
 确认用途，别把推理那条链路一起改掉。
+
+⚠️ **用户症状是「插件报今日已领取、但官方能领」**：`campaigns:[]` 或只有
+`VIEW_DETAILS` 会让 `claimableCampaigns()` 筛出 0 个 →
+`claimQoderDailyCheckin` 返回 `already-claimed`，**把「服务端没下发数据」
+误报成「今天已领」**。排查时**不要只看这个文案**，先确认上述四个头是否齐全。
+
+⚠️ **「今天已领」的正确判据不是「列表为空」**（2026-09-21 抓包实测的
+**领取前后对照**，这是该判据可靠性的直接证据）：
+
+| 时刻 | `claimable` | 那条 `CLAIM_BENEFIT` 的 `claimStatus` | 列表 |
+|---|---|---|---|
+| 领取前 | `true` | `CLAIMABLE` | 非空 |
+| 领取后 | `false` | `CLAIMED` | **仍非空** |
+
+即**领取成功后服务端并不清空列表**，只是把该条改成 `CLAIMED`。故判据必须是
+「存在 `CLAIM_BENEFIT` 且 `CLAIMED`」，而「列表为空 / 只有 `VIEW_DETAILS`」
+应判**未领**。方向取保守：误报未领最多让用户多点一次（服务端幂等，回
+`replayed:true`，无害）；误报已领会让其**真的错过当天积分**。
 
 ⚠️ **幂等判据是响应体的 `replayed`，不是 HTTP 状态码**：重复领取同样返回
 **200**，但 `replayed:true`、**不含 `benefit`**，且 `claimedAt` 是**上一次
@@ -144,9 +169,14 @@ POST {openApiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body **空*
 回调」那次是同一类错误。
 
 ⚠️ **`CheckinStatus.active` 必须恒为 `true`**（拿到响应即 true，不按
-「列表非空」判）：服务端在「今天已领」时清空 `campaigns`，若据此判
-`active:false`，`collectClaimResults` 会先命中「活动未开启」分支，
+「列表非空」判）：服务端在活动不同阶段都可能回空列表（如请求头不全时），
+若据此判 `active:false`，`collectClaimResults` 会先命中「活动未开启」分支，
 把「今天已领」误报成「签到活动未开启」。
+
+⚠️ **但「今天已领」不可反推成「列表为空」** —— 2026-09-21 抓包实测领取前后
+对照显示：**领取成功后列表仍非空**，只是那条 `CLAIM_BENEFIT` 的
+`claimStatus` 由 `CLAIMABLE` 变 `CLAIMED`、顶层 `claimable` 变 `false`。
+正确判据见上「Qoder 每日领取」章节。
 
 ⚠️ **RPC 分支须传 `precheckStatus: false`** —— `claimQoderDailyCheckin`
 自带活动列表查询，否则会重复发一次 GET（与 LobsterAI 传 false 同理）。
@@ -2237,7 +2267,9 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 
 **Qoder** —— `src/qoder-credits.ts`（2026-09-21 由 keylog 解密抓包解出）：
 
-- 状态查询：`GET /sash/api/v1/me/campaigns`（**只需 Bearer + `Cosy-ClientType`**）
+- 状态查询：`GET /sash/api/v1/me/campaigns`
+  （**必需 Bearer + `Cosy-ClientType:'10'` + `Cosy-MachineToken`/`Cosy-MachineType` 成对**；
+  ⚠️ 少了 machine 头只会拿到 1 条 `VIEW_DETAILS`，**看不到可领活动** —— 见上「Qoder 每日领取」）
 - 领取：`POST /sash/api/v1/me/campaigns/{campaignId}/claim`（**body 空**）
 - 幂等：重复领取返回 **HTTP 200 + `replayed:true`**（且不含 `benefit`、
   `claimedAt` 是旧时间）—— 判定**以响应体 `replayed` 为准**，不能只看 HTTP 状态
@@ -2342,7 +2374,9 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 >
 > ⚠️ **早期把 qoder 误判为两项皆无**（登记成 `balance:false`），根因有二，都值得记住：
 > 1. **只按 `/api/` 前缀搜端点**，而余额挂在 **`/sash/`** 下 → 漏检；
-> 2. **误以为用量端点也需要 WASM 签名** —— 实测只需 `Bearer` + `Cosy-ClientType`。
+> 2. **误以为用量端点也需要 WASM 签名** —— 实测只需 `Bearer` + `Cosy-ClientType`
+>    （**活动端点还额外需要成对的 machine 头**，用量端点则不需要：
+>    实测它对这两个头不敏感）。
 >
 > **余额与签到彼此独立**：不能因为「没有签到接口」就推断「也查不到余额」。
 

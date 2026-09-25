@@ -197,17 +197,26 @@ export interface QoderProduct {
    *   `Fp()` 的 **CLI** 默认值，用于**推理请求体**的加密信封 `metadata`；
    * - 本值（`'10'`）对应官方**桌面客户端**身份 —— 源码里是一个冻结常量
    *   `Mh = Object.freeze({ clientType: 10, businessProduct: 'app', sessionType: 'app' })`，
-   *   官方拿它请求 `/sash/api/v1/me/campaigns`（实测日志：`"clientType":10`）。
+   *   官方拿它请求 `/sash/api/v1/me/campaigns`。
    *
-   * 服务端**按这个头决定是否下发活动数据**（真实缺陷，2026-09-25 定位）：
+   * 服务端按这个头进入活动下发分支（真实缺陷，2026-09-25 定位）：
    *
    * | `Cosy-ClientType` | `/sash/api/v1/me/campaigns` 响应 |
    * |---|---|
    * | `'5'`（旧值） | `{"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}` |
-   * | `'10'`（本值） | `{"showCampaign":true,"claimable":true,"campaignUrl":"…","campaigns":[完整条目]}` |
+   * | `'10'`（本值） | `{"showCampaign":true,…,"campaigns":[1 条 VIEW_DETAILS]}` |
    *
-   * ⚠️ 同一账号、同一 token、同一端点，**只改这一个头**即可复现/消除差异，
-   * 详见 AGENTS.md「Qoder 每日领取」章节。
+   * ⚠️ **`'10'` 只是必要前提，不足以拿到「可领取」的活动**。要让服务端下发
+   * `CLAIM_BENEFIT/CLAIMABLE`，还必须同时带 `Cosy-MachineToken` +
+   * `Cosy-MachineType`（成对，见 `src/qoder-machine.ts`）。同一账号对照：
+   *
+   * | 头 | 结果 |
+   * |---|---|
+   * | 仅 `'10'` | 1 条 `VIEW_DETAILS`，`claimable:false` |
+   * | `'10'` ＋ MachineToken ＋ MachineType | **2 条**，含 `CLAIM_BENEFIT/CLAIMABLE/100` |
+   *
+   * 该结论由 2026-09-21 抓包（`qoder积分.pcapng` + `SSLKEYLOGFILE` 解密）
+   * 与逐项消融实验共同证实，详见 `qoder-machine.ts`。
    */
   sashClientType: string
   /** `User-Agent` 头取值前缀（源码拼 `qoder/{version}`）。 */

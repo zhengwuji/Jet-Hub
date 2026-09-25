@@ -68,6 +68,7 @@
  */
 
 import { roundCredits, type CheckinStatus, type ClaimOutcome, type CreditBalance, type CreditPackage } from './credits.js'
+import { withQoderMachineHeaders } from './qoder-machine.js'
 import { qoderBearerToken, type QoderCredential } from './qoder.js'
 import type { QoderProduct } from './qoder-product.js'
 
@@ -82,26 +83,37 @@ const QODER_CREDITS_TIMEOUT_MS = 15_000
 /**
  * `/sash/` 端点（用量、活动）的公共请求头。
  *
- * 实测只需 Bearer + `Cosy-ClientType`（**不需要 WASM 签名**，
- * 也不需要 `cosy-machine*` 那一组）。
+ * ⚠️ **两个头都必需，缺一都会让服务端不下发「可领取」的活动**：
  *
- * ⚠️ **`Cosy-ClientType` 必须用 `sashClientType`（`'10'` = 桌面 app 身份），
- * 不能用 `clientMetadata.client_type`（`'5'` = CLI 身份）** —— 服务端按该头
- * 决定是否下发活动数据。用 `'5'` 时 `/sash/api/v1/me/campaigns` 恒返回
- * `campaigns:[]`，导致「今天已领取」误报（真实缺陷，2026-09-25 定位；
- * 复现与验证数据见 `QoderProduct.sashClientType` 注释与 AGENTS.md）。
+ * 1. `Cosy-ClientType` = `sashClientType`（`'10'` = 桌面 app 身份）。
+ *    用 `clientMetadata.client_type`（`'5'` = CLI）时 `/sash/api/v1/me/campaigns`
+ *    恒返回 `campaigns:[]`。
+ * 2. `Cosy-MachineToken` + `Cosy-MachineType`（**必须成对**，见
+ *    `qoder-machine.ts`）。只用 `'10'` 时服务端只回一条 `VIEW_DETAILS`，
+ *    **没有** `CLAIM_BENEFIT/CLAIMABLE` → 插件误判「今天已领」。
  *
- * 用量端点（`/sash/api/v2/me/usage`）实测两种取值返回一致，一起改是安全的
- * （2026-09-25 对照实验）。
+ * 这两点是**必要但不充分**的关系：`'10'` 是前提，machine 头才决定是否下发
+ * 可领项。2026-09-25 的逐项消融实验（同一账号、同一 token、只改头）证实：
+ *
+ * | 头 | 结果 |
+ * |---|---|
+ * | 仅 `ClientType: '10'` | 1 条 `VIEW_DETAILS`，`claimable:false` |
+ * | ＋ `MachineToken` ＋ `MachineType` | **2 条**，含 `CLAIM_BENEFIT/CLAIMABLE/100` |
+ * | 去掉 `MachineToken` 或 `MachineType` 任一 | 退回 1 条 |
+ *
+ * 关键证据来自用户提供的 `qoder积分.pcapng`（配 `SSLKEYLOGFILE` 解密），
+ * 其中 native 请求确实带了完整 machine 头族；详见 `qoder-machine.ts` 模块注释。
+ *
+ * 用量端点（`/sash/api/v2/me/usage`）对这些头**不敏感**，一并带上无副作用。
  */
 function creditsHeaders(credential: QoderCredential, product: QoderProduct): Record<string, string> {
-  return {
+  return withQoderMachineHeaders({
     Accept: 'application/json',
     Authorization: `Bearer ${qoderBearerToken(credential)}`,
-    // 桌面 app 身份；服务端据此下发活动列表（见上方注释）。
+    // 桌面 app 身份（`'10'`）；服务端据此进入活动下发分支。
     'Cosy-ClientType': product.sashClientType,
     'User-Agent': 'Qoder',
-  }
+  })
 }
 
 /** 安全读数字字段（容忍字符串与缺失）；无法解析时返回 undefined。 */
@@ -340,9 +352,26 @@ async function loadCampaigns(
  *   服务端在「今天已领」时会把 `campaigns` 清空并回 `showCampaign:false`，
  *   若据此判 `active:false`，调用方（`collectClaimResults`）会先命中
  *   「活动未开启」分支，把「今天已领」误报成「签到活动未开启」。
- * - `todayCheckedIn`：**没有可领活动即为 true**（含列表为空的情形）。
- *   「已领」与「本来就没活动」在响应上无法区分，而这是个**每日 10:00
- *   刷新**的活动，保守判「已领」比误报「可领」更不容易误导用户。
+ * - `todayCheckedIn`：**只有存在「领过」的领分类活动时才为 true**
+ *   （`CLAIM_BENEFIT` 且 `claimStatus === 'CLAIMED'`）。
+ *
+ *   ⚠️ **不能写成「没有可领活动即为 true」**（真实缺陷，用户报障
+ *   「没领过就显示已经领取，去 IDE 看还是可以领取的状态」）：
+ *   「列表里没有可领项」**不等于**「今天领过了」—— 它还可能是
+ *   ① 未到刷新时间（每日 10:00 UTC+8）、② 请求头不完整导致服务端未下发
+ *   （实测缺 `Cosy-MachineToken`/`Cosy-MachineType` 时就会这样，
+ *   见 `qoder-machine.ts`）、③ 该账号本就无此类活动。三者都不是「已领」。
+ *
+ *   2026-09-21 抓包给了**同一账号的领取前后对照**（这是判据可靠性的直接证据）：
+ *
+ *   | 时刻 | `claimable` | 那条 `CLAIM_BENEFIT` 的 `claimStatus` |
+ *   |---|---|---|
+ *   | 领取前 | `true` | `CLAIMABLE` |
+ *   | 领取后 | `false` | `CLAIMED` |
+ *
+ *   故「有 `CLAIM_BENEFIT`+`CLAIMED`」是「已领」的**充分且可靠**判据。
+ *   方向仍取保守：误报未领最多让用户多点一次（服务端幂等，回
+ *   `replayed:true`，无害）；误报已领会让其**真的错过当天积分**。
  * - `dailyCredit`：可领活动声明的 `benefit.amount`（实测 100）。
  */
 export async function fetchQoderCheckinStatus(
@@ -355,9 +384,12 @@ export async function fetchQoderCheckinStatus(
 
   const claimable = claimableCampaigns(parsed)
   const benefitCampaigns = parsed.campaigns.filter((c) => c.actionType === 'CLAIM_BENEFIT')
+  const claimedBenefit = benefitCampaigns.filter((c) => c.claimStatus === 'CLAIMED')
   return {
     active: true,
-    todayCheckedIn: claimable.length === 0,
+    // 真有「领过」的领分类活动、且当前无可领项 ⇒ 今天已领。
+    // 列表为空 / 仅 VIEW_DETAILS / 请求头不完整导致的空态，一律判**未领**。
+    todayCheckedIn: claimedBenefit.length > 0 && claimable.length === 0,
     streakDays: 0,
     dailyCredit: claimable[0]?.amount ?? benefitCampaigns[0]?.amount ?? 0,
     todayCredit: 0,
@@ -457,10 +489,17 @@ function describeNonJson(status: number, text: string): string {
  * 与其它运营活动），故逐个领取而非只领第一个。
  *
  * 返回的 `ClaimOutcome` 汇总为一条：
- * - 全部已领 → `already-claimed`；
- * - 无可领活动 → `inactive`；
+ * - 无可领活动 → `inactive`（⚠️ **不是** `already-claimed`）；
  * - 至少一个成功 → `claimed`（`credit` 为累计值）；
+ * - 全部已领（`replayed:true`）→ `already-claimed`；
  * - 全部失败 → `failed`（带上第一条错误原因）。
+ *
+ * ⚠️ **「无可领活动」必须是 `inactive`，不能报 `already-claimed`**
+ * （真实缺陷，用户报障「没领过就显示已经领取」）：旧实现在
+ * `targets.length === 0` 时直接返回「今天已领取」，于是只要服务端没下发
+ * 可领项（含**请求头不完整**、未到刷新时间、本就无活动三种情形），
+ * 界面就显示「今天已领取」，与 IDE 的「可领取」直接矛盾。
+ * 二者语义完全不同：`inactive` = 没东西可领；`already-claimed` = 领过了。
  */
 export async function claimQoderDailyCheckin(
   credential: QoderCredential,
@@ -474,7 +513,14 @@ export async function claimQoderDailyCheckin(
 
   const targets = claimableCampaigns(parsed)
   if (targets.length === 0) {
-    return { kind: 'already-claimed', message: '今天已领取' }
+    // 区分两种「没领到」：确实领过 → already-claimed；压根没东西可领 → inactive。
+    // 判据同 fetchQoderCheckinStatus（抓包实证：领取后该活动变 CLAIMED）。
+    const claimedBefore = parsed.campaigns.some(
+      (c) => c.actionType === 'CLAIM_BENEFIT' && c.claimStatus === 'CLAIMED',
+    )
+    return claimedBefore
+      ? { kind: 'already-claimed', message: '今天已领取' }
+      : { kind: 'inactive', message: '当前没有可领取的活动' }
   }
 
   let total = 0
