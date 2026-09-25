@@ -929,9 +929,9 @@ describe('model.list / model.setDisabled 端点', () => {
       // 始终可用），使端点注册行为与 Web profile 下完全一致。
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
-      // `model.setDisabled` 写完黑名单后必须广播 `llm/adapters-updated`，
-      // 否则客户端那份 `status === 'ready'` 即短路的目录缓存永不失效 ——
-      // 表现为「关闭后选择器里仍看得到该模型，重启后才消失」（真实缺陷）。
+      // `model.setDisabled` / `model.setAllDisabled` 写完黑名单后必须广播
+      // `llm/adapters-updated`，否则客户端那份 `status === 'ready'` 即短路的
+      // 目录缓存永不失效 —— 表现为「关闭后选择器里仍看得到该模型，重启后才消失」。
       // 替身必须真的实现 emit：若只声明不实现，生产代码的广播会以
       // `ctx.emit is not a function` 被 try/catch 静默吞掉，用例便形同虚设。
       emit: (event: string) => {
@@ -1390,7 +1390,7 @@ describe('model.list / model.setDisabled 端点', () => {
 
     /** 广播抛错不能反噬已落盘的批量开关（与单条端点同一约定）。 */
     it('广播抛错时批量开关仍算成功', async () => {
-      const { call, storedValue } = registerEndpoints({ models: MODELS, emitThrows: true })
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS, emitThrows: true })
 
       const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
 
@@ -1398,6 +1398,8 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(storedValue().disabledModels).toEqual({
         buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
       })
+      // 抛错发生在 push 之前，故不会有记录 —— 关键断言是上面的 ok/落盘。
+      expect(emitted).toEqual([])
     })
   })
 })

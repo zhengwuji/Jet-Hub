@@ -1518,8 +1518,20 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 命中死循环时正文恰好为空且无工具调用，用原文会把病态循环全文复制进
     // 正文块并持久化，下次重放又要重新吃一遍（正是本守卫要根除的问题）。
     const reasoningHasDsml = reasoningText.includes('｜DSML｜')
+    // ⚠️ 正文出口也必须清洗 —— 不能只清 reasoning。
+    //
+    // 本适配器的 `visible` 有**两条来源**：正文块，或（正文为空且无工具调用时的）
+    // reasoning 回退。初版只对 reasoning 侧调了 `stripCourseLeakIfEnabled`，
+    // 正文侧直接取 `textBlock.text` 原值 —— 于是「正文块里带行首泄漏」这一路径
+    // 完全没被覆盖，`block-end` 发出去的仍是脏文本（同型缺陷见
+    // `buddy-adapter.ts` / `lobsterai-adapter.ts` / `trae-adapter.ts` 的
+    // text 出口，那几处均已清洗）。
+    //
+    // 清洗放在**取值处**而非 `block-end` 处：`visible` 同时供 text `block-end`
+    // 与下方回退判定使用，在此清洗可保证两条出口一致（不会出现「正文块干净、
+    // 回退脏」或反之）。`reasoningText` 已是清洗后的值，故回退分支无需再清。
     const visible = textBlock !== undefined && textBlock.text !== ''
-      ? textBlock.text
+      ? stripCourseLeakIfEnabled(textBlock.text)
       : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningText : ''
     /**
      * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
