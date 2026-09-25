@@ -51,6 +51,7 @@ import {
   shouldRotateLobsteraiAccount,
   type LobsteraiErrorKind,
 } from './lobsterai-errors.js'
+import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
@@ -440,7 +441,12 @@ function serializeMessages(
   // OpenAI 兼容协议要求 tool_call 与 tool 结果严格配对：缺任一侧后端都会
   // 以 400 拒绝整个请求，而这条坏历史会被每次请求原样重放 ——
   // 表现为「会话突然报废，此后所有消息都无回复」。发出前剔除可让会话自愈。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+  // ⚠️ 先归一化 DSH 0.1.7 的消息形状（见 `message-shape.ts`）：0.1.7 把工具结果
+  // 改为一等 `role:'tool'` 消息，不再有 `tool-result` 块。若不归一化，结果 id
+  // 集合恒为空 → `resolveToolPairing` 把**全部 tool_calls 剔除**，模型看不到
+  // 自己调用过什么，表现为「无工具调用即判对话结束」或「陷入循环思考」。
+  const normalized = normalizeHarnessMessages(messages)
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
 
   // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
   // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
@@ -455,7 +461,7 @@ function serializeMessages(
     pendingToolImages = []
   }
 
-  for (const message of messages) {
+  for (const message of normalized) {
     if (message.role === 'assistant') {
       // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
       // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——

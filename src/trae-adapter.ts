@@ -45,6 +45,7 @@ import {
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
+import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /** 本适配器注册的 provider 路由名。 */
@@ -307,9 +308,14 @@ function serializeTraeMessages(
   imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
+  // ⚠️ 先归一化 DSH 0.1.7 的消息形状（见 `message-shape.ts`）：0.1.7 把工具结果
+  // 改为一等 `role:'tool'` 消息，不再有 `tool-result` 块。若不归一化，下面的
+  // `type === 'tool-result'` 判据恒不命中 → 工具结果被当成普通 user 消息下发、
+  // `tool_call_id` 关联丢失，且 `resolveToolPairing` 会剔除全部 tool_calls。
+  const normalized = normalizeHarnessMessages(messages)
   // 剔除无法配对的工具调用/结果：SOLO 上游同样要求 tool_calls 与 tool 结果
   // 严格配对，孤儿条目会让整条会话被拒（与三个兄弟适配器同款防线）。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
 
   // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
   // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
@@ -324,7 +330,7 @@ function serializeTraeMessages(
     pendingToolImages = []
   }
 
-  for (const message of messages) {
+  for (const message of normalized) {
     if (message.role === 'assistant') {
       // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
       // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——

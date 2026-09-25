@@ -44,6 +44,7 @@ import {
   stripCourseLeakFromHistoryContent,
   stripCourseLeakIfEnabled,
 } from './sse.js'
+import { normalizeHarnessMessages } from './message-shape.js'
 
 /** 将消息内容载荷展平为纯文本字符串。 */
 export function contentToText(content: unknown): string {
@@ -143,13 +144,18 @@ export function collectImages(content: readonly unknown[], refs: Map<string, unk
  * （**含空 Map**）时把 user 消息升级为多模态 parts。空 Map 不能降级为
  * undefined —— 那会让「图片存在但字节读取失败」的 `[image unavailable]`
  * 占位符也被跳过，图片静默消失。
+ *
+ * ⚠️ 入口先做 **DSH 0.1.7 消息形状归一化**（见 `message-shape.ts`）：0.1.7 把工具
+ * 结果改为一等 `role:'tool'` 消息，若不归一化，下面的 `type === 'tool-result'`
+ * 判据恒不命中 → 工具调用被 `resolveToolPairing` 整体剔除。
  */
 export function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
   imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
+  const normalized = normalizeHarnessMessages(messages)
   const wire: Array<Record<string, unknown>> = []
-  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
 
   let pendingToolImages: Array<Record<string, unknown>> = []
   const flushToolImages = (): void => {
@@ -161,7 +167,7 @@ export function serializeMessages(
     pendingToolImages = []
   }
 
-  for (const message of messages) {
+  for (const message of normalized) {
     if (message.role === 'assistant') {
       // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
       // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——

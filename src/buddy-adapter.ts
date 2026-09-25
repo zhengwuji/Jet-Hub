@@ -31,6 +31,7 @@ import {
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
+import { normalizeHarnessMessages } from './message-shape.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /**
@@ -259,9 +260,15 @@ function serializeMessages(
   //
   // 适配器是最后一道防线：发出请求前把无法配对的 tool_calls 与 tool 结果
   // 一并剔除，让会话自愈。宁可丢失一轮工具上下文，也好过整条会话死亡。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+  // ⚠️ 先归一化 DSH 0.1.7 的消息形状（见 `message-shape.ts`）：0.1.7 把工具结果
+  // 改为一等 `role:'tool'` 消息，不再有 `tool-result` 块。若不归一化，下面所有
+  // 按 `type === 'tool-result'` 的判据恒不命中 → 结果 id 集合为空 →
+  // `resolveToolPairing` 把**全部 tool_calls 剔除**，模型看不到自己调用过什么，
+  // 表现为「无工具调用即判对话结束」或「陷入循环思考」。
+  const normalized = normalizeHarnessMessages(messages)
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
 
-  for (const message of messages) {
+  for (const message of normalized) {
     if (message.role === 'assistant') {
       // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
       // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——

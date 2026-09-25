@@ -545,6 +545,90 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
   `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
   v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
+## ⚠️ DSH 0.1.7 把工具结果改为一等 `role:'tool'` 消息（消息形状双兼容）
+
+**真实缺陷**（用户报障）：升级到 DSH **0.1.7** 后，带工具调用的会话出现
+「**没有工具调用就认为对话结束**而提前停止」或「**模型陷入循环思考**」。
+
+### 根因：`tool-result` 包裹块被删除，工具调用被整体剔除
+
+0.1.7 重构了消息模型：
+
+| | ≤0.1.6 | 0.1.7 |
+|---|---|---|
+| 工具结果承载 | `role:'user'` 内嵌 `{type:'tool-result',toolCallId,content,isError}` | **一等 `role:'tool'` 消息**，`toolCallId`/`isError` 在**顶层** |
+| `ContentBlockMap` | 含 `'tool-result'` | **删除 `'tool-result'`**，新增 `'tool-addition'`/`'tool-removal'` |
+| 角色 | system / user / assistant | 新增 **`tool`**、**`developer`** |
+| `StreamChunk`（插件产出） | — | **逐字节未变** |
+
+⚠️ **`StreamChunk` 没变，所以产出侧（`stream()`）完全不用改** —— 坏的只是
+**消费**方向（harness 传给适配器的 `options.messages`）。
+
+各适配器都按 `type === 'tool-result'` 识别工具结果，该判据在 0.1.7 下**恒不命中**：
+
+1. 工具输出被当成普通 user 消息下发，`tool_call_id` 关联丢失；
+2. `resolveToolPairing` 的 `allResultIds` 恒为**空集**
+   → `usable.every(block => allResultIds.has(...))` 恒 false
+   → **assistant 的 `tool_calls` 被整体剔除**。
+
+wire 上于是完全没有工具调用记录，模型看到的是「我说了段话，用户回了段工具输出」。
+
+**实测**（真实 session `session-54cbd95c`，2492 行 v3 日志经 0.1.7 解析器迁移）：
+修复前保留 **0** 条工具调用，修复后 **512** 条，与 0.1.5 形状对照完全一致。
+
+⚠️ **0.1.7 没有任何协议协商机制**：`packages/llm` 里 `LlmAdapter` / `GenerateOptions`
+都没有版本协商字段（搜到的 `protocolVersion` 全属 ACP，与 LLM 适配器无关）。
+所以**不能靠协商规避**，必须让代码同时认两种形状。
+
+### 修法：形状归一化层，不改五个序列化实现
+
+新增 **`src/message-shape.ts`**，把 0.1.7 形状**降级**为既有代码已理解的 0.1.5
+形状，各入口只插一次调用：
+
+- `normalizeHarnessMessages(messages)` —— 一等 `tool` 消息 → 包回
+  `{role:'user', content:[{type:'tool-result',...}]}`；`developer` 消息**丢弃**
+  （它只承载工具增删元数据，不是对话内容）；其余原样透传。
+- `detectMessageShape(messages)` —— 判据用**形状**而非版本号（沿用
+  `settings-compat.ts` 的能力探测先例），且**同时出现两种形态时以 `tool-role` 为准**
+  （升级期会话可能混合；判成 legacy 会让新形态结果被漏掉，等于没修）。
+
+⚠️ **`content` 数组必须整体保留、不压平** —— 既有实现依赖内嵌 `image` 块做图片
+提升（工具结果内嵌图片须挂到其后的独立 user 消息），压平会让图片静默丢失。
+
+⚠️ **`developer` 的剥离与形状探测相互独立**：`detectMessageShape` 只回答「工具
+结果长什么样」，而 `developer` 是 0.1.7 专有角色，**无论有没有工具结果都要剥离**。
+两者必须分别求值，否则「无工具结果的会话」会把 `developer` 当普通 user 消息下发。
+
+⚠️ **无需改动时返回原数组引用**（`===`），保证 0.1.5 路径**逐字节**不受影响。
+
+落点（6 处）：`sse.ts` 的 `resolveToolPairing`（共享防线，须自身独立正确）、
+`llm-adapter.ts` / `openai-compat.ts` / `buddy-adapter.ts` /
+`lobsterai-adapter.ts` / `trae-adapter.ts` 的 `serializeMessages`。
+`qoder-adapter.ts` 复用 `openai-compat.serializeMessages`，自动受益。
+
+⚠️ **`resolveToolPairing` 的 `content` 参数放宽为可选**（归一化层产出的类型允许
+缺 content；函数内部本就按「非数组即视为空」处理）。这是**纯放宽**，不改变行为。
+
+### 回归用例
+
+- `tests/unit/message-shape.spec.ts` —— 探测/归一化/幂等/身份返回/真实字段布局
+  （含 `source.callId` 回退：顶层 `toolCallId` 缺失时不能丢 id）。
+- `tests/unit/message-shape-adapters.spec.ts` —— **核心不变式**：同一份语义数据按
+  两种形状喂入，`serializeMessages` 输出**逐字节等价**。比逐个断言字段更强，
+  且对实现方式中立。
+- `tests/unit/session-replay.spec.ts` —— **真实会话回放**（离线只读，无网络）。
+  自造 fixture 可能在真实数据上失效，故用真实会话锁死。需 `DSH_SESSION_FIXTURE`
+  指向导出文件，未设则**干净 skip**（⚠️ 文件必须**惰性读取** —— `describe.skipIf`
+  仍会执行回调体收集用例，顶层 `readFileSync(undefined)` 会让整份套件变成
+  Failed Suite 而非 skip）。
+- `scripts/export-session-messages.mjs` —— 只读导出真实会话消息。
+  ⚠️ 必须用 `createSessionFormatCatalogWithChildren([])`（**不是**默认 catalog）：
+  V3→V4 迁移要求显式提供子会话事实，无子会话时传**空数组**，否则 `createStage`
+  抛 `SessionFormatUnsupportedMigrationError`。
+
+⚠️ **验证「修复有效」必须做反向验证**：临时让 `normalizeHarnessMessages` 恒返回
+原数组（= 修复前行为），确认用例**会失败**。否则可能写出一组恒真的同义反复。
+
 ## ⚠️ 持久化：DSH 0.1.7 移除 `settings.register()` 之后（Issue IKI7WT）
 
 **真实缺陷**：升级到 DSH **0.1.7-rc.1** 后，Jet Hub 的**账号列表与模型黑名单

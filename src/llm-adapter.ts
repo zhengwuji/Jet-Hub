@@ -9,6 +9,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
 import { isCodeArtsBenefitModel } from './models.js'
+import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
 import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
@@ -90,13 +91,18 @@ function contentToText(content: unknown): string {
  * `reasoning_content` field"）；工具结果（搭载在 harness 用户消息中）
  * 展开为独立的 `{role: 'tool'}` 消息，使模型能看到其调用的返回值。
  * 其余非文本块（图片）被丢弃，与端点接受的格式一致。
+ *
+ * ⚠️ 入口先做 **DSH 0.1.7 消息形状归一化**（见 `message-shape.ts`）：0.1.7 把工具
+ * 结果改为一等 `role:'tool'` 消息，若不归一化，下面的 `type === 'tool-result'`
+ * 判据恒不命中 → 工具调用被 `resolveToolPairing` 整体剔除。
  */
-function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
+export function serializeMessages(messages: readonly { role: string; content: unknown }[]): Array<Record<string, unknown>> {
+  const normalized = normalizeHarnessMessages(messages)
   const wire: Array<Record<string, unknown>> = []
   // 剔除无法配对的工具调用/结果（详见 resolveToolPairing）：孤儿 tool_calls
   // 会让后端对之后每一条消息都返回 400，整个会话永久报废。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
-  for (const message of messages) {
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
+  for (const message of normalized) {
     if (message.role === 'assistant') {
       // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
       // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——

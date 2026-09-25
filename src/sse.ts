@@ -11,6 +11,7 @@
 
 import { EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-llm'
 import type { FinishReason } from '@deepseek-ai/dsh-llm'
+import { normalizeHarnessMessages } from './message-shape.js'
 
 /** SSE 读取阶段：等待首 token 与已收到数据后的 chunk 间等待。 */
 export type SsePhase = 'first-token' | 'chunk'
@@ -241,11 +242,19 @@ export function createBlankReasoningSuppressor(): {
  * @returns 应当保留的 tool_call id 与 tool 结果 id 集合。
  */
 export function resolveToolPairing(
-  messages: readonly { role: string; content: unknown }[],
+  // `content` 可选：归一化层产出的 `HarnessMessageLike` 允许缺 content，
+  // 且该函数内部本就按「非数组即视为空」处理，放宽签名不改变行为。
+  messages: readonly { role: string; content?: unknown }[],
 ): { keepCallIds: Set<string>; keepResultIds: Set<string> } {
+  // ⚠️ 先归一化 DSH 0.1.7 的消息形状：0.1.7 把工具结果改为一等 `role:'tool'`
+  // 消息，不再有 `tool-result` 块。若不归一化，下面的 `allResultIds` 恒为空集，
+  // `usable.every(block => allResultIds.has(...))` 恒 false → **assistant 的
+  // 全部 tool_calls 被剔除**，模型在 wire 上看不到自己调用过什么，表现为
+  // 「无工具调用即判对话结束」或「陷入循环思考」。详见 `message-shape.ts`。
+  const normalized = normalizeHarnessMessages(messages)
   // 收集历史上出现过的所有工具结果 id（harness 把结果搭载在 user 消息里）。
   const allResultIds = new Set<string>()
-  for (const message of messages) {
+  for (const message of normalized) {
     const content = Array.isArray(message.content) ? message.content : []
     for (const block of content) {
       if (typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result') {
@@ -257,7 +266,7 @@ export function resolveToolPairing(
   // 是否配对完整都会被上游 400（见上方表格）。同批其余调用不受影响 ——
   // 结果按 id 匹配，剔掉一个不会破坏另一个的配对。
   const keepCallIds = new Set<string>()
-  for (const message of messages) {
+  for (const message of normalized) {
     if (message.role !== 'assistant') continue
     const content = Array.isArray(message.content) ? message.content : []
     const calls = content.filter((block): block is { type: string; id: unknown; name: unknown } =>
