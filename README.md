@@ -1266,6 +1266,24 @@ Muse Spark 1.3 Contributor · 免费
 ⚠️ 免费资格是**服务端随时可撤销**的营销状态，故插件每次都从远端重新取，
 不在代码里硬编码任何免费模型名。
 
+### 思考强度
+
+模型选择器旁提供 `None / Low / Medium / High / Extra` 五档，与 Cline IDE 一致，
+默认 **High**。
+
+- `None` = 不思考（实测不传 `reasoning_effort` 时模型本就不思考）
+- `Extra` 对应上游的 `max` 档 —— 内嵌目录里的 `xhigh` 实测与 `high` 无可辨差异，
+  故跳过它，把真正的最高档留给 `Extra`
+
+⚠️ 档位数据来自 Cline 客户端内嵌的模型目录，**远端接口不下发**（`/api/v1/models`
+只有 `{id, object, created, owned_by}`，`recommended-models` 只有
+`{id, name, description, tags}`）。对不在该目录里的模型，五档是统一给的 ——
+上游不认识的档位会被**静默忽略**（不会导致请求失败，最坏是「开关无效」）。
+
+⚠️ 声明默认档位 High 意味着**默认会思考**：未手动选择时插件会带上
+`reasoning_effort: 'high'`，思考 token 计入 `completion_tokens`。想要完全不思考，
+在选择器里选 `None` 即可。
+
 ### 积分余额
 
 Jet Hub 的 Cline 账号卡片会显示账户余额（`GET /api/v1/users/{accountId}/balance`）。

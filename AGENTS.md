@@ -900,6 +900,49 @@ re-authenticate your Cline account."* —— 与真实原因**毫不相干**，�
 只认前者会让 Cline 的思考内容被静默丢弃（表现为「模型不思考」，且 reasoning
 档位切换看似无效）。e2e 探针实测已确认思考内容真的产出。
 
+### ⚠️ 坑 4：思考档位**远端不下发**，只能来自客户端内嵌目录
+
+IDE 的模型选择器旁有思考强度菜单（`None / Low / Medium / High / Extra`），
+但**远端两个模型端点都不下发档位**：`/api/v1/models` 只有
+`{id, object, created, owned_by}`，`recommended-models` 只有
+`{id, name, description, tags}`。sidecar 内 `/api/v1/` 的 21 个路径中也没有
+任何模型详情端点（`/api/v1/users/me/remote-config` 返回 `{"data":null}`）。
+
+档位只存在于 `code-sidecar.exe` 内嵌的 `BUILTIN_MODEL_CATALOG` 的
+`reasoningOptions`，而那张表覆盖不了远端 460 个 id。故 `CLINE_REASONING_EFFORTS`
+对**所有**模型统一给 5 档。
+
+⚠️ **`id`（wire 值）与 `name`（展示名）不是同一个概念**。最高档的对应关系
+（`Extra` → `max`）是**行为实测**出来的，不是反推的：
+
+| effort | reasoning 字符数（`stealth/space-bunny-alpha`，同题 3 次采样均值） |
+|---|---|
+| 不传 / `none` | 0（**不传 = 不思考**） |
+| `low` | 67 |
+| `medium` | 379 |
+| `high` | 294 |
+| `xhigh` | **259（与 high 无可辨差异 → 伪档位）** |
+| `max` | **1192（high 的 4 倍 → 最高档）** |
+
+若只按名字对齐（`xhigh` → 显示成 XHigh），会给用户一个**实测无差异的档位**，
+而真正的最高档 `max` 反被跳过。旁证：sidecar 权重表
+`{ max:1, xhigh:0.95, high:0.8, ... }` 同样确认 `max` 在 `xhigh` 之上。
+
+⚠️ **上游对不认识的档位静默忽略而非报错**（实测 `reasoning_effort: 'banana'`
+返回 HTTP 200、思考量为 0）—— 故 `stream()` 里**绝不能加白名单校验**：
+校验既无必要，又会把上游未来新增的档位变成静默丢弃。
+
+⚠️ **声明 `defaultEffort` 会改变默认行为**：实测不传档位时模型完全不思考，
+而 DSH 在用户未选择时自动采用 `model.reasoning.defaultEffort`。本插件默认
+`high`（对齐 IDE 截图的选中态），代价是思考 token 计入 `completion_tokens`。
+
+⚠️ 统一给档位的**已知局限**：对不在内嵌目录里的模型，档位是猜的 ——
+最坏情况是「开关无效」（上游静默忽略），不会是「请求失败」。
+
+排查脚本：`scripts/probe-cline-reasoning.mjs`（纯本地，只读）、
+`scripts/probe-cline-effort-compare.mjs`（**消耗免费额度**，多次采样对比档位）。
+设计文档：`docs/superpowers/specs/2026-09-25-cline-reasoning-effort-design.md`。
+
 ### 登录：WorkOS 设备码（与 Qoder 同为轮询式，但判据形态不同）
 
 ```

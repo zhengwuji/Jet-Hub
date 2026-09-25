@@ -183,6 +183,33 @@ describe('ClineAdapter resolveModel', () => {
     const unknown = await adapter.resolveModel('cline', 'unknown/model-x')
     expect(unknown.inputModalities).toEqual(['text'])
   })
+
+  it('声明 5 档思考强度（顺序与展示名对齐 Cline IDE）', async () => {
+    const adapter = makeAdapter()
+    const resolved = await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    // ⚠️ id 是发给上游的 wire 值，name 是 IDE 上的展示名，两者**刻意不同**：
+    // 最高档 wire 是 `max`，展示是 `Extra`（xhigh 实测与 high 无差异，故跳过）。
+    expect(resolved.reasoning?.efforts).toEqual([
+      { id: 'none', name: 'None' },
+      { id: 'low', name: 'Low' },
+      { id: 'medium', name: 'Medium' },
+      { id: 'high', name: 'High' },
+      { id: 'max', name: 'Extra' },
+    ])
+  })
+
+  it('默认档位是 high（对齐 IDE 截图的选中态）', async () => {
+    const adapter = makeAdapter()
+    const resolved = await adapter.resolveModel('cline', 'cline-free/deepseek-v4.1-flash')
+    expect(resolved.reasoning?.defaultEffort).toBe('high')
+  })
+
+  it('未知模型同样有 5 档（覆盖范围决策：统一给，不按目录细分）', async () => {
+    const adapter = makeAdapter()
+    const resolved = await adapter.resolveModel('cline', 'unknown/model-x')
+    expect(resolved.reasoning?.efforts).toHaveLength(5)
+    expect(resolved.reasoning?.defaultEffort).toBe('high')
+  })
 })
 
 describe('ClineAdapter 请求构造', () => {
@@ -271,6 +298,20 @@ describe('ClineAdapter 请求构造', () => {
     })
     await collect(adapter, { reasoningEffort: 'high' })
     expect((JSON.parse(bodies[0]!) as { reasoning_effort: string }).reasoning_effort).toBe('high')
+  })
+
+  it('不在请求构造处过滤档位（上游新增档位不能被静默丢弃）', async () => {
+    const bodies: string[] = []
+    const adapter = makeAdapter({
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        bodies.push(String(init.body))
+        return sseResponse([JSON.stringify({ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] })])
+      }) as unknown as typeof fetch,
+    })
+    // `xhigh` 是内嵌目录里有、但本插件档位表未收录的 wire 值（实测与 high 无差异）。
+    // 即便如此也必须原样发出：白名单校验会把上游未来新增的档位变成静默丢弃。
+    await collect(adapter, { reasoningEffort: 'xhigh' })
+    expect((JSON.parse(bodies[0]!) as { reasoning_effort: string }).reasoning_effort).toBe('xhigh')
   })
 
   it('无凭据时报 MISSING_CREDENTIAL', async () => {

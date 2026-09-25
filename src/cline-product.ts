@@ -185,6 +185,61 @@ const CLINE_FALLBACK_MODELS: readonly ClineFallbackModel[] = [
   },
 ]
 
+/**
+ * Cline 全 provider 统一的思考档位（**顺序即 UI 展示顺序**）。
+ *
+ * ## 为什么所有模型共用一张表
+ *
+ * 远端**不下发**档位：`/api/v1/models` 只有 `{id, object, created, owned_by}`，
+ * `recommended-models` 只有 `{id, name, description, tags}`；sidecar 里
+ * `/api/v1/` 的 21 个路径中也没有任何模型详情端点。档位只存在于客户端
+ * 内嵌 `BUILTIN_MODEL_CATALOG`，而那张表覆盖不了远端 460 个 id。
+ *
+ * 故按产品决策对**所有**模型统一给这 5 档。已知局限：对不在内嵌目录里的
+ * 模型，档位是猜的 —— 但上游对不认识的档位**静默忽略而不报错**
+ * （实测 `reasoning_effort: 'banana'` 返回 HTTP 200 且思考量为 0），
+ * 所以最坏情况是「开关无效」，不会是「请求失败」。
+ *
+ * ## `id` 与 `name` 刻意不同（wire 值 ≠ 展示名）
+ *
+ * Cline IDE 的档位菜单是 None/Low/Medium/High/**Extra**（用户截图实测），
+ * 而上游认的 wire 值是 `none/low/medium/high/max`。最高档的对应关系是
+ * **行为实测**出来的，不是从二进制反推的：
+ *
+ * | effort | reasoning 字符数（`stealth/space-bunny-alpha`，同题 3 次采样均值） |
+ * |---|---|
+ * | 不传 / `none` | 0（**不传 = 不思考**） |
+ * | `low` | 67 |
+ * | `medium` | 379 |
+ * | `high` | 294 |
+ * | `xhigh` | **259（与 high 无可辨差异 → 伪档位，跳过）** |
+ * | `max` | **1192（high 的 4 倍 → 最高档）** |
+ *
+ * 旁证：sidecar 权重表 `{ max:1, xhigh:0.95, high:0.8, medium:0.5, low:0.2, ... }`
+ * 同样确认 `max` 在 `xhigh` 之上。
+ *
+ * ⚠️ **把 `id` 与 `name` 当成同一个概念会让用户找不到档位** —— 与本项目
+ * LobsterAI 那条「wire 值 ≠ 展示名」的教训同源。
+ */
+export const CLINE_REASONING_EFFORTS: readonly { id: string; name: string }[] = [
+  { id: 'none', name: 'None' },
+  { id: 'low', name: 'Low' },
+  { id: 'medium', name: 'Medium' },
+  { id: 'high', name: 'High' },
+  { id: 'max', name: 'Extra' },
+]
+
+/**
+ * 默认思考档位。
+ *
+ * ⚠️ **声明它会改变默认行为**：实测「不传 `reasoning_effort` → 模型完全不思考」，
+ * 而 `dsh-client-ui-model-selection` 在用户未手动选择时会自动采用
+ * `model.reasoning.defaultEffort`（`state.current?.reasoningEffort ?? defaultEffort`）。
+ * 即声明后 Cline 从「默认不思考」变成「默认 High 思考」，与 IDE 一致，
+ * 代价是思考 token 计入 `completion_tokens`。这是**用户明确要求**的变更。
+ */
+export const CLINE_DEFAULT_REASONING_EFFORT = 'high'
+
 /** Cline provider 配置（生产环境）。 */
 export const CLINE: ClineProduct = {
   id: 'cline',

@@ -29,7 +29,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
@@ -39,7 +39,13 @@ import {
   loadClineModels,
   type ClineModel,
 } from './cline-models.js'
-import { CLINE, CLINE_CHAT_PATH, type ClineProduct } from './cline-product.js'
+import {
+  CLINE,
+  CLINE_CHAT_PATH,
+  CLINE_DEFAULT_REASONING_EFFORT,
+  CLINE_REASONING_EFFORTS,
+  type ClineProduct,
+} from './cline-product.js'
 import {
   collectImages,
   consumeOpenAiSse,
@@ -289,6 +295,16 @@ export class ClineAdapter extends LlmAdapter {
     //（这正是 buddy 那条「回答在 32000 token 处被截断」的根因）。
     const maxTokens = clampClineMaxTokens(entry?.maxTokens)
     if (maxTokens !== undefined) resolved.defaultMaxTokens = maxTokens
+    // 思考档位：对**所有**模型统一声明（远端不下发档位，见产品配置注释）。
+    // 这是 composer 里「思考强度」选择器的唯一入口 —— 不声明则 UI 显示
+    // 「当前模型未提供推理等级」。
+    resolved.reasoning = {
+      efforts: CLINE_REASONING_EFFORTS.map((effort) => ({
+        id: ReasoningEffortId(effort.id),
+        name: effort.name,
+      })),
+      defaultEffort: ReasoningEffortId(CLINE_DEFAULT_REASONING_EFFORT),
+    }
     return resolved
   }
 
@@ -375,10 +391,11 @@ export class ClineAdapter extends LlmAdapter {
     if (options.stop !== undefined && options.stop.length > 0) bodyObj.stop = options.stop
     // 推理强度：DSH 注入的 `reasoningEffort` 原样透传给上游的 `reasoning_effort`。
     //
-    // Cline 的内嵌目录用 `reasoningOptions[].values` 描述档位
-    // （如 deepseek-v4.1-flash 的 `['low','high','max']`），而本插件未把
-    // 档位解析进 `ClineModel`（那是另一套 UI 契约），故这里不做白名单校验 ——
-    // 校验只会把「远端新增档位」变成静默丢弃。上游对非法档位会明确报错。
+    // ⚠️ **这里绝不能加白名单校验**。档位表（`CLINE_REASONING_EFFORTS`）是客户端
+    // 内嵌目录的快照，会随 Cline 版本变化；校验等于把上游新增的档位静默丢弃。
+    // 且上游对**完全不认识**的档位也只是静默忽略 —— 实测
+    // `reasoning_effort: 'banana'` 返回 HTTP 200、思考量为 0，**不报错**，
+    // 故白名单既无必要也无收益。
     if (options.reasoningEffort !== undefined) {
       bodyObj.reasoning_effort = options.reasoningEffort
     }
