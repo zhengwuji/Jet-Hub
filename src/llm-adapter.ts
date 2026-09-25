@@ -1123,6 +1123,27 @@ export class CodeArtsAdapter extends LlmAdapter {
     const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
     let loopDetected = false
     /**
+     * **正文**死循环检测（**独立实例**，见 `createReasoningLoopDetector`）。
+     *
+     * 真实缺陷（用户报障，2026-09-25）：唯一活动 session 出现**正文**循环，
+     * 而旧实现只在 reasoning 分支调 `observe` → 正文循环完全看不见。
+     *
+     * ⚠️ 两个实例不可合并：判据看尾部 3000 字符窗口的行去重率，两条通道
+     * 混进同一窗口会互相稀释，使守卫双双失效。
+     *
+     * ⚠️ 语义差异：实测正文循环的工具调用在循环正文**之后**到达且有效，
+     * 故正文守卫**只截断文本**，绝不 `reader.cancel()`、绝不改 finish reason。
+     *
+     * ⚠️ **本适配器刻意不做 `</think:hex>` 归位**（与其余四个适配器不同）：
+     * 实测那 28 处标签**全部出自 `workbuddy`**（`hy4-preview-f` 25 处、
+     * `workbuddy/deepseek-v4.1-flash` 3 处），codearts 一条都没有。
+     * 更关键的是，本适配器的正文出口带 **`visible` 回退**（正文为空且无工具
+     * 调用时用推理文本回填可见区）—— 若在此处把正文归位成空串，回退会立刻
+     * 把整段思考**复制回正文**，等于归位失效并放大问题。故此处只加守卫。
+     */
+    const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let proseLoopDetected = false
+    /**
      * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
      * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
      *
@@ -1165,8 +1186,15 @@ export class CodeArtsAdapter extends LlmAdapter {
           blocks.push(block)
           yield { type: 'block-start', index: block.index, blockType: 'text' }
         }
-        block.text += text
-        yield { type: 'text-delta', index: block.index, text }
+        // 正文死循环守卫（见 `proseLoopGuard` 注释）。命中后只停止累积与发射，
+        // 绝不 `reader.cancel()`、绝不改 finish reason。
+        if (proseLoopGuard !== undefined) {
+          if (proseLoopGuard.observe(text)) proseLoopDetected = true
+        }
+        if (!proseLoopDetected) {
+          block.text += text
+          yield { type: 'text-delta', index: block.index, text }
+        }
       }
       if (reasoning.length > 0) {
         // 死循环守卫：命中后不再累积、不再发射。
@@ -1530,9 +1558,19 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 清洗放在**取值处**而非 `block-end` 处：`visible` 同时供 text `block-end`
     // 与下方回退判定使用，在此清洗可保证两条出口一致（不会出现「正文块干净、
     // 回退脏」或反之）。`reasoningText` 已是清洗后的值，故回退分支无需再清。
-    const visible = textBlock !== undefined && textBlock.text !== ''
-      ? stripCourseLeakIfEnabled(textBlock.text)
-      : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningText : ''
+    // 正文死循环截断：只保留循环前的干净前缀。
+    // ⚠️ **不改 finish reason**：工具调用仍要被执行。
+    //
+    // ⚠️ 截断必须在 `visible` 回退**之前**应用：否则「正文命中循环 → 截断后为空
+    // → 回退又把推理文本复制进正文」会把病态循环原样搬到可见区。
+    const truncatedText = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
+      ? (textBlock?.text ?? '').slice(0, proseLoopGuard.cutAt)
+      : undefined
+    const visible = truncatedText !== undefined
+      ? stripCourseLeakIfEnabled(truncatedText)
+      : textBlock !== undefined && textBlock.text !== ''
+        ? stripCourseLeakIfEnabled(textBlock.text)
+        : reasoningBlock !== undefined && toolOrder.length === 0 && !reasoningHasDsml ? reasoningText : ''
     /**
      * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
      *

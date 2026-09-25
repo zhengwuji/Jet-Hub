@@ -46,6 +46,7 @@ import {
   readWithIdleTimeout,
   resolveEmptyResponseReason,
   resolveToolPairing,
+  splitThinkTaggedContent,
   stripCourseLeakFromHistoryContent,
   stripCourseLeakIfEnabled,
 } from './sse.js'
@@ -361,6 +362,45 @@ export async function* consumeOpenAiSse(
   const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
   let loopDetected = false
   /**
+   * **正文**死循环检测（**独立实例**，见 `createReasoningLoopDetector`）。
+   *
+   * ## 真实缺陷（用户报障，2026-09-25）
+   *
+   * 唯一活动 session（`lilishop-go` / `workbuddy/hy4-preview-f`）出现**正文**循环。
+   * 旧实现只在 reasoning 分支调 `observe`，正文分支从不调用 → 正文循环**完全
+   * 看不见**。用真实检测器回放该会话正文，三段全部命中（去重率 0.0412 /
+   * 0.0938 / 0.1745，阈值 < 0.35）—— **不是循环不够长，是通道没接**。
+   *
+   * ## ⚠️ 为什么必须与 `loopGuard` **分成两个实例**
+   *
+   * 判据看的是**尾部 3000 字符窗口**的行去重率。两条通道的文本若混进同一
+   * 窗口，「持续体量」与「去重率」都会被另一条通道的内容稀释 —— 于是
+   * 两条通道各自都不再达标，守卫**双双失效**。反之，共用一个 `cutAt` 也会让
+   * 一条通道的截断点错切另一条通道。
+   *
+   * ## ⚠️ 与思考守卫的**语义差异**（最关键）
+   *
+   * 思考死循环时模型**不产出工具调用**，故命中即可 `reader.cancel()` 止损。
+   * 但正文循环**不一样**：实测三段的 wire 帧顺序恒为
+   * `text-chunks(循环) → tool-call-chunks → block-end → finish: tool-calls`
+   * —— **工具调用在循环正文之后才到达**，且调用有效、任务能继续。
+   * 若在正文命中时 `cancel()`，会把这些调用**整块丢掉**，把「能继续的任务」
+   * 变成「什么都不做就结束」，比循环本身更糟。
+   *
+   * 故正文守卫**只截断文本、不中止上游、不丢工具调用**，也**不**改写
+   * `finish` 的 reason（调用仍要被执行）。
+   */
+  const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+  let proseLoopDetected = false
+  /**
+   * `</think:hex>` 泄漏的**待定正文**（见 `splitThinkTaggedContent`）。
+   *
+   * 实测 `hy4-preview-f` 把思考写进 `content` 通道，只在思考段末尾留一个闭标签。
+   * 由于标签**可能跨帧到达**（`</think:612` + `4c78e>`），不能逐帧判定 ——
+   * 必须缓冲到收尾时一次性切分。故这里只累积，`block-end` 时再归位。
+   */
+  let proseHasThinkTag = false
+  /**
    * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
    * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
    *
@@ -564,8 +604,27 @@ export async function* consumeOpenAiSse(
             blocks.push(block)
             yield { type: 'block-start', index: block.index, blockType: 'text' }
           }
-          block.text += textDelta
-          yield { type: 'text-delta', index: block.index, text: textDelta }
+          // 正文死循环守卫（见 `proseLoopGuard` 注释）。
+          //
+          // ⚠️ 与思考守卫的关键差异：命中后**只停止累积与发射**，**绝不**
+          // `reader.cancel()`、**绝不**改 finish reason —— 实测正文循环的
+          // 工具调用在循环正文**之后**到达且有效，中止上游会把它们整块丢掉。
+          //
+          // ⚠️ 本块仍要发 `block-end`（内容为截断后的前缀），否则
+          // `BlockAssembler` 会拿全部已流出的 delta 组装出完整循环正文 ——
+          // 截断必须靠收尾的权威覆盖落地（见 `block-end` 段）。
+          if (proseLoopGuard !== undefined) {
+            if (proseLoopGuard.observe(textDelta)) proseLoopDetected = true
+          }
+          // `</think:hex>` 泄漏探测（见 `splitThinkTaggedContent`）：标签可能
+          // **跨帧**到达，故只做「是否出现过」的廉价判定，真正切分放在收尾。
+          // 判据用 `think` 子串而非完整正则：跨帧时正则匹配不到，
+          // 但完整子串判定能可靠地把「本步需切分」标记出来。
+          if (!proseHasThinkTag && textDelta.includes('think:')) proseHasThinkTag = true
+          if (!proseLoopDetected) {
+            block.text += textDelta
+            yield { type: 'text-delta', index: block.index, text: textDelta }
+          }
         }
         // 同样必须用 `typeof === 'string'`：reasoning_content 也会显式返回 null。
         //
@@ -752,12 +811,52 @@ export async function* consumeOpenAiSse(
     }
   }
   if (textBlock !== undefined) {
+    // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+    //
+    // ⚠️ 必须在**收尾**做，不能逐帧做：标签会跨帧到达
+    // （`</think:61` + `24c78e>`），逐帧匹配不到完整标签。
+    //
+    // 归位语义：标签**前**的内心独白 → 既有 reasoning 块（或新建一个），
+    // 标签**后**的真正文 → 本 text 块。无标签时**逐字节不变**。
+    let textOut = textBlock.text
+    if (proseHasThinkTag) {
+      const split = splitThinkTaggedContent(textBlock.text)
+      if (split !== undefined) {
+        // 思考段并入既有 reasoning 块（实测有 3 步两者同时存在），
+        // 保证不丢内容；顺序与到达顺序一致。
+        //
+        // ⚠️ **必须同时喂 `suppressor`**：收尾段以 `suppressor.text()` 为思考块
+        // 的**权威**（见下方 reasoning 段注释），只改 `blocks` 里的条目不会
+        // 影响落块内容 —— 这是本次实现踩过的坑（测试直接暴露）。
+        if (split.reasoning !== '') {
+          const existing = blocks.find(candidate => candidate.kind === 'reasoning')
+          if (existing === undefined) {
+            blocks.push({ index: nextIndex++, kind: 'reasoning', text: split.reasoning })
+          } else {
+            existing.text += split.reasoning
+          }
+          suppressor.feed(split.reasoning)
+        }
+        textOut = split.text
+      }
+    }
+    // 正文死循环截断：只保留循环前的干净前缀（与思考守卫同一机制 ——
+    // `block-end` 的 block 是**权威覆盖**，见 scripts/verify-blockend-override.ts）。
+    //
+    // ⚠️ 与思考守卫不同，这里**不改 finish reason**：实测正文循环的
+    // 工具调用在循环之后到达且有效，调用必须照常执行。
+    const truncatedText = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
+      ? textOut.slice(0, proseLoopGuard.cutAt)
+      : textOut
     // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
-    blockCount += 1
-    yield {
-      type: 'block-end',
-      index: textBlock.index,
-      block: { type: 'text', text: stripCourseLeakIfEnabled(textBlock.text) },
+    const cleanedText = stripCourseLeakIfEnabled(truncatedText)
+    // ⚠️ 归位后正文可能为空串（实测 seq=34768 形态：标签前 8845 字符、
+    // 标签后仅 13 字符）。此时**不发射空 text 块** —— 空块会污染会话，
+    // 且 DSH 的 `EMPTY_RESPONSE` 契约禁止产出空内容块。
+    // 但**思考段已归位**，故本响应仍有内容产出，不会被误判为零块。
+    if (cleanedText !== '') {
+      blockCount += 1
+      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleanedText } }
     }
   }
   const reasoningBlock = blocks.find(block => block.kind === 'reasoning')

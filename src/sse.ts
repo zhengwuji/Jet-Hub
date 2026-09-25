@@ -535,6 +535,120 @@ export function isReasoningLoopGuardEnabled(): boolean {
 }
 
 /**
+ * `</think:hex>` 闭标签的匹配式（**区分大小写、hex 至少 1 位**）。
+ *
+ * 刻意不做大小写兼容：实测 28 处标签**恒为小写**，放宽只会扩大误伤面
+ * （`</THINK:…>` 从未出现过）。
+ */
+const THINK_CLOSE_TAG_RE = /<\/think:([0-9a-f]+)>/g
+
+/** {@link splitThinkTaggedContent} 的结果。 */
+export interface ThinkTaggedSplit {
+  /** 闭标签**之前**的文本（思考），已剔除其中出现的全部标签。 */
+  reasoning: string
+  /** 闭标签**之后**的文本（真正文）。 */
+  text: string
+  /** 真正文在**原始字符串**中的起点偏移（即最后一个闭标签的结束位置）。 */
+  textStart: number
+}
+
+/**
+ * 按 `</think:hex>` **闭标签**把正文拆成「思考 + 真正文」。
+ *
+ * ## 真实缺陷（用户报障，2026-09-25）
+ *
+ * `workbuddy/hy4-preview-f` 把**思考**写进 `content`（正文）通道，只在思考段
+ * 末尾留一个 `</think:6124c78e>` 闭标签。实测该会话 93 步里只有 9 步的
+ * reasoning 通道非空 —— 思考总量 9563 字符，而正文 64043 字符。
+ *
+ * 两个后果：
+ *  1. 思考落在正文块里 → 思考死循环守卫（只喂 reasoning 增量）**完全看不见**
+ *     → 该模型正文出现真循环（去重率 0.0412），实测三段
+ *     （seq 34752 / 34768 / 34823，最长 34406 字符）；
+ *  2. 用户界面上看到「模型把内心独白当正文输出」。
+ *
+ * ## 实测形态（155 会话全量普查）
+ *
+ * | 项 | 值 |
+ * |---|---|
+ * | 含标签的步数 | 28（仅 2 个模型：`hy4-preview-f` 25、`workbuddy/deepseek-v4.1-flash` 3）|
+ * | **开标签** | **0** |
+ * | 闭标签 | 28（每步恰好 1 个）|
+ * | hex | 恒为 `6124c78e`（会话级 id）|
+ * | 标签前 | 内心独白（`让me check.` 重复），13~34364 字符 |
+ * | 标签后 | **真正文**，13~56 字符 |
+ *
+ * ## 三个刻意的设计取舍
+ *
+ * 1. ⚠️ **以最后一个闭标签为界**，且**剔除思考段里的全部标签**：实测每步只有
+ *    一个标签，但多标签时「以最后一个为界」才能保证正文完整 —— 若以第一个
+ *    为界，第二个标签会留在正文里。
+ * 2. ⚠️ **只认闭标签、不猜开标签**：实测开标签**恒缺失**。仅见开标签时无法
+ *    确定「思考到哪结束」，**不切分**（保持原样）比猜错安全。
+ * 3. ⚠️ **无标签时返回 `undefined`**（而非空切分结果）：调用方据此走原路径，
+ *    保证 99.6% 的普通响应**逐字节不受影响**。
+ *
+ * @returns 命中时返回切分结果；无闭标签时返回 `undefined`。
+ */
+export function splitThinkTaggedContent(raw: string): ThinkTaggedSplit | undefined {
+  if (raw.length === 0) return undefined
+  // ⚠️ 正则**在函数内新建**：带 `g` 的正则对象有 `lastIndex` 状态，复用一个
+  // 模块级实例会让相邻两次调用互相干扰（第二次从上次的位置开始搜）。
+  const re = new RegExp(THINK_CLOSE_TAG_RE.source, 'g')
+  let last: RegExpExecArray | undefined
+  for (let m = re.exec(raw); m !== null; m = re.exec(raw)) last = m
+  if (last === undefined) return undefined
+  // ⚠️ **引用判据（不可省）**：标签可能只是被模型**讨论/复述**，而非泄漏分界。
+  // 实测 28 处 text 块标签里有 **3 处是反引号包裹的行内引用** —— 包括排查
+  // 本缺陷时会话里复述该标签字面量的正常正文。若只看「有没有标签」，会把
+  // 这类正文的前半段误当思考移走。
+  //
+  // 实测该判据分离度 **3/3 与 25/25 全部正确**：反引号包裹 ⇔ 引用。
+  if (isQuotedThinkTag(raw, last.index)) return undefined
+  const boundary = last.index
+  const textStart = boundary + last[0].length
+  // 思考段里可能还残留更早的标签，一并剔除（否则会把标签当思考内容展示）。
+  const reasoning = raw.slice(0, boundary).replace(new RegExp(THINK_CLOSE_TAG_RE.source, 'g'), '')
+  return { reasoning, text: raw.slice(textStart), textStart }
+}
+
+/**
+ * 判断 `index` 处的标签是否处于**引用语境**（反引号 / 代码块），而非真泄漏。
+ *
+ * ## 为什么必须有这条判据（实测依据）
+ *
+ * 普查 155 会话的全部 `text` 块标签（28 处），发现两类形态：
+ *
+ * | 形态 | 处数 | 标签前一非空字符 | 含义 |
+ * |---|---|---|---|
+ * | **行内引用** | 3 | 反引号 `` ` `` | 模型在讨论/复述该标签 |
+ * | **真泄漏** | 25 | `.` / `。`（句子结尾）| 思考与正文的分界 |
+ *
+ * 判据「标签是否被反引号包裹」的分离度是 **3/3 与 25/25**，零交叉。
+ *
+ * ⚠️ 3 处引用里包含**排查本缺陷时我自己输出的正文**（复述 `</think:6124c78e>`
+ * 这个字面量）—— 这正是「只看有没有标签会误伤」的直接证据。
+ *
+ * 两种语境都认：
+ * - **行内代码**：紧邻标签的字符是反引号（`` `</think:hex>` ``）；
+ * - **围栏代码块**：标签之前存在**未闭合**的 ``` 围栏（奇偶计数）。
+ *
+ * 只做廉价判定，不做完整 Markdown 解析 —— 判据只需覆盖实测形态。
+ */
+function isQuotedThinkTag(raw: string, index: number): boolean {
+  // ① 行内代码：标签紧邻的字符是反引号。
+  const before = raw.slice(0, index).trimEnd()
+  if (before.endsWith('`')) return true
+  const after = raw.slice(index).trimStart()
+  // 标签自身长度 + 可能的 hex；这里只需看标签**之后**是否紧跟反引号。
+  const tagEnd = raw.indexOf('>', index)
+  if (tagEnd !== -1 && raw.slice(tagEnd + 1).trimStart().startsWith('`')) return true
+  // ② 围栏代码块：标签之前有**奇数个** ``` 围栏（即处于未闭合的代码块内）。
+  const fences = raw.slice(0, index).match(/```/g)
+  return fences !== null && fences.length % 2 === 1
+}
+
+/**
  * ASCII 字母（仅用于「`course` 后接字母则不删」的保护面判定）。
  *
  * ⚠️ 刻意用**单字符**正则而非 `/^[A-Za-z]/`：`test()` 对带 `^` 的正则每次调用

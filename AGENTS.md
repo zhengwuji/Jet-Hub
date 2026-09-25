@@ -1394,7 +1394,8 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 3. **`loopDetected` 的 finish 优先级高于 `tool_calls`** —— 循环中生成的工具
    调用参数不可信；且若无任何可用调用，落到 `stop` 会让任务**静默中断**
    （与「无报错中断」同族）。
-4. **判据只喂 `reasoning`，正文绝不参与** —— 正文里的重复（代码块、列表）是正常输出。
+4. **思考判据只喂 `reasoning`** —— 正文里的重复（代码块、列表）在思考通道是正常输出。
+   ⚠️ 但**正文有自己的独立守卫**，见下节（2026-09-25 补充）。
 
 开关 `DSH_REASONING_LOOP_GUARD` —— **默认开启**，仅显式假值关闭（与
 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` 同为「默认开」语义，用独立的
@@ -1404,6 +1405,85 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 回归用例：`tests/unit/reasoning-loop.spec.ts`（判据）、
 `tests/unit/reasoning-loop-adapter.spec.ts`（各适配器中断行为）；
 fixture 为**真实会话文本**（`tests/fixtures/reasoning-*.txt`）。
+
+#### ⚠️ 正文（text 通道）死循环：必须**独立实例**且**绝不 `cancel()`**
+
+**真实缺陷**（用户报障，2026-09-25）：唯一活动 session（`lilishop-go` /
+`workbuddy/hy4-preview-f`）出现**正文**循环，用户问「是只能处理思考不能处理
+正文吗？还是这个循环还不够长？」
+
+**答案：两者都不是 —— 是通道没接。** 旧实现六个落点**全部只喂 reasoning
+增量**，正文分支从不调 `observe`。用**真实检测器**回放该会话正文，三段
+**全部命中**（远超阈值，不是「不够长」）：
+
+| seq | 正文长度 | 非空行 | 去重行 | 去重率 | 检测器 |
+|---|---|---|---|---|---|
+| 34752 | 4,641 | 486 | 20 | 0.0412 | HIT，cutAt=752 |
+| 34768 | 8,875 | 416 | 39 | 0.0938 | HIT，cutAt=880 |
+| 34823 | 34,406 | 2,711 | 473 | 0.1745 | HIT，cutAt=3256 |
+| 35069 | 138,852 | — | — | — | HIT，撞满 `maxTokens: 64000` |
+
+判据（去重率 < 0.35 且持续 ≥ 2000 字符）与思考侧**完全相同**，直接复用
+`createReasoningLoopDetector`。
+
+⚠️ **必须与思考守卫分成两个实例**：判据看**尾部 3000 字符窗口**的行去重率，
+两条通道混进同一窗口会互相稀释，使守卫**双双失效**；共用一个 `cutAt` 也会
+让一条通道的截断点错切另一条。
+
+⚠️ **与思考守卫的语义差异（最关键，别照抄）**：思考死循环时模型**不产出工具
+调用**，故命中即可 `reader.cancel()` 止损。但正文循环**不一样** —— 实测三段的
+wire 帧顺序恒为
+
+```
+block-start(text) → text-chunks(循环正文) → block-start(tool-call)
+  → tool-call-chunks → usage → block-end(tool-call) → block-end(text) → finish: tool-calls
+```
+
+**工具调用在循环正文之后才到达**，且调用有效、任务能继续。故正文守卫：
+**只截断文本，绝不 `reader.cancel()`、绝不改 `finish` reason**。若照搬
+`cancel()`，会把这些有效调用**整块丢掉**，把「能继续的任务」变成「什么都不做
+就结束」—— 比循环本身更糟。
+
+⚠️ **误报余量比思考侧更宽**（全语料 155 会话 / **32,725 步**实测）：
+
+| 量 | 正常正文 | 命中样本 | 余量 |
+|---|---|---|---|
+| 窗口最低去重率 | **0.7667** | 最高 0.0387 | **19.8 倍** |
+| 最长连续 looping 体量 | **0** | 3,937 ~ 8,064 | — |
+
+正文命中 **4 次，全部是真循环**；其余 32,721 步零误报。
+排查脚本 `scripts/measure-prose-loop-margin.mjs`、
+`scripts/analyze-prose-loop-false-positive.mjs`；
+回归用例 `tests/unit/prose-loop-guard.spec.ts`。
+
+#### ⚠️ `</think:hex>` 闭标签：思考被上游塞进 `content` 通道
+
+**同一缺陷的另一半。** `hy4-preview-f` 把**思考**写进 `content`（正文），只在
+思考段末尾留一个 `</think:6124c78e>` **闭标签**。实测该会话 93 步里只有 **9 步**
+的 reasoning 通道非空 —— 思考 9,563 字符 vs 正文 64,043 字符。
+
+全语料普查（155 会话）：含标签 **28 步**，**开标签 0 个**、闭标签 28 个，
+hex 恒为 `6124c78e`（会话级）；只出现在 `workbuddy/hy4-preview-f`（25）
+与 `workbuddy/deepseek-v4.1-flash`（3）。
+
+**判据**（`splitThinkTaggedContent`，`src/sse.ts`）：
+- 以**最后一个**闭标签为界，标签**前** → reasoning 块、标签**后** → text 块；
+- ⚠️ **只认闭标签，不猜开标签**：开标签恒缺失，仅见开标签时无法确定「思考到哪
+  结束」，**不切分**（保持原样比猜错安全）；
+- ⚠️ **无标签返回 `undefined`**，保证 99.6% 的普通响应**逐字节不变**；
+- ⚠️ **必须在收尾做，不能逐帧**：标签会跨帧到达（`</think:61` + `24c78e>`）；
+- ⚠️ **归位时必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为 reasoning
+  块的**权威**，只改 `blocks` 条目不生效（测试直接暴露过这个坑）；
+- ⚠️ **归位后正文可能为空串**（实测 seq=34768 形态）—— 空块会污染会话且违反
+  DSH 的 `EMPTY_RESPONSE` 契约，故**不发空 text 块**（思考段已归位，仍有产出）。
+
+⚠️ **引用判据不可省（否则误伤正常正文）**：标签可能只是被模型**讨论/复述**。
+实测 28 处里 **3 处是反引号包裹的行内引用**（含排查本缺陷时复述该标签字面量的
+正文）。判据「标签是否被反引号/围栏代码块包裹」分离度 **3/3 与 25/25，零交叉**。
+
+回归用例 `tests/unit/think-tag-split.spec.ts`；真实会话端到端回放
+`scripts/verify-prose-loop-replay.ts`（用会话里保存的**真实 wire 分片**重建 SSE，
+喂真实 `BuddyAdapter`，断言**工具零丢失**）。
 
 #### ⚠️ 行首 `course` / `课` 泄漏 token 会污染提示词
 

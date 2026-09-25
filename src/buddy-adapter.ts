@@ -32,7 +32,7 @@ import {
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { normalizeHarnessMessages } from './message-shape.js'
-import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -1170,6 +1170,30 @@ export class BuddyAdapter extends LlmAdapter {
     const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
     let loopDetected = false
     /**
+     * **正文**死循环检测（**独立实例**）。本路径正是用户实际报障的那条
+     * （`lilishop-go` 会话 / `workbuddy/hy4-preview-f`）：该模型把思考写进
+     * `content` 通道，正文出现真循环（去重率 0.0412），而旧实现只在
+     * reasoning 分支调 `observe` → 正文循环**完全看不见**。
+     *
+     * ⚠️ 必须与 `loopGuard` **分成两个实例**：判据看的是尾部 3000 字符窗口的
+     * 行去重率，两条通道混进同一窗口会互相稀释，使守卫**双双失效**。
+     *
+     * ⚠️ 与思考守卫的**语义差异**：实测正文循环的 wire 顺序恒为
+     * `text-chunks(循环) → tool-call-chunks → finish: tool-calls` —— 工具调用
+     * 在循环正文**之后**到达且有效。故正文守卫**只截断文本**，
+     * **绝不 `reader.cancel()`、绝不改 finish reason**，否则会把有效调用
+     * 整块丢掉（比循环本身更糟）。
+     */
+    const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let proseLoopDetected = false
+    /**
+     * `</think:hex>` 泄漏的待定正文（见 `splitThinkTaggedContent`）。
+     *
+     * 标签可能**跨帧**到达（`</think:612` + `4c78e>`），故不能逐帧判定，
+     * 必须缓冲到收尾时一次性切分。
+     */
+    let proseHasThinkTag = false
+    /**
      * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
      * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
      *
@@ -1280,8 +1304,21 @@ export class BuddyAdapter extends LlmAdapter {
               blocks.push(block)
               yield { type: 'block-start', index: block.index, blockType: 'text' }
             }
-            block.text += delta.content
-            yield { type: 'text-delta', index: block.index, text: delta.content }
+            // 正文死循环守卫（见 `proseLoopGuard` 注释）。
+            //
+            // ⚠️ 命中后**只停止累积与发射**，绝不 `reader.cancel()`、绝不改
+            // finish reason —— 工具调用在循环正文之后到达且有效（实测）。
+            // 截断靠收尾的 `block-end` 权威覆盖落地（见文件末尾 text 段）。
+            if (proseLoopGuard !== undefined) {
+              if (proseLoopGuard.observe(delta.content)) proseLoopDetected = true
+            }
+            // `</think:hex>` 泄漏探测：标签可能跨帧，故只做廉价子串判定，
+            // 真正切分放在收尾（见文件末尾 text 段）。
+            if (!proseHasThinkTag && delta.content.includes('think:')) proseHasThinkTag = true
+            if (!proseLoopDetected) {
+              block.text += delta.content
+              yield { type: 'text-delta', index: block.index, text: delta.content }
+            }
           }
           if (delta?.reasoning_content) {
             // 死循环守卫：命中后不再累积、不再发射。
@@ -1442,12 +1479,40 @@ export class BuddyAdapter extends LlmAdapter {
       }
     }
     if (textBlock !== undefined) {
+      // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+      // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
+      // 无标签时**逐字节不变**。
+      let textOut = textBlock.text
+      if (proseHasThinkTag) {
+        const split = splitThinkTaggedContent(textBlock.text)
+        if (split !== undefined) {
+          // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
+          // reasoning 块的权威，只改 `blocks` 条目不生效。
+          if (split.reasoning !== '') {
+            const existing = blocks.find(candidate => candidate.kind === 'reasoning')
+            if (existing === undefined) {
+              blocks.push({ index: nextIndex++, kind: 'reasoning', text: split.reasoning })
+            } else {
+              existing.text += split.reasoning
+            }
+            suppressor.feed(split.reasoning)
+          }
+          textOut = split.text
+        }
+      }
+      // 正文死循环截断：只保留循环前的干净前缀（与思考守卫同一覆盖机制）。
+      // ⚠️ **不改 finish reason**：工具调用仍要被执行。
+      const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
+        ? textOut.slice(0, proseLoopGuard.cutAt)
+        : textOut
       // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
-      blockCount += 1
-      yield {
-        type: 'block-end',
-        index: textBlock.index,
-        block: { type: 'text', text: stripCourseLeakIfEnabled(textBlock.text) },
+      const cleaned = stripCourseLeakIfEnabled(truncated)
+      // ⚠️ 归位后正文可能为空串（实测 seq=34768 形态）—— 空块会污染会话，
+      // 且 DSH 的 `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，
+      // 故本响应仍有产出，不会被误判为零块。
+      if (cleaned !== '') {
+        blockCount += 1
+        yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } }
       }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
