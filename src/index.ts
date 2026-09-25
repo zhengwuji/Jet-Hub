@@ -6,11 +6,13 @@ import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
 import { registerTraeLlm } from './trae-adapter.js'
+import { registerClineLlm } from './cline-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
+import { ClineAuth } from './cline-auth.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
@@ -18,10 +20,12 @@ import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
+import { CLINE } from './cline-product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
+import type { ClineCredential } from './cline.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -140,7 +144,7 @@ export function apply(ctx: Context): void {
   // profile 条目 id，故这里不做任何注册；各 provider 的 settingsNs 由
   // `settingsNamespaceFor()` 解析为本插件条目 id。
   registerProviderSettings(
-    ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai', 'llm-qoder', 'llm-trae',
+    ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai', 'llm-qoder', 'llm-trae', 'llm-cline',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -365,6 +369,51 @@ export function apply(ctx: Context): void {
     product: TRAE,
   })
 
+  // ===== Cline（Cline 桌面端 / Cline API）服务 =====
+  // 第七个产品线，协议与前面六者**都不同源**：登录是 **WorkOS 设备码轮询**
+  // （api.workos.com，不起本地回调端口），鉴权头是 `Bearer workos:<jwt>`
+  // （前缀**不可剥**），推理是**标准 OpenAI 兼容**端点。
+  // 服务名由 ClineAuth 依 product.id 派生，注册为 ctx.clineAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Cline 面板。
+  const cline = new ClineAuth(ctx)
+  const clineAdapter = registerClineLlm(ctx, {
+    credentialRef: credentialRef(CLINE.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 Cline 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 CLINE.id 而非字面量 'cline'：写死字面量在
+      // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(CLINE.id, '')
+      if (available) return available.credential as ClineCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as ClineCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
+      //
+      // 为什么：resolveCredential（上面）优先从账号池取
+      // `CLINE_ACCOUNT_XXX` 的凭据，而 `cline.refresh()` 读写的是
+      // `CLINE_ACCESS_TOKEN`。两者错配的后果是 —— 适配器检测到池凭据
+      // 过期 → 调 refresh → 成功回写到**另一个** ref → 再 resolve 仍取到
+      // 那份未更新的过期凭据 → 带着过期 token 发请求 → 401。
+      // 用户看到的是「刚在 Jet Hub 登录好，却一直认证失败」，
+      // 而日志里续期全是成功的，极难排查。
+      const available = await pool.getAvailableAccount(CLINE.id, '')
+      if (available) await cline.refreshAccountCredential(available.entry.credentialRef)
+      else await cline.refresh()
+    },
+    // 图片字节桥接：Cline 内嵌目录的 `capabilities` 含 `images`，
+    // 模态按模型判定（见 ClineAdapter.inputModalitiesFor）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: CLINE,
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -388,6 +437,9 @@ export function apply(ctx: Context): void {
     try {
       await trae.refreshAll(pool)
     } catch { /* 静默 */ }
+    try {
+      await cline.refreshAll(pool)
+    } catch { /* 静默 */ }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期。
@@ -409,6 +461,7 @@ export function apply(ctx: Context): void {
         lobsterai.stop()
         qoder.stop()
         trae.stop()
+        cline.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -421,6 +474,7 @@ export function apply(ctx: Context): void {
     lobsterai.stop()
     qoder.stop()
     trae.stop()
+    cline.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
@@ -436,8 +490,9 @@ export function apply(ctx: Context): void {
     lobsterai: lobsteraiAdapter,
     qoder: qoderAdapter,
     trae: traeAdapter,
+    cline: clineAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, modelAdapters)
   ctx.provide('accountPool', pool)
 }

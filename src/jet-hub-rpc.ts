@@ -20,9 +20,11 @@ import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { QoderAuth } from './qoder-auth.js'
 import type { TraeAuth } from './trae-auth.js'
+import type { ClineAuth } from './cline-auth.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
+import { CLINE } from './cline-product.js'
 import { isLobsteraiRefreshable, lobsteraiCredentialExpiresAtMs } from './lobsterai.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import { isQoderRefreshable, qoderCredentialExpiresAtMs } from './qoder.js'
@@ -30,6 +32,12 @@ import type { QoderCredential } from './qoder.js'
 import { claimQoderDailyCheckin, fetchQoderCreditBalance } from './qoder-credits.js'
 import { isTraeRefreshable, traeCredentialExpiresAtMs } from './trae.js'
 import type { TraeCredential } from './trae.js'
+import { fetchClineCreditBalance } from './cline-credits.js'
+import {
+  clineCredentialExpiresAtMs,
+  isClineRefreshable,
+  type ClineCredential,
+} from './cline.js'
 import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
@@ -157,6 +165,18 @@ function parseQoderCredential(raw: string): QoderCredential | undefined {
 function parseTraeCredential(raw: string): TraeCredential | undefined {
   try {
     const parsed = JSON.parse(raw) as TraeCredential
+    return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
+      ? parsed
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 解析 Cline 凭据 JSON；解析失败返回 undefined。 */
+function parseClineCredential(raw: string): ClineCredential | undefined {
+  try {
+    const parsed = JSON.parse(raw) as ClineCredential
     return typeof parsed === 'object' && parsed !== null && typeof parsed.access_token === 'string'
       ? parsed
       : undefined
@@ -511,6 +531,7 @@ export function registerJetHubRpc(
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   trae: TraeAuth,
+  cline: ClineAuth,
   /**
    * provider → 适配器实例（可选）。
    *
@@ -522,7 +543,7 @@ export function registerJetHubRpc(
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters,
+      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, qoder, trae, cline, modelAdapters,
     )
   })
 }
@@ -577,6 +598,7 @@ function registerJetHubEndpoints(
   lobsterai: LobsteraiAuth,
   qoder: QoderAuth,
   trae: TraeAuth,
+  cline: ClineAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -821,6 +843,41 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === CLINE.id) {
+          // Cline 是 **WorkOS 设备码轮询**登录（见 src/cline-oauth.ts）：
+          // 与 Qoder 同为「不开本地回调服务器」的轮询式，但判据形态不同 ——
+          // Qoder 看 HTTP 404，Cline 看响应体的 `error: authorization_pending`。
+          //
+          // ⚠️ 与 Qoder 的另一处差异：`startLogin` 内部要先发一次
+          // `POST {workOsBase}/user_management/authorize/device` 拿到设备码，
+          // 才能返回 loginUrl（Qoder 的 URL 是纯本地构造的）。那只是一次
+          // 快速 POST，仍远快于浏览器手势窗口，故两步式的理由与 Qoder 一致。
+          const started = await cline.startLogin({ refName })
+          // 先登记启用的占位条目（无凭据），使前端 login.poll 能立即看到该账号；
+          // 登录成功后再回填昵称/有效期等真实字段。
+          await pool.addAccount({
+            id,
+            provider: CLINE.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          started.result.then(async (loginResult) => {
+            const credential = parseClineCredential(loginResult.access)
+            await pool.updateAccount(id, {
+              nickname: credential?.nickname !== undefined && credential.nickname.length > 0
+                ? credential.nickname
+                : id,
+              expiresAt: credential !== undefined ? clineCredentialExpiresAtMs(credential) : undefined,
+              refreshable: credential !== undefined && isClineRefreshable(credential),
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${CLINE.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
@@ -908,6 +965,9 @@ function registerJetHubEndpoints(
               break
             case TRAE.id:
               await trae.refreshAccountCredential(entry.credentialRef)
+              break
+            case CLINE.id:
+              await cline.refreshAccountCredential(entry.credentialRef)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -1024,6 +1084,19 @@ function registerJetHubEndpoints(
             } satisfies RpcCreditsStatusResponse,
           }
         }
+        if (req.provider === CLINE.id) {
+          // Cline **没有签到端点**（对整个 sidecar 二进制做字符串扫描，
+          // checkin / check-in / daily / campaign 均无任何 Cline 业务端点命中；
+          // 见 src/cline-credits.ts 的模块注释）。故与 WorkBuddy 国际版一致，
+          // 如实返回 null，而不是臆造一份状态对象。
+          const accounts = await pool.listAccounts(req.provider)
+          return {
+            ok: true,
+            value: {
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
+            } satisfies RpcCreditsStatusResponse,
+          }
+        }
         const product = productById(req.provider)
         if (product === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -1106,6 +1179,22 @@ function registerJetHubEndpoints(
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
+        if (req.provider === CLINE.id) {
+          // Cline **没有签到端点**（见 src/cline-credits.ts 的模块注释：
+          // 对整个 sidecar 做字符串扫描，无任何 checkin/campaign 业务端点）。
+          // 客户端按能力矩阵（`credits-capabilities.js` 的
+          // `cline: { balance: true, dailyCheckin: false }`）根本不会渲染
+          // 「一键领取积分」按钮、也不会发起本调用；这里显式返回可读错误，
+          // 而不是落到下面 `productById` 的 `unsupported provider` 泛化文案
+          // —— 后者会让排查者以为是「provider 没注册」，而真相是「该产品无此能力」。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: 'Cline 不支持每日签到（其后端没有签到接口）',
+            },
+          }
         }
         const product = productById(req.provider)
         if (product === undefined) {
@@ -1207,6 +1296,49 @@ function registerJetHubEndpoints(
             fetchBalance: (credential, product) => fetchTraeCreditBalance(credential as TraeCredential, product),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === CLINE.id) {
+          // 余额来自 `GET /api/v1/users/{accountId}/balance`（实测
+          // `{data:{userId, balance}, success:true}`）。与 Qoder 分支同因：
+          // `fetchClineCreditBalance` 只吃 ClineCredential，故不用
+          // collectCreditBalances 的泛型（它会把产品配置转发给 fetchBalance）。
+          //
+          // ⚠️ 账号 id 必须用凭据里的 `account_id`（`usr-…`），**不是** JWT 的
+          // `sub`（`user_…`）—— 传后者实测返回 `400 Invalid request format`。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (!resolved) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置',
+              })
+              continue
+            }
+            let credential: ClineCredential
+            try {
+              credential = JSON.parse(resolved.value) as ClineCredential
+            } catch {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据解析失败',
+              })
+              continue
+            }
+            const result = await fetchClineCreditBalance(credential, CLINE)
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance: result.balance,
+              // 查不到时带上**具体原因**（含 HTTP 状态码与错误体摘要），
+              // 而不是笼统一句「查询失败」—— 卡片显示原因而非 0
+              //（0 是「已用光」的语义，会误导用户）。
+              ...result.balance === null
+                ? { error: result.error ?? '积分查询失败（凭据失效或响应异常）' }
+                : {},
+            })
+          }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         const product = productById(req.provider)

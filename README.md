@@ -109,12 +109,13 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册五个独立的 provider 路由：`buddy`（见
+除 `codearts` 外，插件另注册六个独立的 provider 路由：`buddy`（见
 [buddy provider](#buddy-provider)）、`workbuddy`（见
 [WorkBuddy provider](#workbuddy-provider)）、`lobsterai`（见
 [LobsterAI provider](#lobsterai-provider有道龙虾)）、`qoder`（见
-[Qoder provider](#qoder-provider)）与 `trae`（见
-[TRAE provider](#trae-provider字节跳动-trae)）。六者互不覆盖，可同时使用。
+[Qoder provider](#qoder-provider)）、`trae`（见
+[TRAE provider](#trae-provider字节跳动-trae)）与 `cline`（见
+[Cline provider](#cline-provider)）。七者互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -1216,3 +1217,99 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
 
 > 实现依据见 `docs/trae-integration-plan.md`（协议逆向自
 > [`trae2api`](https://github.com/Sliverkiss/traework2api) 及其衍生项目）。
+
+## Cline provider
+
+Cline（[cline.bot](https://cline.bot)）桌面端的账号与模型路由。协议全部由本机
+Cline 产物逆向 + 实测得出（2026-09-25），与其余六个 provider **都不同源**：
+
+| 维度 | 本 provider 的取值 |
+|------|-------------------|
+| 登录 | **WorkOS 设备码轮询**（`api.workos.com`，不起本地监听端口） |
+| 鉴权头 | `Authorization: Bearer workos:<jwt>` —— **前缀不可剥** |
+| 推理 | **标准 OpenAI 兼容**（`POST {apiBase}/api/v1/chat/completions`） |
+| 续期 | `POST {apiBase}/api/v1/auth/refresh`，body `{refreshToken, grantType}` |
+| 积分 | 余额有；**签到无**（后端没有签到接口） |
+
+### 登录（设备码轮询）
+
+Jet Hub 的 Cline 面板点「+ 新建账号」→ 浏览器打开授权页并显示用户码 →
+在浏览器完成授权 → 插件自动换取凭据。全程**不需要**本地回调端口。
+
+⚠️ **`authorization_pending` 不是错误**：它是「用户还没在浏览器里点授权」，
+插件会继续轮询（与 Qoder 的「404 表示尚未授权」同类语义）。`slow_down` 会
+**累积退避**后再轮询。
+
+### 免费模型
+
+Cline 的免费模型由远端 `GET /api/v1/ai/cline/recommended-models` 的 **`free`
+数组**动态下发，插件在模型列表里把它们的名字标成 `· 免费`，例如：
+
+```
+Space Bunny Alpha · 免费
+MiMo-V2.6-Flash · 免费
+DeepSeek V4.1 Flash · 免费
+Gemini 3.8 Flash · 免费
+Muse Spark 1.3 Contributor · 免费
+```
+
+⚠️ **免费与付费是两组不同的模型 id**，不是同一模型的两种档位：
+
+| 免费（`free` 数组下发） | 按量计费（同名前缀不同） |
+|---|---|
+| `cline-free/deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash` |
+
+插件的判定基于**完整 id**（远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/`
+前缀 ∪ 静态兜底），**不做名字模糊匹配** —— 否则会把付费条目误标为免费，
+用户按免费预期使用却被计费。
+
+⚠️ 免费资格是**服务端随时可撤销**的营销状态，故插件每次都从远端重新取，
+不在代码里硬编码任何免费模型名。
+
+### 积分余额
+
+Jet Hub 的 Cline 账号卡片会显示账户余额（`GET /api/v1/users/{accountId}/balance`）。
+**没有「一键领取积分」按钮** —— Cline 后端没有签到接口（对 sidecar 做全量字符串
+扫描，`checkin` / `campaign` 等均无业务端点命中）。
+
+### 适用范围
+
+- 需要**已登录 Cline 账号**（Jet Hub 面板登录，或用免费账号）；
+- 模型列表**全部列出**（含付费模型），免费的带 `· 免费` 标记；
+  可在 Jet Hub 的「显示列表」里逐个关闭不需要的；
+- 图片输入按模型判定（内嵌目录 `capabilities` 含 `images`）。
+
+### 图标
+
+面板图标是**从本机 Cline 安装目录提取的官方图标**（`icons\app\macos\classic.png`，
+品牌紫底），不是手绘的 —— 早期版本曾按印象画了个「C 形弧线」，与真实标志不符。
+
+需要重新提取（例如 Cline 换了图标，或想换主题）时：
+
+```bash
+node scripts/extract-cline-icon.mjs                    # classic（默认），48×48
+node scripts/extract-cline-icon.mjs --theme=midnight   # 换主题
+node scripts/extract-cline-icon.mjs --dry-run          # 只报告不改文件
+pnpm build:client                                      # 改完必须重建
+```
+
+官方提供 `classic` / `chip` / `hologram` / `midnight` 四套主题，脚本默认取
+`classic`：`midnight`（exe 内嵌的默认主题）是近黑底，与 Qoder 图标在 20×20 下
+难以区分；`chip` 的电路板纹理缩小后退化成噪点；`hologram` 在白底容器里对比度不足。
+
+### e2e 探针
+
+```
+pnpm test:e2e:cline        # 只读：凭据/前缀证据/余额/免费集合，零 token 消耗
+pnpm test:e2e:cline-chat   # ⚠️ 发一次推理：默认只发 cline-free/deepseek-v4.1-flash
+```
+
+⚠️ 推理探针**默认只请求一个免费模型**。其余免费模型需显式设置
+`DSH_CLINE_CHAT_E2E_ALL_FREE=1` 才遍历；**付费模型一律被拒绝**（避免免费资格
+被撤销后按付费价刷 token）。详见 `tests/e2e/README.md`。
+
+### 排查脚本（只读）
+
+`scripts/probe-cline-endpoints.mjs`（按关键词提取 sidecar 二进制字符串窗口）、
+`probe-cline-models.mjs`、`probe-cline-recommended.mjs`、
+`probe-cline-balance.mjs`、`probe-cline-chat.mjs`。

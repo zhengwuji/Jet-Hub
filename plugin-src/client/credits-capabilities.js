@@ -26,6 +26,8 @@
  * | `workbuddy` | ✓                   | ✗ 国际版后端无签到接口        |
  * | `lobsterai` | ✓                   | ✓ `client-activities` 三步流程 |
  * | `qoder`     | ✓ `sash/api/v2/me/usage` | ✗ 未见签到接口            |
+ * | `trae`      | ✓                   | ✓ `checkin_credits/*`        |
+ * | `cline`     | ✓ `/api/v1/users/{id}/balance` | ✗ 后端无签到接口  |
  *
  * - `balance`：CodeBuddy 系用 `POST /v2/billing/meter/get-user-resource`
  *   （CodeBuddy 与 WorkBuddy 国际版**通用**，仅 baseURL 随 `product.endpoint`
@@ -70,6 +72,18 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // TRAE：余额与签到都有（`/trae/api/v2/pay/ide_user_ent_usage` +
   // `checkin_credits/status` → `checkin_credits/claim`，见 `src/trae-credits.ts`）。
   trae: Object.freeze({ balance: true, dailyCheckin: true }),
+  // Cline：**只有余额**，没有签到。
+  //
+  // 余额：`GET /api/v1/users/{accountId}/balance`
+  // （实测 `{data:{userId, balance:500000}, success:true}`，见 `src/cline-credits.ts`）。
+  //
+  // ⚠️ `dailyCheckin: false` 的依据是**对整个 sidecar 二进制做字符串扫描**：
+  // `checkin` / `check-in` / `daily` / `campaign` 均无任何 Cline 业务端点命中
+  // （`campaign` 的命中是 PostHog 的 UTM 参数与 feature-flag 事件属性；
+  // `daily` 是 YAML cron 别名与 Blob 导出频率枚举）。
+  // 这比「某次调用没看到」强，但仍不等于「永远不存在」—— 若将来 Cline 增加
+  // 签到，需按 Qoder 那次教训重新采集（见 AGENTS.md 的对应章节）。
+  cline: Object.freeze({ balance: true, dailyCheckin: false }),
 });
 
 /**

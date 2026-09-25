@@ -42,7 +42,9 @@
     "test:e2e:qoder-chat": "cross-env DSH_QODER_CHAT_E2E=1 DSH_QODER_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/qoder-chat-probe.e2e.spec.ts",
     "test:e2e:trae": "cross-env DSH_TRAE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/trae-probe.e2e.spec.ts",
     "test:e2e:trae-claim": "cross-env DSH_TRAE_E2E=1 DSH_TRAE_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/trae-claim-probe.e2e.spec.ts",
-    "test:e2e:trae-channels": "cross-env DSH_TRAE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/trae-channels-probe.e2e.spec.ts"
+    "test:e2e:trae-channels": "cross-env DSH_TRAE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/trae-channels-probe.e2e.spec.ts",
+    "test:e2e:cline": "cross-env DSH_CLINE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/cline-probe.e2e.spec.ts",
+    "test:e2e:cline-chat": "cross-env DSH_CLINE_CHAT_E2E=1 DSH_CLINE_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/cline-chat-probe.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {

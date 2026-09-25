@@ -642,6 +642,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       makeAuth('lobsterai') as never,
       makeAuth('qoder') as never,
       makeAuth('trae') as never,
+      makeAuth('cline') as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -774,6 +775,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       ctx as never, pool as never,
       {} as never, {} as never, {} as never, {} as never, {} as never,
       failingAuth as never,
+      {} as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -942,6 +944,7 @@ describe('model.list / model.setDisabled 端点', () => {
 
     registerJetHubRpc(
       ctx as never, pool, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never,
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')

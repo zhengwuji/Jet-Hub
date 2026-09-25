@@ -21,6 +21,11 @@
  *   `content`、要么走 `reasoning_content`，**另一侧恒为 `null`**。只判 undefined
  *   会让 `.length` 在 null 上崩溃（表现为每轮对话第一帧就报
  *   `Cannot read properties of null`）。
+ * - **思考字段有两个名字**：`reasoning_content`（Qoder / buddy）与
+ *   `reasoning`（**Cline**，实测形如
+ *   `{"delta":{"reasoning":"The","reasoning_details":[…]}}`）。只认前者会让
+ *   Cline 的思考内容被静默丢弃（表现为「模型不思考」）。两者语义相同，
+ *   由同一分支经 `??` 合并处理。
  * - **工具配对剔除**：孤儿 tool_call / tool_result 会让后端 400，且坏历史被每次
  *   请求原样重放 —— 会话彻底报废。发出前剔除可让会话自愈。
  * - **`function.name` 只允许非空覆盖**：后续分片带空串 `""` 会清空已解析出的
@@ -462,6 +467,17 @@ export async function* consumeOpenAiSse(
             delta?: {
               content?: string | null
               reasoning_content?: string | null
+              /**
+               * 思考增量的**另一种字段名**（Cline 用这个）。
+               *
+               * ⚠️ Cline 的实测 SSE 是
+               * `{"delta":{"reasoning":"The","reasoning_details":[…]}}`，
+               * **不是** `reasoning_content`（后者是 Qoder / buddy 的形态）。
+               * 只认 `reasoning_content` 会让 Cline 的思考内容被静默丢弃
+               * （表现为「模型不思考」，且 reasoning 档位看似无效）。
+               * 两者由下方同一分支处理（同一帧只会出现其中一个）。
+               */
+              reasoning?: string | null
               tool_calls?: Array<{
                 index?: number
                 id?: string
@@ -544,7 +560,14 @@ export async function* consumeOpenAiSse(
           yield { type: 'text-delta', index: block.index, text: textDelta }
         }
         // 同样必须用 `typeof === 'string'`：reasoning_content 也会显式返回 null。
-        const reasoningDelta = delta?.reasoning_content
+        //
+        // ⚠️ **两个字段名都要认**：Qoder / buddy 用 `reasoning_content`，
+        // **Cline 用 `reasoning`**（实测 SSE 形如
+        // `{"delta":{"reasoning":"The","reasoning_details":[…]}}`）。
+        // 只认前者会让 Cline 的思考内容被静默丢弃 —— 用户看到「模型不思考」，
+        // 且 reasoning 档位切换看似无效（真实风险，见 cline-provider-design.md §2.5）。
+        // 用 `??` 合并而非分别处理：同一帧只会出现其中一个，且两者语义相同。
+        const reasoningDelta = delta?.reasoning_content ?? delta?.reasoning
         if (typeof reasoningDelta === 'string' && reasoningDelta.length > 0) {
           // 死循环守卫：命中后**不再累积、不再发射**该增量。
           // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + `break`）在

@@ -8,7 +8,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）与 `trae`（字节跳动 **TRAE**）五个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`trae`（字节跳动 **TRAE**）与 `cline`（**Cline** 桌面端 / Cline API）六个 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -134,7 +134,7 @@ POST {openApiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body **空*
 
 `trae` 同样**完全独立**（第五个脉系，独立一套 `src/trae*.ts`），且差异点与其他四者都不一样：认证用 **ExchangeToken 轮换 refreshToken**（不是轮询、也不是 authCode 交换）；鉴权头是 `Cloud-IDE-JWT <token>` 加十余个 `X-*` 身份头；**请求体需要从 OpenAI 格式转换为 SOLO 格式**（`function` / `config_name` / `tools.parameters` 序列化等）；**响应是 SOLO 自定义 SSE 事件**（`output` / `token_usage` / `done` / `error`），必须自行解析并转成 OpenAI chunk；凭据还必须持久化 `machine_id` 与 `device_id`（均为 **32 位 hex**，分别用作设备指纹与签到设备号，后者账号间必须互异）。**登录回调默认直接回传 token**（`auth_callback_url` 参数，老流程没有 `code`；但也并存 PKCE 新流程，两套都要认），详见下「TRAE 协议要点」。实现见 `docs/trae-integration-plan.md`。
 
-Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI、CodeArts、Qoder 与 TRAE 五个面板提供** —— 只有国际版 WorkBuddy 不提供（其后端没有签到接口）。五者是**五套互不相同的协议**（见下「积分领取」）。
+Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**CodeBuddy、LobsterAI、CodeArts、Qoder 与 TRAE 五个面板提供** —— 只有国际版 WorkBuddy 与 Cline 不提供（两者的后端都没有签到接口）。各面板是**互不相同的协议**（见下「积分领取」）。
 
 - **包名**：`dsh-codearts-auth`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
@@ -177,14 +177,14 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 
 ## 工作方式
 
-本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`traeAuth`）均遵循统一接口：
+本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyAuth`、`workbuddyAuth`、`lobsteraiAuth`、`qoderAuth`、`traeAuth`、`clineAuth`）均遵循统一接口：
 
 - `login(options?)` — 执行浏览器登录流程
 - `startLogin(options?)` — 两步式登录（先返回 loginUrl，Jet Hub 据此弹窗）
 - `refreshAccountCredential(refName)` — 按凭据 ref 续期**指定账号**（账号卡片「刷新」按钮）
 - `refreshAll(pool)` — 批量续期全部账号（定时调度器）
 
-⚠️ **不注册任何斜杠命令**：六个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
+⚠️ **不注册任何斜杠命令**：七个 provider 的登录/状态/续期**全部**在 Jet Hub 设置页完成。
 
 ⚠️ **CodeArts 只支持账号池，单凭据模式已移除**（用户要求）：
 
@@ -196,7 +196,7 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
   移除单凭据后会恒返回空列表。
 - `codearts-login` / `codearts-status` / `codearts-refresh` 三个命令**已删除**
   （注意代码里**从来没有** `codearts-logout` 命令，logout 只是服务方法）。
-- 六个 provider 的门控判据因此**完全一致**：都只看账号池，
+- 七个 provider 的门控判据因此**完全一致**：都只看账号池，
   `providerCatalogVisible` 的 `extraCredentialRefs` 参数已随之删除。
 - 老用户影响：若此前只用固定 ref 登录过，模型列表会变空，需在 Jet Hub 重新登录一次
   （用户已确认接受该行为，不做自动迁移）。
@@ -217,11 +217,11 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - `src/index.ts` 的 `accounts.some(a => a.refreshable && a.enabled)`
   → **所有账号都停用时续期定时器根本不启动**。
 
-用户重新启用后拿到的是死凭据，只能重新登录。六个 provider 的
+用户重新启用后拿到的是死凭据，只能重新登录。七个 provider 的
 `refreshAll`（`buddy-auth.ts` / `service.ts` / `lobsterai-auth.ts` / `qoder-auth.ts` / `trae-auth.ts`）与调度器
 **都必须保持只看 `refreshable`**。
 
-服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，`QoderAuth` 注册为 `qoderAuth`，`TraeAuth` 注册为 `traeAuth`，互不覆盖。
+服务名由产品 id 派生（`${product.id}Auth`）：两个 `BuddyAuth` 实例分别注册为 `buddyAuth` 与 `workbuddyAuth`，`LobsteraiAuth` 注册为 `lobsteraiAuth`，`QoderAuth` 注册为 `qoderAuth`，`TraeAuth` 注册为 `traeAuth`，`ClineAuth` 注册为 `clineAuth`，互不覆盖。
 
 各 provider 的登录/续期机制不同（详见 README.md），但均通过 `ctx.credentials` 统一管理凭据生命周期。
 
@@ -804,7 +804,7 @@ groups: catalog.flatMap(...).filter(group => group.models.length > 0)
 | 判据是**凭据可解析** | 服务层的 `logout()` **只 unset 凭据、保留账号条目**（删条目是另一条路径 `removeAccount`）。若只看「有条目」，用户登出后模型仍然显示，门控形同虚设 |
 | **不看 `enabled`** | 停用只影响「自动选号」，与「是否已登录」无关。若过滤 `enabled`，把所有账号停用的用户会发现整个 provider 的模型凭空消失。与「续期只看 `refreshable`、不看 `enabled`」是同一条既有约定 |
 
-⚠️ **六个 provider 判据完全一致，没有例外**：早期 CodeArts 曾额外接受固定单凭据
+⚠️ **七个 provider 判据完全一致，没有例外**：早期 CodeArts 曾额外接受固定单凭据
 ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs` 参数一并
 删除。老用户若只用固定 ref 登录过，模型列表会变空 —— 需在 Jet Hub 重新登录一次
 （用户已确认接受，不做自动迁移）。
@@ -833,6 +833,194 @@ ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs
   `qoder` / `trae`）。`buddy` 与 `workbuddy` 共用同一个适配器类，但
   `this.product.id` 不同 → 两者按各自 provider 独立判定，互不影响。
 
+## ⚠️ Cline provider：`workos:` 前缀不可剥、免费集合动态下发
+
+`cline` 是**第六个脉系**（独立一套 `src/cline*.ts`）。协议全部由本机 Cline 桌面端
+产物逆向 + 实测得出（2026-09-25）：
+
+- 二进制 `C:\Users\Jet\AppData\Local\Cline\code-sidecar.exe`（bun 单文件，144 MB）
+- 真实凭据 `C:\Users\Jet\.cline\data\settings\providers.json`
+- 排查脚本（只读）：`scripts/probe-cline-endpoints.mjs`（按关键词提取二进制字符串
+  窗口）、`probe-cline-models.mjs`、`probe-cline-recommended.mjs`、
+  `probe-cline-balance.mjs`、`probe-cline-chat.mjs`
+- 设计文档：`docs/superpowers/specs/2026-09-25-cline-provider-design.md`
+
+### ⚠️ 坑 1：`Authorization` 必须原样带 `workos:` 前缀（剥掉即 401）
+
+源码 `resolveApiKey` **原样使用存储值**，而 Cline 磁盘上存的就是
+`workos:eyJ…`。该前缀只在**解码 JWT** 时被剥掉
+（`decodeJwtPayload(token.replace(/^workos:/, ""))`），**从不出现在请求头构造里**。
+
+实测（`tests/e2e/cline-probe.e2e.spec.ts` 会现场复验，同一凭据）：
+
+| Authorization | `/api/v1/users/me` |
+|---|---|
+| `Bearer workos:eyJ…`（**原样**） | **200** |
+| `Bearer eyJ…`（剥掉前缀） | **401** |
+
+⚠️ 401 文案是 *"make sure you're using the latest version of Cline and
+re-authenticate your Cline account."* —— 与真实原因**毫不相干**，会让人误判成
+「客户端版本过旧」。实现见 `clineBearerValue`（幂等补齐，两种形态都接受）。
+
+### ⚠️ 坑 2：免费模型是**独立 id**，且只由 `recommended-models` 下发
+
+`cline-free/deepseek-v4.1-flash`（免费）与 `deepseek/deepseek-v4.1-flash`
+（按量计费）是**两个不同条目**。绝不可用「名字含 deepseek」之类模糊匹配判免费 ——
+那会让用户按免费预期使用却被计费。
+
+两个端点**必须都打**，理由各有实测依据：
+
+| 端点 | 内容 | 认证 |
+|---|---|---|
+| `GET /api/v1/ai/cline/recommended-models` | `{recommended[], free[], clinePass[]}`，**唯一权威的 free 集合** | **不需要** |
+| `GET /api/v1/models` | 460 个 `{id, object, created, owned_by}` —— **只有 id**，无 name/上下文 | 需要 |
+
+⚠️ 实测 `/models` 的 460 个 id 里 **`cline-free/*` 零命中** —— 免费模型**只**由
+`recommended-models` 下发。这就是「只调 `/models` 会看不到任何免费模型」的原因。
+`tests/e2e/cline-probe.e2e.spec.ts` 用断言锁死了这一事实（若某天 `/models` 也开始
+下发它们，该用例会失败并提示可简化实现）。
+
+判定规则（`isClineFreeModel`，**不硬编码模型名**）：
+远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/` 前缀 ∪ 兜底表 `isFree`。
+与 CodeArts benefit 集合同一约定。
+
+⚠️ **兜底表不足以覆盖免费集合**：sidecar 内嵌目录缺
+`cline-free/gemini-3.8-flash`（远端 `free` 有），故 `cline-product.ts` 的兜底表
+手工补上了它 —— 否则离线时用户看不到截图里的那个模型。
+
+⚠️ **`clinePass` 不是免费集合**：它是 Cline Pass 订阅制模型（`cline-pass/*`），
+按订阅额度计费。实测 14 个，误判为免费会误导用户。
+
+### ⚠️ 坑 3：思考字段是 `delta.reasoning`，不是 `reasoning_content`
+
+实测 Cline SSE 形如
+`{"delta":{"reasoning":"The","reasoning_details":[…]}}`，而
+`reasoning_content` 是 Qoder / buddy 的形态。`src/openai-compat.ts` 的
+`consumeOpenAiSse` 因此**同时认两者**（`delta?.reasoning_content ?? delta?.reasoning`）。
+只认前者会让 Cline 的思考内容被静默丢弃（表现为「模型不思考」，且 reasoning
+档位切换看似无效）。e2e 探针实测已确认思考内容真的产出。
+
+### 登录：WorkOS 设备码（与 Qoder 同为轮询式，但判据形态不同）
+
+```
+POST {workOsBase}/user_management/authorize/device   → device_code / user_code / verification_uri
+轮询 POST {workOsBase}/user_management/authenticate  → 200 {access_token, refresh_token}
+     grant_type=urn:ietf:params:oauth:grant-type:device_code
+POST {apiBase}/api/v1/auth/register  body {accessToken, refreshToken}
+  → {success:true, data:{accessToken, refreshToken, expiresAt, userInfo:{clineUserId, email}}}
+```
+
+⚠️ **`authorization_pending` 不是错误**，必须继续轮询 —— 它是「用户还没在浏览器里
+点授权」。与 Qoder 的「404 表示尚未授权」是同一类语义，但**判据形态完全不同**
+（Qoder 看 HTTP 状态码，Cline 看响应体的 `error` 字段）。`slow_down` 必须**累积
+退避**（源码 `intervalSeconds += 1`）。
+
+⚠️ **响应套 `{success, data}` 信封，字段名是驼峰** `accessToken`（不是
+`access_token`）。判据是 `success && data.accessToken`（源码
+`requireClineTokenResponse`），只看裸字段会把失败信封当成功。
+
+### 续期：字段名是驼峰 `refreshToken` + `grantType`
+
+```
+POST {apiBase}/api/v1/auth/refresh
+body: { "refreshToken": <refresh>, "grantType": "refresh_token" }
+```
+
+⚠️ **不是 OAuth 标准的 `refresh_token` / `grant_type`**（源码 `refreshClineToken`）。
+两者都必填；写错字段名服务端不会明确报「缺字段」，而是回一个泛化的认证失败。
+
+### 积分余额：只有余额，**没有签到**
+
+```
+GET {apiBase}/api/v1/users/{accountId}/balance
+  → { data: { userId, balance: 500000 }, success: true }
+```
+
+⚠️ **`userId` 用凭据里的 `account_id`（`usr-…`），不是 JWT 的 `sub`（`user_…`）**：
+实测传 `sub` 返回 `400 {"error":"Invalid request format"}`。
+
+⚠️ **401 的响应体是 `{error:"…"}`，没有 `success` 字段** —— 解析器必须两种失败形态
+都认，否则 401 会落到误导性的「响应缺少 data 字段」，把服务端给的唯一有用线索丢掉
+（真实缺陷，已由 `tests/unit/cline-credits.spec.ts` 锁死）。
+
+⚠️ **余额单位**：实测 `balance: 500000`。按 1e-5 USD 解释为 **$5.00**，与 Cline
+公开的新账号赠额一致 —— 这是选取 `CLINE_BALANCE_SCALE = 100000` 的独立锚点。
+⚠️ **不要用 `/usages` 的 `costUsd` 反推该系数**：实测单次记录
+`{creditsUsed:0, costUsd:1320, totalTokens:49}`，按 1e-5 解释会是 $269/1M token
+（flash 档不可能），说明两者**口径不同**。只读 e2e 探针会打印原始值供核对。
+
+**签到不存在**：对整个 sidecar 做字符串扫描，`checkin` / `check-in` / `daily` /
+`campaign` 均无任何 Cline 业务端点命中（`campaign` 的命中是 PostHog 的 UTM 参数与
+feature-flag 事件属性；`daily` 是 YAML cron 别名与 Blob 导出频率枚举）。故能力矩阵
+登记为 `{balance:true, dailyCheckin:false}`（与 WorkBuddy 国际版同例）。
+⚠️ 这比「某次调用没看到」强，但仍不等于「永远不存在」—— 若将来增加签到，需按
+Qoder 那次教训重新采集。
+
+### e2e 闸门（付费保护，**请勿削弱**）
+
+```
+DSH_CLINE_E2E=1                          只读探针（凭据/前缀证据/余额/免费集合）
+DSH_CLINE_CHAT_E2E=1 + ..._CONFIRM=yes   默认**只**请求 cline-free/deepseek-v4.1-flash
+DSH_CLINE_CHAT_E2E_ALL_FREE=1            才遍历其余 4 个免费模型
+```
+
+理由：免费资格是**服务端随时可撤销**的营销状态。无条件遍历「远端此刻说免费」的
+那批模型，某天某个转为计费后，一次 e2e 就会**按付费价刷 token**。
+
+`assertFreeModel()` 是安全边界：任何 `isFree === false` 的模型（无论来自
+`DSH_CLINE_MODEL` 还是远端列表）都**直接抛错、不发请求**；遍历分支还做逐个二次确认
+（已不在**当前** free 集合中即跳过）。
+
+### ⚠️ 面板图标必须从官方资源提取，**不得凭印象手绘**
+
+**真实缺陷**（用户报障）：「我们用的图标和 cline 的好像不一样」。
+
+初版 `CLINE_ICON` 是**凭印象手绘**的内联 SVG（「深色圆角方块 + 白色 C 形弧线」），
+与 Cline 真实标志完全不符 —— 真实标志是**顶部带凸起的圆角方块 + 中间两条竖线 +
+左右两侧尖角**，品牌紫底。
+
+**教训：品牌图标必须从官方资源提取。** 修法与工具：
+
+- 官方图标**就在安装目录里**，不必从 exe 抠 PE 资源：
+  ```
+  %LOCALAPPDATA%\Cline\icons\app\{classic,chip,hologram,midnight}.png   148×148
+  %LOCALAPPDATA%\Cline\icons\app\macos\*.png                            1024×1024  ← 用这个
+  ```
+  （`cline-app.exe` 内嵌的主图标只有 **32×32** 且是 **midnight** 主题，不适合。）
+- 提取脚本 **`scripts/extract-cline-icon.mjs`**（纯 Node，**零第三方依赖**：
+  PNG 解码/编码用内置 `zlib` 手写，只支持官方图标的
+  bit depth 8 + color type 6/2 + 非隔行）：
+  ```
+  node scripts/extract-cline-icon.mjs                    # classic，48×48，写入 jet-hub.js
+  node scripts/extract-cline-icon.mjs --dry-run
+  node scripts/extract-cline-icon.mjs --theme=midnight --size=64
+  node scripts/extract-cline-icon.mjs --out=icon.png     # 另存供目视
+  ```
+- **主题选 classic（品牌紫 `#7271E5`）**，理由：`midnight`（exe 内嵌的默认主题）
+  是近黑底，与 **Qoder 图标的深蓝黑 `#1f2a3f`** 在容器实际尺寸 **20×20** 下
+  几乎无法区分，列表里会混淆；`chip`（绿色电路板）缩到 20×20 后纹理退化成噪点；
+  `hologram` 在白底容器里对比度不足。另：紫色在当前 7 个 provider 图标里**未被占用**。
+- ⚠️ **缩放必须做 alpha 加权（预乘）平均**：图标边缘是抗锯齿的半透明像素，
+  直接对未预乘 RGB 平均会混入透明区的黑色，产出**发黑的描边**。
+- ⚠️ 脚本的替换逻辑用**全局匹配、只保留一行**：单次 `String.replace` 一旦
+  文件里出现重复的 `const CLINE_ICON` 声明就会残留 → esbuild 直接报
+  `The symbol "CLINE_ICON" has already been declared`（开发期踩过一次），
+  现在重复运行幂等且能自愈重复行。
+- **回归测试 `tests/unit/cline-icon.spec.ts`**：锁定 ① 必须是结构完整的 **PNG**
+  （防退回手绘 SVG）、② 尺寸 48×48、③ 与「从官方 `classic.png` 重新提取」
+  **逐字节一致**（无 Cline 安装时该条干净跳过）。
+  已做**反向验证**：把前缀改回 `data:image/svg+xml` 后 4 条用例失败。
+
+### 其它
+
+- 推理端点是**标准 OpenAI 兼容**（`POST {apiBase}/api/v1/chat/completions`），
+  故复用 `src/openai-compat.ts` 全套（消息序列化 / SSE 消费 / 错误归类），与 Qoder 同做法。
+- 客户端标识头（推理与账号端点都带）：`HTTP-Referer: https://cline.bot`、
+  `X-Title: Cline`、`X-IS-MULTIROOT: false`、`X-CLIENT-TYPE: cline-sdk`。
+- `max_tokens` 上界收敛到 **943718**（内嵌目录最大 `maxTokens`，取自
+  `muse-spark-1.3-contributor`），不自行编造更大值。
+- 单元测试 6 个文件：`cline.spec.ts` / `cline-models.spec.ts` / `cline-oauth.spec.ts` /
+  `cline-credits.spec.ts` / `cline-auth.spec.ts` / `cline-adapter.spec.ts`。
 ## 常见开发任务
 
 ### 新增功能
@@ -1038,7 +1226,7 @@ Let me write. / Writing. / Go. / OK. / Producing. / Let me output. / Final.
 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` 同为「默认开」语义，用独立的
 `resolveReasoningLoopGuardFlag`，不要与 `isTruthyFlag` 混用）。
 
-五个适配器全部接入（含 codearts 的 `reasoning` 与 `<thought>` **两条**出口）。
+六个适配器全部接入（含 codearts 的 `reasoning` 与 `<thought>` **两条**出口）。
 回归用例：`tests/unit/reasoning-loop.spec.ts`（判据）、
 `tests/unit/reasoning-loop-adapter.spec.ts`（各适配器中断行为）；
 fixture 为**真实会话文本**（`tests/fixtures/reasoning-*.txt`）。
@@ -1838,9 +2026,9 @@ CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控�
 - 工具结果内嵌图片（`read_image`）不能留在 `role:'tool'` 消息里（该角色 content 只能是字符串），须提升为**其后的独立 user 消息**；`userContentParts` 与 `collectImages` 必须**对称递归**，否则深层图片会被静默吞掉
 - 只声明 `inputModalities` 而不实现比不声明**更糟**：DSH 在 `LlmRuntime` 里按它决定是否把图片投影成文本占位符，声明支持就必须真支持
 
-## 「+ 新建账号」必须两步式返回 loginUrl（五个 provider 一致）
+## 「+ 新建账号」必须两步式返回 loginUrl（六个 provider 一致）
 
-`account.create` 对**全部五个 provider** 都必须在**用户完成授权之前**返回
+`account.create` 对**全部六个 provider** 都必须在**用户完成授权之前**返回
 `loginUrl`，由前端立即 `window.open`，后台再异步等回调。
 
 这不是风格偏好，而是浏览器硬约束：`window.open` 只在用户点击后的

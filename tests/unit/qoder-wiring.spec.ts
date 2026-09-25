@@ -39,8 +39,12 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
   it('Jet Hub RPC 传入 qoder 实例与适配器映射', () => {
     // 末尾的 `modelAdapters` 供「显示列表」取不受黑名单影响的全量目录
     // （使被关闭的模型也显示正确的展示名/倍率，而不是退化成裸 id）。
-    expect(index).toContain(
-      'registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, modelAdapters)',
+    //
+    // ⚠️ 形参是**位置参数**：新增 provider（本次是 cline）会插在 trae 与
+    // modelAdapters 之间，故这里必须跟着更新 —— 只断言「qoder 在正确位置」，
+    // 不要写死整串（否则每加一个 provider 都会假失败）。
+    expect(index).toMatch(
+      /registerJetHubRpc\(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, \w+, modelAdapters\)/,
     )
     expect(index, 'qoder 适配器须登记进映射').toContain('qoder: qoderAdapter')
   })

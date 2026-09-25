@@ -12,6 +12,7 @@
 | `buddy-pool-probe.e2e.spec.ts` | `DSH_BUDDY_POOL_E2E=1` + `DSH_BUDDY_POOL_E2E_CONFIRM=yes` | 用账号池凭据走完整 LLM 链路 |
 | `buddy-ratelimit-probe.e2e.spec.ts` | `DSH_BUDDY_RATELIMIT_E2E=1` + `DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes` | 对记录「限额重置」的账号实发一次请求，**判定是否真限流** |
 | `trae-channels-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | 拉真实多通道目录，并用**真实适配器**对 `glm-5.1`（agent 通道）与 `glm-5-turbo`（work 通道）各发一条最短消息 —— **验证「模型只在列出它的通道里可调用」**。消耗 2 次极小额度 |
+| `cline-chat-probe.e2e.spec.ts` | `DSH_CLINE_CHAT_E2E=1` + `DSH_CLINE_CHAT_E2E_CONFIRM=yes` | **默认只请求 `cline-free/deepseek-v4.1-flash`**（用户指定的日常验证模型）。其余 4 个免费模型需 `DSH_CLINE_CHAT_E2E_ALL_FREE=1` 才遍历。**付费模型一律拒绝请求**（见下「Cline 探针的付费保护」） |
 
 > LobsterAI **没有**发 chat 请求的 e2e —— 它的对话链路可在 Jet Hub 里人工验证
 > （选一个模型发一句话即可），单独写探针的边际价值低于维护成本。
@@ -34,6 +35,7 @@
 | `qoder-probe.e2e.spec.ts` | `DSH_QODER_E2E=1` | **只读**：凭据结构（含 `machine_id`）、令牌对 `/api/v1/userinfo` 的有效性、静态兜底模型表。**不发模型请求、不续期** |
 | `trae-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` | **只读**：凭据结构（含 machine_id / device_id）、积分余额、签到状态、远端模型列表。**不签到、不发模型请求** |
 | `trae-claim-probe.e2e.spec.ts` | `DSH_TRAE_E2E=1` + `DSH_TRAE_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
+| `cline-probe.e2e.spec.ts` | `DSH_CLINE_E2E=1` | **只读**：凭据结构（含 `account_id` 与 `workos:` 前缀）、**前缀不可剥的现场证据**（带前缀 200 / 剥掉 401）、积分余额（打印原始值供核对单位）、远端 `free` 集合与 `/models` 目录。**不发模型请求、不续期** |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。
@@ -88,7 +90,38 @@ pnpm test:e2e:trae-claim
 
 # ⚠️ 会消耗极小额度：验证多通道目录与「按模型路由通道」
 pnpm test:e2e:trae-channels
+
+# 安全：Cline 只读探针（凭据/前缀证据/余额/免费集合，不发模型请求、不续期）
+pnpm test:e2e:cline
+
+# ⚠️ 发一次 Cline 推理请求（**默认只发 cline-free/deepseek-v4.1-flash**，免费模型）
+pnpm test:e2e:cline-chat
 ```
+
+## ⚠️ Cline 探针的付费保护（请勿削弱）
+
+Cline 的免费资格是**服务端动态下发的营销状态**（`GET /api/v1/ai/cline/recommended-models`
+的 `free` 数组），**随时可能被撤销或改为计费**。因此若探针无条件遍历
+「远端此刻说是免费」的那批模型，某天某个模型转为计费后，一次 e2e 就会
+**按付费价刷掉真实 token**。
+
+三重闸门（`tests/e2e/cline-chat-probe.e2e.spec.ts`）：
+
+```
+DSH_CLINE_CHAT_E2E=1                必需
+DSH_CLINE_CHAT_E2E_CONFIRM=yes      必需（防误跑）
+DSH_CLINE_CHAT_E2E_ALL_FREE=1       可选：才遍历其余 4 个免费模型
+```
+
+默认行为：**只请求 `cline-free/deepseek-v4.1-flash`**（用户指定的日常验证模型）。
+
+另有 `assertFreeModel()` 作为**安全边界**：任何 `isFree === false` 的模型
+（无论来自 `DSH_CLINE_MODEL` 环境变量还是远端列表）都会**直接抛错、不发请求**。
+`DSH_CLINE_MODEL` 指向付费模型同样会被拒绝 —— 这是刻意设计，不要为了
+「临时测一下」而绕过它。
+
+⚠️ 遍历分支里还做了**逐个二次确认**：即使模型在目录里标着免费，
+若它已不在**当前**远端 `free` 集合中，也会跳过（避免用过期快照去请求）。
 
 > **CodeArts 凭据必须新鲜**：其 `refresh_token` 是**一次性轮换**的（用一次即
 > 作废，服务端回 `STS5.1806 the refresh token has been used`）。两个 CodeArts
