@@ -115,8 +115,15 @@ function fallbackToRemote(model: LoomyFallbackModel): LoomyRemoteModel {
 export interface LoomyAdapterOptions {
   /** 单凭据回退 ref（无账号池时）。 */
   credentialRef: CredentialRef
-  /** 解析当前可用凭据。 */
-  resolveCredential: () => Promise<LoomyCredential | undefined>
+  /**
+   * 解析当前可用凭据。
+   *
+   * ⚠️ 入参是**本轮要用的模型 id**：Loomy 的选号策略要按「该模型是否受限」
+   * 先过滤账号（限流是**按模型**记的），再按余额分档。实现**必须**把它透传给
+   * `AccountPool.getAvailableAccount` 的 `modelId` —— 早期实现传空串
+   * （等于不按模型过滤），会让模型级限流失效。
+   */
+  resolveCredential: (modelId?: string) => Promise<LoomyCredential | undefined>
   /**
    * 凭据失效时的处理。
    *
@@ -282,10 +289,13 @@ export class LoomyAdapter extends LlmAdapter {
     }
 
     // 1. 取凭据（过期则先尝试探测/刷新）
-    let credential = await this.options.resolveCredential()
+    //
+    // ⚠️ **必须把模型 id 传给选号器**：Loomy 的选号要先按「该模型是否受限」
+    // 过滤账号（限流按模型记），再按余额分档。传空串会让模型级限流失效。
+    let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isLoomyExpired(credential)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('loomy: no usable credential; log in first', 'MISSING_CREDENTIAL')

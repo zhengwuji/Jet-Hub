@@ -18,6 +18,7 @@ import { ClineAuth } from './cline-auth.js'
 import { LoomyAuth } from './loomy-auth.js'
 import { RaccoonAuth } from './raccoon-auth.js'
 import { LOOMY } from './loomy-product.js'
+import { LoomyBalanceSelector } from './loomy-balance-selector.js'
 import { RACCOON } from './raccoon-product.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
@@ -430,18 +431,79 @@ export function apply(ctx: Context): void {
   // 服务名由 LoomyAuth 依 product.id 派生，注册为 ctx.loomyAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Loomy 面板。
   const loomy = new LoomyAuth(ctx)
+
+  /**
+   * 按凭据 ref 解析 Loomy 凭据（供选号器与兜底路径共用）。
+   *
+   * 抽成局部函数而非内联两遍：选号器需要它查余额，而解析最终凭据又要用它 ——
+   * 两处若各写一遍 JSON 解析，格式一变就会只改一处。
+   */
+  const resolveLoomyCredentialByRef = async (refName: string): Promise<LoomyCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as LoomyCredential
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Loomy 的**按余额优先选号器**（负载均衡）。
+   *
+   * ⚠️ **为什么需要它**（真实缺陷）：实测 Loomy 的今日赠送额度（每天 5000）
+   * 耗尽后，服务端**继续扣永久积分且不报错** —— 「耗尽」是**静默降级**而非错误。
+   * 而本插件既有的「限流 → 换号」只在服务端返回限流错误时触发，
+   * 故对 Loomy **完全无效**：会一直烧同一个号（用户报障）。
+   *
+   * 策略：优先有今日额度的号 → 其次有永久积分的号 → 都无/查不到排最后。
+   * 档内保持手动拖拽顺序（详见 `loomy-balance-rank.ts`）。
+   */
+  const loomyBalanceSelector = new LoomyBalanceSelector({
+    product: LOOMY,
+    resolveCredential: resolveLoomyCredentialByRef,
+  })
+
   const loomyAdapter = registerLoomyLlm(ctx, {
     credentialRef: credentialRef(LOOMY.defaultCredentialRef),
-    resolveCredential: async () => {
+    /**
+     * 解析本轮该用哪个账号的凭据。
+     *
+     * ⚠️ `modelId` 由适配器传入（见 `LoomyAdapterOptions.resolveCredential`
+     * 的签名说明）—— **必须透传给 `getAvailableAccount`**，否则模型级限流
+     * 过滤失效（早期实现传空串 `''`，等于「不按模型过滤」）。
+     */
+    resolveCredential: async (modelId?: string) => {
       // 只从 Loomy 自己的账号池取账号，回退到自己的单凭据 ref，
       // 保证不会串用其它 provider 的凭据。
       // provider 实参用 LOOMY.id 而非字面量 'loomy'：写死字面量在
       // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
-      const available = await pool.getAvailableAccount(LOOMY.id, '')
-      // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
-      // 联合（历史遗留），与 `LoomyCredential` 无充分重叠，故经 `unknown` 转换。
-      // 运行时安全性由 provider 过滤保证：查询用 `LOOMY.id`，取到的必是 Loomy 凭据。
-      if (available) return available.credential as unknown as LoomyCredential
+      //
+      // ⚠️ 先按「模型未受限 + 未停用」筛出候选，**再**按余额分档选号。
+      // 余额排序只在这批候选内部进行 —— 即你的要求：
+      // 「策略建立在模型没有受限且账户没有被设置为停用的基础上」。
+      const candidates = pool
+        .listAccountsByProvider(LOOMY.id)
+        .filter(a => a.enabled)
+        .filter((a) => {
+          // 与 `getAvailableAccount` 的限流判据保持一致（空 modelId = 不过滤）。
+          const key = modelId ?? ''
+          if (key.length === 0) return true
+          if (!a.modelRateLimits) return true
+          const resetAt = a.modelRateLimits[key]
+          return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+        })
+        .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
+
+      if (candidates.length > 0) {
+        const picked = await loomyBalanceSelector.select(candidates)
+        if (picked !== undefined) {
+          const credential = await resolveLoomyCredentialByRef(picked.account.credentialRef)
+          if (credential !== undefined) return credential
+        }
+      }
+
+      // 兜底：账号池为空/全部不可解析时，退回单凭据 ref。
       const resolved = await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
       if (!resolved) return undefined
       try {

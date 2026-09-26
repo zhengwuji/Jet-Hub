@@ -31,6 +31,40 @@ describe('Loomy 在 index.ts 的接线', () => {
     expect(indexSource).toMatch(/loomy\.refreshAccountCredential\(available\.entry\.credentialRef\)/)
   })
 
+  /**
+   * ⚠️ **按余额优先选号（负载均衡）**。
+   *
+   * **真实缺陷**：实测 Loomy 今日额度（每天 5000）耗尽后**继续扣永久积分
+   * 且不报错**（静默降级），而既有「限流 → 换号」只在服务端返回限流错误时
+   * 触发，故对它完全无效 —— 会一直烧同一个号（用户报障）。
+   */
+  it('接入按余额优先的选号器（负载均衡）', () => {
+    expect(indexSource).toContain("from './loomy-balance-selector.js'")
+    expect(indexSource).toContain('new LoomyBalanceSelector(')
+    expect(indexSource).toContain('loomyBalanceSelector.select(')
+    // 候选必须先按「未停用」过滤（用户要求：策略建立在未停用基础上）
+    expect(indexSource).toMatch(/listAccountsByProvider\(LOOMY\.id\)[\s\S]{0,300}?filter\(a => a\.enabled\)/)
+    // 再按模型限流过滤（用户要求：策略建立在模型未受限基础上）
+    expect(indexSource).toMatch(/modelRateLimits\[key\]/)
+  })
+
+  /**
+   * ⚠️ **模型 id 必须透传给选号器**：限流是**按模型**记的，
+   * 传空串等于「不按模型过滤」，会让模型级限流失效（原实现的疏漏）。
+   */
+  it('resolveCredential 接收并透传 modelId（限流按模型记）', () => {
+    const adapterSource = readFileSync(
+      resolve(here, '../../src/loomy-adapter.ts'), 'utf8',
+    )
+    // 适配器侧：声明与调用都带 modelId
+    expect(adapterSource).toMatch(/resolveCredential: \(modelId\?: string\)/)
+    expect(adapterSource).toContain('this.options.resolveCredential(options.model)')
+
+    // 宿主侧：接住 modelId 并用它过滤限流
+    expect(indexSource).toMatch(/resolveCredential: async \(modelId\?: string\)/)
+    expect(indexSource).toContain('const key = modelId ?? ')
+  })
+
   it('settings namespace 已注册', () => {
     expect(indexSource).toMatch(/registerProviderSettings\([\s\S]*?'llm-loomy'/)
   })

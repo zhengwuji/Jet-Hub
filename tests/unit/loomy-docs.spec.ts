@@ -126,4 +126,30 @@ describe('Loomy 文档覆盖', () => {
   it('AGENTS.md 概述行把 provider 数量更新为七个', () => {
     expect(agents).toMatch(/七个 LLM provider 路由/)
   })
+
+  /**
+   * ⚠️ **负载均衡策略必须写进文档**。
+   *
+   * 真实缺陷：Loomy **不会因积分耗尽而报错**（静默降级为扣永久积分），
+   * 故既有「限流 → 换号」对它无效，会一直烧同一个号。
+   */
+  it('README 写明按余额优先选号的负载均衡策略', () => {
+    expect(readme).toMatch(/负载均衡/)
+    expect(readme).toMatch(/dailyBalance > 0/)
+    expect(readme).toMatch(/permanentBalance > 0/)
+    // 三个关键约定
+    expect(readme).toMatch(/手动顺序/)
+    expect(readme).toMatch(/60 秒/)
+  })
+
+  it('AGENTS.md 写明「Loomy 不会因积分耗尽报错」与三条不可改的约定', () => {
+    expect(agents).toMatch(/静默降级/)
+    expect(agents).toMatch(/getAvailableAccount/)
+    // 档内保序 / 查询失败归最后一档 / 先过滤再分档
+    expect(agents).toMatch(/档内保持手动拖拽顺序/)
+    expect(agents).toMatch(/查询失败归最后一档/)
+    expect(agents).toMatch(/未停用 \+ 该模型未受限/)
+    // modelId 必须透传（原实现疏漏）
+    expect(agents).toMatch(/modelId/)
+  })
 })

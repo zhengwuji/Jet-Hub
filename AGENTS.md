@@ -2584,6 +2584,44 @@ loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
 显示 `永久 15000 · 每日 4992`；其余 provider 的多个同类资源包仍显示
 「N/M 个资源包有效」。两种形态互斥（`isLoomyTwoPools`）。
 
+### ⚠️ 多账号负载均衡：Loomy **不会**因积分耗尽报错，既有换号机制对它无效
+
+**真实缺陷**（用户报障）：Loomy 会**一直消耗同一个号**，从不触发限流换号。
+
+**根因**（实测 2026-09-26）：今日赠送额度（每天 5000）耗尽后，服务端
+**继续扣永久积分且照常返回** —— 「耗尽」是**静默降级**，不是错误。
+而本插件既有的换号机制（`getAvailableAccount` 按 `modelRateLimits` 排除账号）
+**只在服务端返回限流错误时触发**，故对 Loomy 完全无效。
+
+**修法**：Loomy 用**独立的按余额优先选号**（`src/loomy-balance-rank.ts`
+纯函数 + `src/loomy-balance-selector.ts` 带缓存的选择器）：
+
+| 优先级 | 判据 |
+|---|---|
+| 1 | `dailyBalance > 0`（今日额度每天刷新、不用会浪费） |
+| 2 | `permanentBalance > 0` |
+| 3 | 其余（含**查询失败**） |
+
+三条**不能改**的约定：
+
+1. **档内保持手动拖拽顺序**，不按余额大小重排（用户明确要求，
+   与 `getAvailableAccount` 的既有语义一致）。
+2. **查询失败归最后一档**（不是第一档）—— 用户明确要求：
+   宁可先用能确认余额的号。
+3. **候选先按「未停用 + 该模型未受限」过滤，再按余额分档** ——
+   用户明确要求「策略建立在模型没有受限且账户没有被设置为停用的基础上」。
+   ⚠️ 故 `resolveCredential` **必须接住并透传 `modelId`**（限流是**按模型**记的）：
+   适配器侧 `resolveCredential(modelId?)` → 宿主侧用它过滤
+   `a.modelRateLimits[key]`。早期实现传空串 `''`，等于不按模型过滤。
+
+余额查询**带 60 秒 TTL 缓存**（`LOOMY_BALANCE_CACHE_TTL_MS`）：每次选号都实时查
+所有账号会显著变慢（N 个账号 = N 次网络往返）。
+
+⚠️ **不要**把 Loomy 塞回 `getAvailableAccount` 的通用逻辑里 —— 那个函数服务
+全部 8 个 provider，而「按余额分档」是 Loomy 独有的需求（其他 provider 的
+积分模型不同，且多数会返回限流错误）。Loomy 的 `resolveCredential` 自己
+`listAccountsByProvider` + 过滤 + 调选择器。
+
 ### ⚠️ AccessKey 明文入库（用户明确同意）
 
 `src/loomy-product.ts` 内含从 Loomy 客户端解密得到的讯飞账号 AccessKey。
