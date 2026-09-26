@@ -599,8 +599,17 @@ export function apply(ctx: Context): void {
       // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
       // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
       const available = await pool.getAvailableAccount(RACCOON.id, '')
-      if (available) await raccoon.refreshAccountCredential(available.entry.credentialRef)
-      else await raccoon.refresh()
+      if (available) {
+        // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
+        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
+        //（真实缺陷：JWT 已续到 15:09、账号池仍是 12:02，相差 3.1 小时）。
+        // 这条路径正是「发消息时按需续期」，故它是最常触发回写的地方。
+        await raccoon.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await raccoon.refresh()
+      }
     },
     // 远端模型目录：委托给 RaccoonAuth.fetchModels（它负责 Bearer 头与
     // visible 过滤 + raccoonDisplayName 生成含倍率的展示名）。

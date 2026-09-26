@@ -28,7 +28,29 @@ describe('Raccoon 在 index.ts 的接线', () => {
   })
 
   it('refresh 走 refreshAccountCredential（刷新解析凭据所用的那个账号）', () => {
-    expect(indexSource).toMatch(/raccoon\.refreshAccountCredential\(available\.entry\.credentialRef\)/)
+    expect(indexSource).toMatch(/raccoon\.refreshAccountCredential\(/)
+    expect(indexSource).toMatch(/available\.entry\.credentialRef/)
+  })
+
+  /**
+   * ⚠️ **真实缺陷回归**（用户报障）：「凭据过期后显示过期，但是似乎是续期
+   * 成功了还是没有真正的过期，我发送会话成功从 6300 扣分了。」
+   *
+   * 根因：续期成功后没把新的 `expiresAt` 写回账号池，而 Jet Hub UI 读的
+   * 正是账号池。实测该账号 JWT `exp` 已是 15:09（有效）、账号池却是
+   * 12:02（已过期），**相差 3.1 小时**。
+   *
+   * 判据：`index.ts` 的续期路径必须把 `pool` 与 `entry.id` 传下去，
+   * 否则 `syncAccountExpiry` 无从回写。
+   */
+  it('⚠️ 续期调用必须传 pool 与 accountId（否则 UI 假过期）', () => {
+    // 适配器的 refresh 回调 = 「发消息时按需续期」，最常触发的路径
+    expect(
+      indexSource,
+      '适配器 refresh 回调必须传 pool + entry.id，否则账号池的 expiresAt 不会更新',
+    ).toMatch(
+      /refreshAccountCredential\(\s*available\.entry\.credentialRef,\s*pool,\s*available\.entry\.id,?\s*\)/,
+    )
   })
 
   it('settings namespace 已注册', () => {

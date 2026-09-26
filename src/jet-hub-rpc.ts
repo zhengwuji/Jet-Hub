@@ -1190,7 +1190,10 @@ function registerJetHubEndpoints(
             case RACCOON.id:
               // raccoon **有** refresh 端点（refresh_token 轮换），这里是真续期。
               // ⚠️ 只读写传入的 ref，不碰默认单凭据 ref。
-              await raccoon.refreshAccountCredential(entry.credentialRef)
+              // ⚠️ **必须传 pool + entry.id**：续期后要把新的 `expiresAt` 写回
+              // 账号池，否则 UI 一直显示「已过期」（真实缺陷：JWT 已续到 15:09、
+              // 账号池仍是 12:02，相差 3.1 小时，但功能完全正常）。
+              await raccoon.refreshAccountCredential(entry.credentialRef, pool, entry.id)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
