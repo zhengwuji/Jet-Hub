@@ -403,4 +403,39 @@ export class BuddyAuth extends Service {
   private get fetchImpl(): typeof fetch {
     return this.options.fetcher ?? fetch
   }
+
+}
+
+/**
+ * 构造腾讯系（buddy / workbuddy）适配器的 `refresh` 回调。
+ *
+ * ⚠️ **必须刷新 `resolveCredential` 实际用到的那一个账号**，而不是
+ * {@link BuddyAuth.refresh} 读写的默认单凭据 ref（`BUDDY_ACCESS_TOKEN` /
+ * `WORKBUDDY_ACCESS_TOKEN`）。错配的后果是**整轮不可恢复的失败**
+ * （真实缺陷，2026-09-26 由用户报障定位：账号池里 5 个 workbuddy 账号、
+ * 凭据全部有效，却一直报「未配置凭据，请先登录」）：
+ *
+ * 1. Jet Hub 的登录入口只写 `WORKBUDDY_ACCOUNT_XXX`，**从不写**那个固定
+ *    ref —— 于是适配器在 `buddy-adapter.ts` 的 401/403 分支调 `refresh()`
+ *    时，本类 `refresh()` 里的 `resolve` 恒为 null，抛
+ *    「未配置凭据，请先登录」。该文案**完全是误导**：账号池里凭据齐全。
+ * 2. 那个 401/403 分支在刷新后即返回（修复前），**不走**账号轮换 ——
+ *    池里其余可用账号一个也用不上。
+ * 3. 刷新抛错前没有写回任何凭据 → 下一轮仍取池首账号 → 再次 401 →
+ *    再次同一条死路，表现为「中断后继续 goal 永远复现同一错误」的
+ *    **自锁**，重试与重启都无效。
+ *
+ * 池内无账号时才回退到 {@link BuddyAuth.refresh}（单凭据路径，供未迁移的
+ * 老数据）。与 LobsterAI / Qoder / TRAE 的既有实现同形。
+ */
+export function createPoolRefresh(
+  pool: Pick<AccountPool, 'getAvailableAccount'>,
+  productId: string,
+  auth: Pick<BuddyAuth, 'refreshAccountCredential' | 'refresh'>,
+): () => Promise<void> {
+  return async () => {
+    const available = await pool.getAvailableAccount(productId, '')
+    if (available) await auth.refreshAccountCredential(available.entry.credentialRef)
+    else await auth.refresh()
+  }
 }

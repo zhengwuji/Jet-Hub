@@ -10,7 +10,7 @@ import { registerClineLlm } from './cline-adapter.js'
 import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
 import { registerRaccoonLlm } from './raccoon-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
-import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
+import { BUDDY_CREDENTIAL_REF, BuddyAuth, createPoolRefresh } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
@@ -222,7 +222,10 @@ export function apply(ctx: Context): void {
         return undefined
       }
     },
-    refresh: () => buddy.refresh(),
+    // 刷新**账号池里实际使用的那一个账号**，而不是默认单凭据 ref ——
+    // 后者在 Jet Hub 登录路径下根本不存在，会把 401 报成「未配置凭据」
+    // 并自锁。详见 createPoolRefresh 的注释。
+    refresh: createPoolRefresh(pool, 'buddy', buddy),
     fetchRemoteModels: () => buddy.fetchModels(pool),
     readImage: makeReadImage(ctx),
     accountPool: pool,
@@ -250,7 +253,9 @@ export function apply(ctx: Context): void {
         return undefined
       }
     },
-    refresh: () => workbuddy.refresh(),
+    // 同上：必须刷池内账号（`WORKBUDDY_ACCESS_TOKEN` 从未被写入过）。
+    // 这条正是「workbuddy + deepseek-v4.1-flash 一直报未配置凭据」的根因。
+    refresh: createPoolRefresh(pool, 'workbuddy', workbuddy),
     fetchRemoteModels: () => workbuddy.fetchModels(pool),
     readImage: makeReadImage(ctx),
     accountPool: pool,

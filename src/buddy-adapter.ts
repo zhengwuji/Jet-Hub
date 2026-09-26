@@ -1041,15 +1041,76 @@ export class BuddyAdapter extends LlmAdapter {
     }
     const body = JSON.stringify(bodyObj)
 
-    // 4. 发送请求（401/403 时刷新一次凭据后重试）
+    // 4. 发送请求（401/403 时刷新当前账号一次，仍认证失败则换号重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      await this.options.refresh()
-      credential = await this.options.resolveCredential()
-      if (credential === undefined || credential.access_token.length === 0) {
-        throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: response.status })
+      // ⚠️ 真实缺陷（2026-09-26，用户报障「账号池里明明有 3~4 个账号没被限流，
+      // 却报『未配置凭据，请先登录』」）。早期实现在这里刷新一次就 `return`：
+      //
+      // ① **不换号** —— 池首账号被服务端拒绝（401/403）时，池里其余可用账号
+      //    一个都用不上。轮换逻辑（下一段）只覆盖 `isRateLimited` 的 429 类，
+      //    而 401/403 在这里就返回了。
+      // ② **刷新失败直接冒泡** —— 刷新接线一旦指向单凭据 ref（见 `src/index.ts`
+      //    的 buddyRefresh 注释），抛出的「未配置凭据，请先登录」与真实原因
+      //    毫无关系：账号池凭据完好，只是刷错了 ref。
+      // ③ **下一轮必然复现** —— 刷新抛错前没有写回任何凭据，池首账号不变，
+      //    于是「中断后继续 goal」永远撞同一条死路（自锁）。
+      //
+      // 现在的次序：刷新当前账号 → 重试 → 仍认证失败则按池顺序换号，
+      // 全部换完才报 AUTH。
+      const authStatus = response.status
+      // 已尝试过的账号：换号时必须排除，否则会拿回刚失败的那个原地打转。
+      const triedAuth = new Set<string>()
+      if (currentAccountId !== '') triedAuth.add(currentAccountId)
+      let refreshedCredential: BuddyCredential | undefined
+      try {
+        await this.options.refresh()
+        refreshedCredential = await this.options.resolveCredential()
+      } catch (error) {
+        // 刷新失败**不致命**：换号仍有机会，单个账号故障不该让整轮陪葬。
+        console.warn(`[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：${String(error)}`)
       }
-      response = await this.send(credential, body, options)
+      if (refreshedCredential !== undefined && refreshedCredential.access_token.length > 0) {
+        credential = refreshedCredential
+        response = await this.send(credential, body, options)
+        if (response.ok) {
+          yield* this.consumeSse(response, options)
+          return
+        }
+      }
+      let rotated = false
+      if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
+        for (;;) {
+          // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
+          const next = await this.options.accountPool.getAvailableAccount(
+            this.product.id, options.model, triedAuth,
+          )
+          if (!next || triedAuth.has(next.entry.id)) break
+          triedAuth.add(next.entry.id)
+          rotated = true
+          credential = next.credential as BuddyCredential
+          currentAccountId = next.entry.id
+          response = await this.send(credential, body, options)
+          if (response.ok) {
+            yield* this.consumeSse(response, options)
+            return
+          }
+          // 只有认证类失败才继续换号；429/5xx/400 交给下面的既有分类逻辑。
+          if (response.status !== 401 && response.status !== 403) break
+        }
+      }
+      // 刷新既没产出凭据、也没换到别的账号：保留原有的可诊断报错。
+      if (refreshedCredential === undefined && !rotated) {
+        throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: authStatus })
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new LlmError(
+          `buddy: 所有账号均认证失败（HTTP ${authStatus}），请在 Jet Hub 重新登录`,
+          'AUTH',
+          { status: authStatus },
+        )
+      }
+      // 换号途中遇到非认证类错误 → 落到下面的限流换号 / 错误码归类逻辑。
     }
     if (!response.ok) {
       let errorText = await response.text().catch(() => '')
