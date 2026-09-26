@@ -7,7 +7,15 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import {
+  allModelsDisabled,
+  disablingLeavesNoEnabledAccount,
+} from './account-model-link.js';
 import { bulkButtonState } from './model-bulk.js';
+import {
+  filterModels,
+  isFilterActive,
+} from './model-filter.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
@@ -428,6 +436,12 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
  * 刻意不做本地乐观更新：模型列表与黑名单都以 Host 为准（可能是远端拉取的
  * 结果），本地猜测状态容易与真实持久化结果分叉。这里等 RPC 返回后再翻状态，
  * 期间禁用开关，保证界面上看到的就是服务端已接受的。
+ *
+ * ⚠️ **根元素是 `<label>`，且内部只能有这 1 个 checkbox。**
+ * 整行是 label，故点行内任意位置（含模型名）都会切换这个开关 —— 这是既有交互。
+ * 一旦再插入第二个 checkbox（如曾经加过的多选勾选框），浏览器会把点击激活到
+ * **第一个**可标记控件，「点模型名」就变成切换那个新控件、可见性开关纹丝不动
+ * （实测确认的行为倒退）。若将来确需多选，必须先把行容器改成 `<div>`。
  */
 function ModelToggle({ model, busy, onToggle }) {
   return React.createElement('label', {
@@ -475,6 +489,23 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
    * 黑名单是整体写入，并发提交必然互相覆盖（后写的那次会丢掉先写的改动）。
    */
   const [bulkBusy, setBulkBusy] = React.useState(false);
+  /**
+   * 搜索词与状态筛选。
+   *
+   * Cline 的远端目录实测约 478 条，搜索与筛选确实有用。这两个状态只影响
+   * **渲染**，不改变 `models` 本身，故清空筛选即恢复全量。
+   *
+   * ⚠️ **刻意不做多选勾选框**（曾引入真实的行为倒退，已回退）：
+   * `ModelToggle` 的根元素是 `<label>`，原先 label 内只有 1 个 checkbox，
+   * 点行内任意位置（如模型名）都会切换**可见性开关**。一旦插入第二个 checkbox，
+   * 浏览器把点击激活到**第一个**可标记控件 —— 「点模型名」会变成切换勾选、
+   * 可见性开关纹丝不动。若将来确需多选，必须先把行容器从 `<label>` 改成 `<div>`。
+   *
+   * ⚠️ **也刻意不做渲染上限**：改动前 478 条就是一次性全渲染、工作正常，
+   * 加「显示更多」凭空多一次点击，属于功能收缩。
+   */
+  const [query, setQuery] = React.useState('');
+  const [statusFilter, setStatusFilter] = React.useState('all');
   const mounted = React.useRef(true);
 
   const load = React.useCallback(async () => {
@@ -537,6 +568,23 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const bulk = bulkButtonState(models, bulkBusy);
 
   /**
+   * 筛选后的列表。`filterModels` 是纯函数（见 model-filter.js）：这里只负责
+   * 把当前搜索词与状态筛选项传进去。
+   *
+   * **不做渲染上限**：改动前 478 条就是一次性全渲染、工作正常；加「显示更多」
+   * 只会凭空多一次点击（属于功能收缩），故这里直接渲染全部筛选结果。
+   */
+  const filtered = filterModels(all, { query, status: statusFilter });
+  /** 是否有生效中的筛选。决定是否渲染「清空筛选」按钮。 */
+  const filtering = isFilterActive({ query, status: statusFilter });
+
+  /** 清空搜索与筛选。 */
+  const resetFilters = () => {
+    setQuery('');
+    setStatusFilter('all');
+  };
+
+  /**
    * 批量打开/关闭全部模型。
    *
    * 走**批量端点**而不是循环调用 `model.setDisabled`：后者会发 N 次请求、写 N 次
@@ -570,7 +618,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   };
 
   const dialog = React.createElement('div', {
-    className: 'dim-jh-modalOverlay',
+    // `--top`：顶部锚定。列表长度随搜索变化，若垂直居中会让弹窗整体上下跳动
+    //（见 jet-hub-styles.js 中该修饰类的说明）。
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
     // 点击遮罩关闭；点击弹窗内部不关闭（stopPropagation 由内层容器负责）。
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
@@ -586,7 +636,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           React.createElement('span', { className: 'dim-jh-modalSubtitle' }, providerLabel),
           phase === 'ready'
             ? React.createElement('span', { className: 'dim-jh-modelPanelCount' },
-                `${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`)
+                filtering
+                  ? `${filtered.length} / ${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`
+                  : `${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`)
             : null),
         React.createElement('div', { className: 'dim-jh-modelPanelActions' },
           React.createElement('button', {
@@ -601,6 +653,35 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      // 搜索 + 状态筛选：Cline 的目录实测近 500 条，没有它就只能一页页翻。
+      // 只在列表可用时渲染（载入中/出错时没有可筛的内容）。
+      phase === 'ready' && all.length > 0
+        ? React.createElement('div', { className: 'dim-jh-modelFilterBar' },
+            React.createElement('input', {
+              type: 'search',
+              className: 'dim-jh-input dim-jh-modelSearch',
+              placeholder: '搜索模型名或 id…',
+              value: query,
+              'aria-label': '搜索模型',
+              onChange: (event) => setQuery(event.target.value),
+            }),
+            React.createElement('div', { className: 'dim-jh-modelStatusFilter', role: 'group', 'aria-label': '按状态筛选' },
+              [['all', '全部'], ['enabled', '已打开'], ['disabled', '已关闭']].map(([value, label]) =>
+                React.createElement('button', {
+                  key: value,
+                  className: 'dim-jh-btn',
+                  'data-active': statusFilter === value ? 'true' : 'false',
+                  'aria-pressed': statusFilter === value ? 'true' : 'false',
+                  onClick: () => setStatusFilter(value),
+                }, label))),
+            filtering
+              ? React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  title: '清空搜索词与状态筛选，恢复完整列表。',
+                  onClick: resetFilters,
+                }, '清空筛选')
+              : null)
+        : null,
       // 批量工具条：只在列表可用时渲染。计数从标题挪到这里，避免与标题争宽。
       phase === 'ready' && all.length > 0
         ? React.createElement('div', { className: 'dim-jh-modelBulkBar' },
@@ -636,16 +717,25 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
             ? React.createElement('div', { className: 'dim-jh-modalBody' },
                 React.createElement('div', { className: 'dim-jh-empty' },
                   React.createElement('p', null, '该 Provider 当前没有可用的模型。')))
-            : React.createElement('div', { className: 'dim-jh-modalBody' },
-                React.createElement('div', { className: 'dim-jh-modelList' },
-                  all.map(model => React.createElement(ModelToggle, {
-                    key: model.id,
-                    model,
-                    // 批量提交期间一并禁用单条开关：黑名单是整体写入，
-                    // 并发提交必然互相覆盖（后写的会丢掉先写的改动）。
-                    busy: busyIds.has(model.id) || bulkBusy,
-                    onToggle: (id, disabled) => void toggleModel(id, disabled),
-                  }))))));
+            // 筛选后无结果：必须与「该 Provider 没有模型」区分开，否则用户会
+            // 以为模型全丢了，而实际上只是搜索词没命中。
+            : filtered.length === 0
+              ? React.createElement('div', { className: 'dim-jh-modalBody' },
+                  React.createElement('div', { className: 'dim-jh-empty' },
+                    React.createElement('p', null, '没有符合当前搜索与筛选条件的模型。'),
+                    React.createElement('button', { className: 'dim-jh-btn', onClick: resetFilters }, '清空筛选')))
+              : React.createElement('div', { className: 'dim-jh-modalBody' },
+                  React.createElement('div', { className: 'dim-jh-modelList' },
+                    // 直接渲染全部筛选结果（**无渲染上限**）：改动前 478 条就是
+                    // 一次性全渲染、工作正常。
+                    filtered.map(model => React.createElement(ModelToggle, {
+                      key: model.id,
+                      model,
+                      // 批量提交期间一并禁用单条开关：黑名单是整体写入，
+                      // 并发提交必然互相覆盖（后写的会丢掉先写的改动）。
+                      busy: busyIds.has(model.id) || bulkBusy,
+                      onToggle: (id, disabled) => void toggleModel(id, disabled),
+                    }))))));
 
   // 与登录弹窗（.dim-jh-loginOverlay）同款做法：直接渲染在组件树内，靠
   // position: fixed 覆盖全屏。**刻意不用 createPortal** —— 客户端模块表由
@@ -959,10 +1049,98 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 停用 / 启用账号。
+   *
+   * ## 与模型可见性的联动（用户明确要求）
+   *
+   * 门控判据刻意**不看 `enabled`**（「停用只应影响自动选号，与是否已登录无关」，
+   * 见 `AccountPool.hasLoggedInAccount`）—— 这是整体设计，此处不改它。
+   *
+   * 但用户停用某 provider 的**最后一个**启用账号后，它的模型仍留在对话框的模型
+   * 选择器里（凭据还在，目录门控判为可见），只能再去「显示列表」里逐个关。
+   * 于是这里把它变成**一次显式选择**：
+   *
+   * - 停用后该 provider 不再有任何启用账号 → 问一句「是否同时关闭它的全部模型」；
+   * - 反过来，启用一个此前无启用账号的 provider、且它的模型恰好全关时 →
+   *   问一句「是否同时打开」（很可能是上次停用时连带关掉的）。
+   *
+   * 两个方向都**由用户决定**，不做静默联动：静默关闭会让「停用账号」这个看似
+   * 与模型无关的操作产生意外副作用；静默打开则可能把用户特意关掉的模型放出来。
+   *
+   * 判定逻辑在 `./account-model-link.js`（纯函数，可单测）。
+   */
   const toggleAccount = async (accountId, enabled) => {
     try {
+      // 必须在提交**之前**判定：提交后列表已刷新，「是否还有启用账号」的答案
+      // 就是变更后的状态了。
+      const isLastEnabled = !enabled
+        && disablingLeavesNoEnabledAccount(accountsRef.current, accountId, provider);
+      const isFirstEnabled = enabled
+        && !accountsRef.current.some(a => a.provider === provider && a.id !== accountId && a.enabled !== false);
       await rpcCall('account.update', { accountId, patch: { enabled } });
       await loadAccounts();
+
+      // 停用方向：提示是否连带关闭模型。
+      if (isLastEnabled) {
+        const closeModels = confirm(
+          `该 Provider 已没有启用账号，它的模型不会再被使用。\n\n`
+          + `是否同时关闭它的全部模型（从对话框的模型选择里移除）？\n`
+          + `选择「取消」则只停用账号，模型保持现状。`,
+        );
+        if (closeModels) {
+          try {
+            await rpcCall('model.setAllDisabled', { provider, disabled: true });
+          } catch (caught) {
+            // 账号已经停用成功，联动失败不能回滚它 —— 只提示，让用户可去
+            // 「显示列表」手动处理。
+            console.error('[jet-hub] cascade disable models failed:', caught);
+            if (mounted.current) {
+              setProbeNotice({
+                tone: 'warn',
+                text: `账号已停用，但关闭模型失败：${caught?.message || '未知错误'}。可在「显示列表」中手动关闭。`,
+                details: [],
+              });
+            }
+          }
+        }
+        return;
+      }
+
+      // 启用方向：只在「此前一个启用账号都没有」时才查模型目录（避免每次启用
+      // 都多发一次 RPC），且全关时才提示打开。
+      if (isFirstEnabled) {
+        let models;
+        try {
+          const res = await rpcCall('model.list', { provider });
+          models = res.models || [];
+        } catch (caught) {
+          // 目录读不出来就静默跳过联动：账号启用本身已经成功，不该因目录故障
+          // 而报错。用户仍可去「显示列表」手动打开。
+          console.error('[jet-hub] read models for cascade enable failed:', caught);
+          models = null;
+        }
+        if (models !== null && allModelsDisabled(models)) {
+          const openModels = confirm(
+            `该 Provider 的 ${models.length} 个模型当前全部处于关闭状态。\n\n`
+            + `是否同时打开它们（让模型重新出现在对话框的模型选择里）？`,
+          );
+          if (openModels) {
+            try {
+              await rpcCall('model.setAllDisabled', { provider, disabled: false });
+            } catch (caught) {
+              console.error('[jet-hub] cascade enable models failed:', caught);
+              if (mounted.current) {
+                setProbeNotice({
+                  tone: 'warn',
+                  text: `账号已启用，但打开模型失败：${caught?.message || '未知错误'}。可在「显示列表」中手动打开。`,
+                  details: [],
+                });
+              }
+            }
+          }
+        }
+      }
     } catch (caught) {
       console.error('[jet-hub] toggle failed:', caught);
     }
