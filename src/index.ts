@@ -67,8 +67,12 @@ export const inject = ['credentials', 'commands', 'llm']
  * `TypeError: ... .toJSON is not a function`，进而使所有依赖 settings 的界面
  * （模型设置页、sidebar 的 settings.get/shell.get）全部失败。
  */
+const providersSchema = Schema.dict(Schema.any()).default({})
+
 export const Config = Schema.object({
-  providers: Schema.dict(Schema.any()).default({}).volatile(),
+  providers: typeof (providersSchema as any)?.volatile === 'function'
+    ? (providersSchema as any).volatile()
+    : providersSchema,
 })
 
 /**
