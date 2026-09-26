@@ -86,7 +86,23 @@ describe('老契约后端（SettingsStore）', () => {
     expect(store.load()).toEqual({
       accounts: [ACCOUNT],
       disabledModels: { buddy: { 'glm-5.2': true } },
+      loomyPermanentLocked: false,
     })
+  })
+
+  /**
+   * ⚠️ 老契约后端也必须持久化锁定开关（用户要求「需要支持持久化」）。
+   */
+  it('Loomy 永久积分锁定在 settings 后端可读回', async () => {
+    let saved: Record<string, unknown> | undefined
+    const scope = {
+      get: () => saved,
+      replace: async (section: object) => { saved = section as Record<string, unknown> },
+    }
+    const store = createJetHubStore(makeCtx({ register: () => scope, describe: () => [] }))
+    await store.save({ accounts: [], disabledModels: {}, loomyPermanentLocked: true })
+    expect(saved?.loomyPermanentLocked).toBe(true)
+    expect(store.load()?.loomyPermanentLocked).toBe(true)
   })
 })
 
@@ -102,7 +118,42 @@ describe('文件后端（FileStore）', () => {
     expect(reader.load()).toEqual({
       accounts: [ACCOUNT],
       disabledModels: { buddy: { 'glm-5.2': true } },
+      // 新字段缺省 false（解锁）—— 与既有行为一致
+      loomyPermanentLocked: false,
     })
+  })
+
+  /**
+   * ⚠️ Loomy「锁定永久积分」必须**跨重启持久化**（用户明确要求）。
+   */
+  it('Loomy 永久积分锁定可跨实例读回', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, loomyPermanentLocked: true })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.loomyPermanentLocked).toBe(true)
+  })
+
+  it('老文档没有该字段时缺省为 false（不误锁）', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    // 手工写入一份「没有 loomyPermanentLocked」的旧文档
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.loomyPermanentLocked).toBe(false)
+  })
+
+  it('该字段非布尔值时不误判为锁定', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, loomyPermanentLocked: 'yes' }),
+      'utf-8',
+    )
+    // 只认显式 true（与 disabledModels 的「只认显式 true」同一约定）
+    expect(createJetHubStore(makeCtx(undefined)).load()?.loomyPermanentLocked).toBe(false)
   })
 
   it('文档损坏时不抛错，按空状态启动', () => {
@@ -144,7 +195,11 @@ describe('文件后端（FileStore）', () => {
       ['refs:', '  BUDDY_ACCOUNT_ABC12345: {"access_token":"x"}'].join('\n'),
       'utf-8',
     )
-    expect(createJetHubStore(makeCtx(undefined)).load()).toEqual({ accounts: [], disabledModels: {} })
+    expect(createJetHubStore(makeCtx(undefined)).load()).toEqual({
+      accounts: [],
+      disabledModels: {},
+      loomyPermanentLocked: false,
+    })
   })
 })
 

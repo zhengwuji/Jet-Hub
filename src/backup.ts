@@ -12,8 +12,12 @@ import { BACKUP_FORMAT, BACKUP_VERSION, type BackupPayload } from './types.js'
 export interface BackupPool {
   /** 读取完整状态快照（账号列表 + 模型黑名单）。 */
   getStateSnapshot(): JetHubState
-  /** 整体替换账号列表与模型黑名单。 */
-  replaceAll(accounts: readonly ProviderAccountEntry[], disabledModels: ModelDisableMap): Promise<void>
+  /** 整体替换账号列表、模型黑名单与 Loomy 锁定开关。 */
+  replaceAll(
+    accounts: readonly ProviderAccountEntry[],
+    disabledModels: ModelDisableMap,
+    loomyPermanentLocked?: boolean,
+  ): Promise<void>
 }
 
 /** 备份操作所需的凭据服务最小接口（`ctx.credentials` 结构上满足）。 */
@@ -88,6 +92,7 @@ export async function exportBackup(
       credentials: exported,
       accounts: state.accounts,
       disabledModels: state.disabledModels,
+      loomyPermanentLocked: state.loomyPermanentLocked === true,
     },
     warnings,
   }
@@ -155,7 +160,7 @@ export async function importBackup(
       skipped.push(refName)
     }
   }
-  await pool.replaceAll(payload.accounts, payload.disabledModels)
+  await pool.replaceAll(payload.accounts, payload.disabledModels, payload.loomyPermanentLocked)
   // 统计已过期账号：expiresAt 是毫秒时间戳，缺失或 NaN 视为「未知」不算过期
   const now = Date.now()
   const expiredAccounts = payload.accounts.filter((entry) =>

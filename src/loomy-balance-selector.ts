@@ -23,7 +23,13 @@
 import type { LoomyCredential } from './loomy.js'
 import type { LoomyProduct } from './loomy-product.js'
 import { fetchLoomyCreditDetail } from './loomy-credits.js'
-import { rankLoomyAccountsByBalance, type LoomyAccountBalance } from './loomy-balance-rank.js'
+import {
+  loomyBalanceTier,
+  loomyTierUsable,
+  rankLoomyAccountsByBalance,
+  type LoomyAccountBalance,
+  type LoomyTierOptions,
+} from './loomy-balance-rank.js'
 
 /** 余额缓存 TTL（毫秒）。用户指定 60 秒。 */
 export const LOOMY_BALANCE_CACHE_TTL_MS = 60_000
@@ -135,11 +141,18 @@ export class LoomyBalanceSelector {
    *
    * ⚠️ 返回的是**第一个**候选（而不是随机），因为档内顺序 = 用户手动顺序。
    *
+   * ⚠️ **锁定永久积分时（`allowPermanent: false`）**：只剩永久积分的账号
+   * 落入 `none` 档（不可用）。若**全部候选都不可用**，本方法返回 `undefined`
+   * —— 调用方据此报「无可用账号」的明确错误（用户要求），而不是硬着头皮
+   * 用永久积分。
+   *
    * @param candidates - 已按 `enabled` 与模型限流过滤过的候选（顺序即手动优先级）。
-   * @returns 选中的账号 + 其余额；候选为空时返回 undefined。
+   * @param options - `allowPermanent` 为 false 时禁止消耗永久积分。
+   * @returns 选中的账号 + 其余额；**无可用账号**时返回 undefined。
    */
   async select(
     candidates: readonly LoomyCandidateAccount[],
+    options: LoomyTierOptions = {},
   ): Promise<{ account: LoomyCandidateAccount; balance: LoomyAccountBalanceEntry } | undefined> {
     if (candidates.length === 0) return undefined
 
@@ -149,9 +162,20 @@ export class LoomyBalanceSelector {
 
     const ranked = rankLoomyAccountsByBalance(
       balances.map((b) => ({ ...b, id: b.id })),
+      options,
     )
     const first = ranked[0]
     if (first === undefined) return undefined
+
+    // ⚠️ 排序只保证「可用的在前」，**不保证第一个可用**。
+    //
+    // 仅在**锁定永久积分**时才把「全部不可用」判成无可用账号：解锁时
+    // 「所有号的余额都是 0」仍返回第一个候选 —— 那是**既有行为**（让上游
+    // 去报余额不足，错误信息更准确），不能因为本次改动而变化。
+    if (options.allowPermanent === false && !loomyTierUsable(loomyBalanceTier(first, options))) {
+      return undefined
+    }
+
     const picked = byId.get(first.id)
     return picked
   }

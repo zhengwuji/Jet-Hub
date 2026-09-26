@@ -4,6 +4,8 @@ import {
   supportsCreditBalance,
   supportsDailyCheckin,
   supportsOnboardingTasks,
+  supportsRateLimit,
+  supportsPermanentLock,
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
@@ -308,7 +310,7 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, drag }) {
+function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showRateLimitActions, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -427,18 +429,24 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
               React.createElement('path', { d: 'M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7' }),
               React.createElement('path', { d: 'M7.5 8a2.5 2.5 0 0 1 0-5A4.8 4.8 0 0 1 12 8a4.8 4.8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5' })))
         : null,
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        title: RETEST_HELP,
-        disabled: busy || !hasAnyLimit,
-        onClick: () => onRetest(account.id),
-      }, '重测'),
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        title: RESET_HELP,
-        disabled: busy || !hasAnyLimit,
-        onClick: () => onReset(account.id),
-      }, '重置'),
+      // 卡片级「重测 / 重置」同样只对会限流的 provider 有意义
+      // （Loomy 不返回限流错误，故这两个按钮对它永远禁用 —— 直接不渲染）。
+      showRateLimitActions
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: RETEST_HELP,
+            disabled: busy || !hasAnyLimit,
+            onClick: () => onRetest(account.id),
+          }, '重测')
+        : null,
+      showRateLimitActions
+        ? React.createElement('button', {
+            className: 'dim-jh-btn',
+            title: RESET_HELP,
+            disabled: busy || !hasAnyLimit,
+            onClick: () => onReset(account.id),
+          }, '重置')
+        : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
@@ -906,6 +914,64 @@ function ProviderPanel({ provider, rpcCall }) {
   const canClaimOnboarding = supportsOnboardingTasks(provider);
 
   /**
+   * Loomy「锁定永久积分」（全局开关，持久化在宿主侧）。
+   *
+   * 锁定后选号**只允许消耗今日赠送额度**；永久积分不参与，故只剩永久积分的
+   * 账号在锁定期间等同于不可用（用户语义：「锁定后没有临时积分后找可用账号
+   * 就是没有可用账号」）。
+   */
+  const canLockPermanent = supportsPermanentLock(provider);
+  const [permanentLocked, setPermanentLocked] = React.useState(false);
+  const [lockBusy, setLockBusy] = React.useState(false);
+  const [lockNotice, setLockNotice] = React.useState(null);
+
+  /**
+   * 读取锁定状态（面板挂载时一次）。
+   *
+   * ⚠️ 只在支持该能力的 provider 上发请求：对不支持的 provider 发会拿到
+   * `bad-request`，并在控制台留下必然失败的报错（与积分能力矩阵同一教训）。
+   */
+  React.useEffect(() => {
+    if (!canLockPermanent) return undefined;
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await rpcCall('loomy.permanentLock', {});
+        if (alive) setPermanentLocked(res?.locked === true);
+      } catch (caught) {
+        // 读失败不阻塞面板：保持「解锁」这一保守默认值（与后端缺省一致）。
+        console.error('[jet-hub] load permanent lock failed:', caught);
+      }
+    })();
+    return () => { alive = false; };
+  }, [canLockPermanent, provider]);
+
+  /** 切换锁定状态（持久化）。 */
+  const togglePermanentLock = async () => {
+    if (!canLockPermanent) return;
+    const next = !permanentLocked;
+    setLockBusy(true);
+    setLockNotice(null);
+    try {
+      const res = await rpcCall('loomy.permanentLock', { locked: next });
+      if (!mounted.current) return;
+      setPermanentLocked(res?.locked === true);
+      setLockNotice({
+        tone: 'ok',
+        text: next
+          ? '已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将无可用账号。'
+          : '已解锁永久积分：今日额度用尽后会继续使用永久积分。',
+      });
+    } catch (caught) {
+      console.error('[jet-hub] toggle permanent lock failed:', caught);
+      if (!mounted.current) return;
+      setLockNotice({ tone: 'error', text: `操作失败：${caught?.message || '未知错误'}` });
+    } finally {
+      if (mounted.current) setLockBusy(false);
+    }
+  };
+
+  /**
    * 领取指定账号的全部新手任务（补差额，最多 10000 分）。
    *
    * ⚠️ 与「一键领取积分」（每日签到）**完全不同的操作**：新手任务是
@@ -1331,18 +1397,41 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void claimCredits(),
             }, claiming ? '领取中…' : '一键领取积分')
           : null,
-        React.createElement('button', {
-          className: 'dim-jh-btn',
-          title: RETEST_ALL_HELP,
-          disabled: probeBusy !== null || accounts.length === 0,
-          onClick: () => void runLimitAction('retestAll'),
-        }, probeBusy === 'all' ? '重测中…' : '重测所有'),
-        React.createElement('button', {
-          className: 'dim-jh-btn',
-          title: RESET_ALL_HELP,
-          disabled: probeBusy !== null || accounts.length === 0,
-          onClick: () => void runLimitAction('resetAll'),
-        }, '重置所有'),
+        // 「重测 / 重置」只对**会返回限流错误**的 provider 有意义。
+        // ⚠️ Loomy 不会限流（积分耗尽时静默降级为扣永久积分），故对它
+        // 隐藏这两个按钮 —— 重测永远测不出限流、重置也没有标记可清，
+        // 而重测还会白烧积分（用户报障：「这个 provider 好像没发现模型限流，
+        // 把重置所有按钮删掉」）。
+        supportsRateLimit(provider)
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: RETEST_ALL_HELP,
+              disabled: probeBusy !== null || accounts.length === 0,
+              onClick: () => void runLimitAction('retestAll'),
+            }, probeBusy === 'all' ? '重测中…' : '重测所有')
+          : null,
+        supportsRateLimit(provider)
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: RESET_ALL_HELP,
+              disabled: probeBusy !== null || accounts.length === 0,
+              onClick: () => void runLimitAction('resetAll'),
+            }, '重置所有')
+          : null,
+        // 锁定永久积分（仅 Loomy）：只消耗每日赠送额度，保住永久积分。
+        canLockPermanent
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              'data-kind': permanentLocked ? 'primary' : undefined,
+              title: permanentLocked
+                ? '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。'
+                : '锁定永久积分后只消耗每日赠送额度（今日额度用尽即无可用账号），可保住永久积分。点此锁定。',
+              disabled: lockBusy,
+              onClick: () => void togglePermanentLock(),
+            }, lockBusy
+              ? '处理中…'
+              : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
+          : null,
         React.createElement('button', {
           className: 'dim-jh-btn',
           'data-kind': 'primary',
@@ -1361,6 +1450,13 @@ function ProviderPanel({ provider, rpcCall }) {
           ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
               probeNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
           : null)
+      : null,
+    lockNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': lockNotice.tone,
+          role: lockNotice.tone === 'error' ? 'alert' : 'status',
+        }, lockNotice.text)
       : null,
     claimNotice
       ? React.createElement('div', {
@@ -1437,6 +1533,8 @@ function ProviderPanel({ provider, rpcCall }) {
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
+                // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
+                showRateLimitActions: supportsRateLimit(provider),
                 onToggle: toggleAccount,
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),

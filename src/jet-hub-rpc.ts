@@ -121,6 +121,8 @@ import type {
   RpcOnboardingStatusResponse,
   RpcOnboardingClaimRequest,
   RpcOnboardingClaimResponse,
+  RpcLoomyPermanentLockRequest,
+  RpcLoomyPermanentLockResponse,
   RpcModelListRequest,
   RpcModelListResponse,
   RpcModelSetDisabledRequest,
@@ -1344,6 +1346,38 @@ function registerJetHubEndpoints(
             points: { ...LOOMY_TASK_POINTS },
           } satisfies RpcOnboardingStatusResponse,
         }
+      }
+
+      /**
+       * Loomy「锁定永久积分」开关（读 / 写）。
+       *
+       * **用户需求**：锁定后选号只允许消耗今日赠送额度，永久积分不参与 ——
+       * 只剩永久积分的账号在锁定期间等同于不可用（「锁定后没有临时积分后找
+       * 可用账号就是没有可用账号」）。解锁后恢复「没临时积分就用永久积分」。
+       *
+       * ⚠️ 这是**全局**开关（不分账号），持久化在 `$DSH_HOME/jet-hub/state.json`
+       * 的 `loomyPermanentLocked` 字段（或老契约的 settings 文档）。
+       *
+       * ⚠️ `locked` 省略时**只读**（供面板初始化），给出布尔值才写入。
+       */
+      case 'loomy.permanentLock': {
+        const req = payload as RpcLoomyPermanentLockRequest
+        if (req.locked === undefined) {
+          return { ok: true, value: { locked: pool.loomyPermanentLocked() } satisfies RpcLoomyPermanentLockResponse }
+        }
+        if (typeof req.locked !== 'boolean') {
+          return { ok: false, error: { code: 'bad-request', message: 'locked 必须是布尔值' } }
+        }
+        await pool.setLoomyPermanentLocked(req.locked)
+        // ⚠️ 与 `model.setDisabled` 同理：本次写入会改变**选号结果**
+        // （进而改变哪些账号会被使用），故广播一次让界面重新读取状态。
+        // 包 try/catch：通知失败不能反噬已经落盘的开关。
+        try {
+          ctx.emit('llm/adapters-updated')
+        } catch (error) {
+          ctx.logger?.warn?.(`[jet-hub] 广播 llm/adapters-updated 失败（不影响已保存的开关）: ${String(error)}`)
+        }
+        return { ok: true, value: { locked: pool.loomyPermanentLocked() } satisfies RpcLoomyPermanentLockResponse }
       }
 
       /**

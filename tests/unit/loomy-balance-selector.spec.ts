@@ -279,6 +279,69 @@ describe('LoomyBalanceSelector.select', () => {
     expect(await selector.select([])).toBeUndefined()
   })
 
+  /**
+   * ⚠️ **锁定永久积分**（用户需求）：只剩永久积分的账号不可用。
+   */
+  it('锁定时只剩永久积分的账号不被选中（返回 undefined）', async () => {
+    const fetcher = makeFetcher({ [CRED.access_token]: { balance: 9999, daily: 0 } })
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY,
+      resolveCredential: makeResolver({ r1: CRED }),
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    const picked = await selector.select([{ id: 'a1', credentialRef: 'r1' }], { allowPermanent: false })
+    expect(picked).toBeUndefined()
+  })
+
+  it('锁定时有今日额度的账号仍可被选中', async () => {
+    const fetcher = makeFetcher({ [CRED.access_token]: { balance: 0, daily: 500 } })
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY,
+      resolveCredential: makeResolver({ r1: CRED }),
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    const picked = await selector.select([{ id: 'a1', credentialRef: 'r1' }], { allowPermanent: false })
+    expect(picked?.account.id).toBe('a1')
+    expect(picked?.balance.dailyBalance).toBe(500)
+  })
+
+  it('锁定时优先有今日额度的（跳过只剩永久积分的）', async () => {
+    const cred2: LoomyCredential = { ...CRED, access_token: 'T'.repeat(32) }
+    const fetcher = makeFetcher({
+      [CRED.access_token]: { balance: 9999, daily: 0 },   // 只有永久（手动顺序第一）
+      [cred2.access_token]: { balance: 0, daily: 100 },   // 有今日（第二）
+    })
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY,
+      resolveCredential: makeResolver({ r1: CRED, r2: cred2 }),
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    const picked = await selector.select([
+      { id: 'a1', credentialRef: 'r1' },
+      { id: 'a2', credentialRef: 'r2' },
+    ], { allowPermanent: false })
+    expect(picked?.account.id).toBe('a2')
+  })
+
+  /**
+   * ⚠️ **解锁时必须保持既有行为**：所有账号余额都是 0 时仍返回第一个候选
+   * （让上游报余额不足，错误信息更准确），不能因为加了锁定功能而改变。
+   */
+  it('解锁时全部无余额仍返回第一个（不改变既有行为）', async () => {
+    const fetcher = makeFetcher({ [CRED.access_token]: { balance: 0, daily: 0 } })
+    const selector = new LoomyBalanceSelector({
+      product: LOOMY,
+      resolveCredential: makeResolver({ r1: CRED }),
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    const picked = await selector.select([{ id: 'a1', credentialRef: 'r1' }])
+    expect(picked?.account.id).toBe('a1')
+  })
+
   it('并发查余额（不是串行 N 次等待）', async () => {
     const cred2: LoomyCredential = { ...CRED, access_token: 'T'.repeat(32) }
     const cred3: LoomyCredential = { ...CRED, access_token: 'U'.repeat(32) }

@@ -495,11 +495,21 @@ export function apply(ctx: Context): void {
         })
         .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
 
+      // 「锁定永久积分」：只允许消耗今日赠送额度（用户要求，且持久化）。
+      const allowPermanent = !pool.loomyPermanentLocked()
+
       if (candidates.length > 0) {
-        const picked = await loomyBalanceSelector.select(candidates)
+        const picked = await loomyBalanceSelector.select(candidates, { allowPermanent })
         if (picked !== undefined) {
           const credential = await resolveLoomyCredentialByRef(picked.account.credentialRef)
           if (credential !== undefined) return credential
+        } else if (!allowPermanent) {
+          // ⚠️ **锁定时绝不可落到下面的单凭据兜底** —— 那会绕过锁定、
+          // 照样消耗永久积分，锁定形同虚设。这里直接抛明确错误（用户要求）。
+          throw new Error(
+            'Loomy：没有可用账号。已锁定永久积分，而所有账号的今日赠送额度都已用尽'
+            + '（或余额查询失败）。请在 Jet Hub 的 Loomy 面板解锁永久积分，或等待明日额度刷新。',
+          )
         }
       }
 

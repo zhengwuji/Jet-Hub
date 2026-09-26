@@ -122,3 +122,55 @@ describe('分档函数本身（loomyBalanceTier）', () => {
     expect(loomyBalanceTier({})).toBe(LOOMY_BALANCE_TIER.none)
   })
 })
+
+/**
+ * ⚠️ **锁定永久积分**（用户需求）。
+ *
+ * 锁定后**只允许消耗今日赠送额度**，永久积分不参与选号 ——
+ * 只剩永久积分的账号在锁定期间**等同于不可用**。
+ *
+ * 用户原话：「锁定永久积分后没有临时积分后找可用账号就是没有可用账号，
+ * 解锁以后才能再没有临时积分的时候找到有永久积分的账号」。
+ */
+describe('锁定永久积分（allowPermanent: false）', () => {
+  const acct = (id: string, daily: number | undefined, permanent: number | undefined): LoomyAccountBalance => ({
+    id,
+    dailyBalance: daily,
+    permanentBalance: permanent,
+  })
+
+  it('只剩永久积分的账号落入 none 档（不是 permanent 档）', async () => {
+    const { loomyBalanceTier } = await import('../../src/loomy-balance-rank.js')
+    expect(loomyBalanceTier({ dailyBalance: 0, permanentBalance: 9999 }, { allowPermanent: false }))
+      .toBe(LOOMY_BALANCE_TIER.none)
+  })
+
+  it('有今日额度的账号仍可用（锁定不影响它）', async () => {
+    const { loomyBalanceTier } = await import('../../src/loomy-balance-rank.js')
+    expect(loomyBalanceTier({ dailyBalance: 100, permanentBalance: 0 }, { allowPermanent: false }))
+      .toBe(LOOMY_BALANCE_TIER.daily)
+  })
+
+  it('排序时只剩永久积分的与「无余额」同档（都在 none）', async () => {
+    const ranked = rankLoomyAccountsByBalance([
+      acct('only-permanent', 0, 9999),
+      acct('has-daily', 10, 0),
+      acct('empty', 0, 0),
+    ], { allowPermanent: false })
+    // has-daily 第一；only-permanent 与 empty 同为 none 档，按传入顺序
+    expect(ranked.map((a) => a.id)).toEqual(['has-daily', 'only-permanent', 'empty'])
+  })
+
+  it('loomyTierUsable：daily/permanent 可用，none 不可用', async () => {
+    const { loomyTierUsable } = await import('../../src/loomy-balance-rank.js')
+    expect(loomyTierUsable(LOOMY_BALANCE_TIER.daily)).toBe(true)
+    expect(loomyTierUsable(LOOMY_BALANCE_TIER.permanent)).toBe(true)
+    expect(loomyTierUsable(LOOMY_BALANCE_TIER.none)).toBe(false)
+  })
+
+  it('allowPermanent 缺省为 true（不改变既有行为）', async () => {
+    const { loomyBalanceTier } = await import('../../src/loomy-balance-rank.js')
+    expect(loomyBalanceTier({ dailyBalance: 0, permanentBalance: 5 })).toBe(LOOMY_BALANCE_TIER.permanent)
+    expect(loomyBalanceTier({ dailyBalance: 0, permanentBalance: 5 }, {})).toBe(LOOMY_BALANCE_TIER.permanent)
+  })
+})

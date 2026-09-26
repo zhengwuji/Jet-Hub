@@ -50,20 +50,55 @@ export interface LoomyAccountBalance {
 }
 
 /**
+ * 分档选项。
+ *
+ * ## `allowPermanent`（锁定永久积分）
+ *
+ * 用户可把永久积分「锁住」，只允许消耗每日赠送额度。关闭时：
+ *
+ * - 有今日额度 → `daily` 档（照常可用）
+ * - 其余（含**只剩永久积分**、查询失败）→ `none` 档
+ *
+ * ⚠️ **这不是「把 permanent 档降级」，而是「永久积分不参与选号」**：
+ * 只剩永久积分的账号在锁定期间**等同于不可用**，这正是用户要的语义
+ * （「锁定后没有临时积分后找可用账号就是没有可用账号」）。
+ */
+export interface LoomyTierOptions {
+  /** 是否允许消耗永久积分。默认 `true`（解锁）。 */
+  allowPermanent?: boolean
+}
+
+/**
  * 判定单个账号的档位。
  *
  * ⚠️ **`daily > 0` 优先于 `permanent > 0`**：今日额度每天刷新、不用会浪费，
  * 而永久积分不会过期。故只要今日还有余额就一定先用它。
+ *
+ * ⚠️ **锁定永久积分时（`allowPermanent: false`）**：永久积分不参与判定 ——
+ * 只剩永久积分的账号直接落入 `none`（不可用），而不是降到 `permanent` 档。
  */
-export function loomyBalanceTier(balance: {
-  dailyBalance?: number
-  permanentBalance?: number
-}): LoomyBalanceTier {
+export function loomyBalanceTier(
+  balance: {
+    dailyBalance?: number
+    permanentBalance?: number
+  },
+  options: LoomyTierOptions = {},
+): LoomyBalanceTier {
   const daily = positiveNumber(balance.dailyBalance)
   if (daily > 0) return LOOMY_BALANCE_TIER.daily
+  if (options.allowPermanent === false) return LOOMY_BALANCE_TIER.none
   const permanent = positiveNumber(balance.permanentBalance)
   if (permanent > 0) return LOOMY_BALANCE_TIER.permanent
   return LOOMY_BALANCE_TIER.none
+}
+
+/**
+ * 该档位是否「可用」（可承载请求）。
+ *
+ * `none` 档不可用 —— 调用方据此判断「真的没有可用账号」并报明确错误。
+ */
+export function loomyTierUsable(tier: LoomyBalanceTier): boolean {
+  return tier !== LOOMY_BALANCE_TIER.none
 }
 
 /**
@@ -86,13 +121,15 @@ function positiveNumber(value: unknown): number {
  * 在 V8 里虽已稳定，但显式带原始下标可让意图自明、且不受引擎实现影响。
  *
  * @param accounts - 待排序账号（顺序即手动优先级）。
+ * @param options - 分档选项（`allowPermanent` = 是否允许消耗永久积分）。
  * @returns **新数组**（不修改入参）。
  */
 export function rankLoomyAccountsByBalance<T extends LoomyAccountBalance>(
   accounts: readonly T[],
+  options: LoomyTierOptions = {},
 ): T[] {
   return accounts
-    .map((account, index) => ({ account, index, tier: loomyBalanceTier(account) }))
+    .map((account, index) => ({ account, index, tier: loomyBalanceTier(account, options) }))
     .sort((a, b) => (a.tier - b.tier) || (a.index - b.index))
     .map((entry) => entry.account)
 }

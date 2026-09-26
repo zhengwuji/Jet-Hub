@@ -60,6 +60,13 @@ export class AccountPool {
    * 本副本为准）。
    */
   private modelCache: ModelDisableMap = {}
+  /**
+   * Loomy「锁定永久积分」的**权威进程内副本**（与 {@link cache} 同理）。
+   *
+   * ⚠️ 这是**全局**开关（不分账号）。三处写入点都必须携带它，
+   * 否则会被整体写入抹掉 —— 与 `disabledModels` 当年踩过的坑同型。
+   */
+  private loomyPermanentLockedCache = false
   /** 是否已完成首次载入。 */
   private loaded = false
 
@@ -80,6 +87,8 @@ export class AccountPool {
     // 黑名单是后来才加入的字段：老文档里没有它，缺失时保持空表
     // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
     this.modelCache = state.disabledModels
+    // 同理：锁定开关也是后加的字段，缺失即视为「解锁」（既有行为）。
+    this.loomyPermanentLockedCache = state.loomyPermanentLocked === true
   }
 
   /** 读取账号列表（进程内权威副本）。 */
@@ -101,7 +110,11 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，账号变更未落盘')
       return
     }
-    await this.store.save({ accounts, disabledModels: this.modelCache })
+    await this.store.save({
+      accounts,
+      disabledModels: this.modelCache,
+      loomyPermanentLocked: this.loomyPermanentLockedCache,
+    })
   }
 
   /**
@@ -200,7 +213,42 @@ export class AccountPool {
       return
     }
     // 与 writeAccounts 对称：整体写入必须携带账号列表，否则会被清空。
-    await this.store.save({ accounts: this.cache, disabledModels })
+    await this.store.save({
+      accounts: this.cache,
+      disabledModels,
+      loomyPermanentLocked: this.loomyPermanentLockedCache,
+    })
+  }
+
+  /**
+   * Loomy「锁定永久积分」是否开启。
+   *
+   * 锁定后选号**只允许消耗今日赠送额度**，永久积分不参与 ——
+   * 只剩永久积分的账号在锁定期间等同于不可用（用户语义）。
+   */
+  loomyPermanentLocked(): boolean {
+    this.ensureLoaded()
+    return this.loomyPermanentLockedCache
+  }
+
+  /**
+   * 设置 Loomy「锁定永久积分」开关（持久化）。
+   *
+   * ⚠️ **必须连同账号与黑名单一起写回**：两种后端都是整体写入，
+   * 只写本字段会把同一文档里的另外两份数据抹掉。
+   */
+  async setLoomyPermanentLocked(locked: boolean): Promise<void> {
+    this.ensureLoaded()
+    this.loomyPermanentLockedCache = locked
+    if (this.store.kind === 'memory') {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，Loomy 永久积分锁定未落盘')
+      return
+    }
+    await this.store.save({
+      accounts: this.cache,
+      disabledModels: this.modelCache,
+      loomyPermanentLocked: locked,
+    })
   }
 
   /** 列出某个 provider 的所有账号（含状态信息） */
@@ -671,6 +719,7 @@ export class AccountPool {
     return {
       accounts: [...this.cache],
       disabledModels,
+      loomyPermanentLocked: this.loomyPermanentLockedCache,
     }
   }
 
@@ -686,16 +735,29 @@ export class AccountPool {
    * 账号条目与显式 `true` 的黑名单项，坏条目直接丢弃而不是写进池里
    * 反复触发选号失败。
    */
-  async replaceAll(accounts: readonly ProviderAccountEntry[], disabledModels: ModelDisableMap): Promise<void> {
+  async replaceAll(
+    accounts: readonly ProviderAccountEntry[],
+    disabledModels: ModelDisableMap,
+    loomyPermanentLocked?: boolean,
+  ): Promise<void> {
     const next = sanitizeAccounts(accounts)
     this.cache = next
     this.modelCache = sanitizeDisabledModels(disabledModels)
+    // 备份文件可能来自不含该字段的旧版本：`undefined` 时**保持当前值**，
+    // 而不是重置为 false —— 否则导入一份老备份会静默解锁用户的永久积分。
+    if (loomyPermanentLocked !== undefined) {
+      this.loomyPermanentLockedCache = loomyPermanentLocked === true
+    }
     this.loaded = true
     if (this.store.kind === 'memory') {
       this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，备份导入仅存在于内存中')
       return
     }
-    await this.store.save({ accounts: next, disabledModels: this.modelCache })
+    await this.store.save({
+      accounts: next,
+      disabledModels: this.modelCache,
+      loomyPermanentLocked: this.loomyPermanentLockedCache,
+    })
   }
 }
 

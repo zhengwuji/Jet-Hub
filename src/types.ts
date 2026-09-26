@@ -300,6 +300,24 @@ export interface RpcCreditsBalancesRequest {
 }
 
 /**
+ * RPC: Loomy「锁定永久积分」开关的读写请求。
+ *
+ * ⚠️ 该开关是 **Loomy 全局**的（不分账号）：锁定后选号只允许消耗今日赠送额度，
+ * 永久积分不参与 —— 只剩永久积分的账号在锁定期间等同于不可用。
+ *
+ * `locked` 省略表示**只读查询**；给出布尔值表示写入。
+ */
+export interface RpcLoomyPermanentLockRequest {
+  locked?: boolean
+}
+
+/** RPC: Loomy「锁定永久积分」开关响应。 */
+export interface RpcLoomyPermanentLockResponse {
+  /** 当前是否已锁定。 */
+  locked: boolean
+}
+
+/**
  * 单个账号的积分余额。
  *
  * 与签到状态的设计取舍不同：余额**带回每个包的明细**而不只是总数 ——
@@ -554,6 +572,13 @@ export interface BackupPayload {
   accounts: ProviderAccountEntry[]
   /** 模型黑名单：provider id → 被关闭的模型 id → true。 */
   disabledModels: Record<string, Record<string, boolean>>
+  /**
+   * Loomy「锁定永久积分」开关。
+   *
+   * ⚠️ **可选**：老备份文件里没有该字段，导入时保持当前值（不重置），
+   * 因此不需要提升 {@link BACKUP_VERSION}。
+   */
+  loomyPermanentLocked?: boolean
 }
 
 /** RPC: 导出备份响应。 */

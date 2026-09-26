@@ -89,6 +89,46 @@ describe('Loomy 客户端接线', () => {
   })
 
   /**
+   * ⚠️ **Loomy 不返回限流错误**（用户报障「这个 provider 好像没发现模型限流，
+   * 把重置所有按钮删掉」）：积分耗尽时静默降级为扣永久积分，故
+   * 「重测 / 重置」对它毫无意义 —— 重测永远测不出限流、还会白烧积分。
+   */
+  it('Loomy 不渲染「重测所有 / 重置所有」与卡片级「重测 / 重置」', () => {
+    // 面板级：两个按钮都被 supportsRateLimit 门控
+    expect(hubSource).toContain('supportsRateLimit(provider)')
+    // 卡片级：新增 showRateLimitActions 开关
+    expect(hubSource).toContain('showRateLimitActions')
+    expect(hubSource).toContain('showRateLimitActions: supportsRateLimit(provider)')
+  })
+
+  it('能力矩阵里 loomy 显式登记为「无限流」，且默认视为有限流', () => {
+    const caps = readFileSync(
+      resolve(here, '../../plugin-src/client/credits-capabilities.js'), 'utf8',
+    )
+    expect(caps).toContain('RATE_LIMIT_CAPABILITIES')
+    // Loomy 显式 false
+    expect(caps).toMatch(/loomy:\s*Object\.freeze\(\{\s*rateLimit:\s*false\s*\}\)/)
+    // ⚠️ 默认必须是 true（未登记视为有限流），否则新增 provider 会凭空失去按钮
+    expect(caps).toMatch(/rateLimit !== false/)
+  })
+
+  /**
+   * ⚠️ **锁定永久积分**（用户需求）：面板级一个开关，锁定后只消耗今日额度。
+   */
+  it('Loomy 渲染「锁定 / 解锁永久积分」按钮并走 loomy.permanentLock', () => {
+    expect(hubSource).toContain('supportsPermanentLock')
+    expect(hubSource).toContain("'loomy.permanentLock'")
+    // 文案随状态切换
+    expect(hubSource).toContain("'解锁永久积分'")
+    expect(hubSource).toContain("'锁定永久积分'")
+  })
+
+  it('锁定状态在面板挂载时读取一次（且只对支持的 provider 发请求）', () => {
+    expect(hubSource).toMatch(/if \(!canLockPermanent\) return undefined/)
+    expect(hubSource).toMatch(/rpcCall\('loomy\.permanentLock', \{\}\)/)
+  })
+
+  /**
    * ⚠️ 客户端**不调用** `onboarding.status`：领取动作（`onboarding.claim`）
    * 的响应已带回 `earned`/`total`/逐任务明细，足以渲染进度，
    * 再发一次只读查询纯属多余请求。该端点保留给将来的面板级进度展示。

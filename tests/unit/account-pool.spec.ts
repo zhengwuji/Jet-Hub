@@ -15,11 +15,23 @@ import type { ProviderAccountEntry } from '../../src/types.js'
  */
 function createMockContext(
   initialAccounts: ProviderAccountEntry[] = [],
-  options: { staleReads?: boolean; initialDisabledModels?: Record<string, Record<string, boolean>> } = {},
+  options: {
+    staleReads?: boolean
+    initialDisabledModels?: Record<string, Record<string, boolean>>
+    /** 初始的 Loomy 永久积分锁定状态（模拟「已落盘的老状态」）。 */
+    initialLoomyPermanentLocked?: boolean
+  } = {},
 ) {
-  let stored: { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, Record<string, boolean>> } = {
+  let stored: {
+    accounts?: ProviderAccountEntry[]
+    disabledModels?: Record<string, Record<string, boolean>>
+    loomyPermanentLocked?: boolean
+  } = {
     accounts: initialAccounts,
     ...options.initialDisabledModels !== undefined ? { disabledModels: options.initialDisabledModels } : {},
+    ...options.initialLoomyPermanentLocked !== undefined
+      ? { loomyPermanentLocked: options.initialLoomyPermanentLocked }
+      : {},
   }
   // 滞后读：get() 返回的这个值只在"下一次 replace 之后"才追平
   let visible = stored
@@ -33,6 +45,7 @@ function createMockContext(
       replace: async (value: {
         accounts?: ProviderAccountEntry[]
         disabledModels?: Record<string, Record<string, boolean>>
+        loomyPermanentLocked?: boolean
       }) => {
         if (options.staleReads) {
           // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
@@ -920,6 +933,97 @@ describe('AccountPool 模型黑名单', () => {
 
     expect(ctx.replacePayloads.at(-1)!.accounts).toHaveLength(1)
     expect(await pool.listAllAccounts()).toHaveLength(1)
+  })
+
+  /**
+   * ⚠️ **Loomy 永久积分锁定**（用户要求「需要支持持久化」）。
+   *
+   * 这是**第三个**整体写入的字段，与 `disabledModels` 当年踩过的坑同型：
+   * 任何一处写入漏带它，就会被静默抹掉（用户看到「锁自己解开了」）。
+   */
+  describe('Loomy 永久积分锁定', () => {
+    it('默认解锁（未设置时为 false）', () => {
+      const pool = new AccountPool(createMockContext() as never)
+      expect(pool.loomyPermanentLocked()).toBe(false)
+    })
+
+    it('设置后可读回，并落盘到 replace 载荷', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+
+      expect(pool.loomyPermanentLocked()).toBe(true)
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+    })
+
+    it('可再解锁', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+      await pool.setLoomyPermanentLocked(false)
+      expect(pool.loomyPermanentLocked()).toBe(false)
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(false)
+    })
+
+    /** ⚠️ 新增账号不得抹掉锁定（与黑名单那次同型缺陷）。 */
+    it('新增账号不会抹掉锁定', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+      await pool.addAccount({
+        id: 'loomy-x', provider: 'loomy', nickname: 'X', enabled: true,
+        credentialRef: 'LOOMY_ACCOUNT_X', createdAt: Date.now(), refreshable: false,
+      })
+
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+      expect(pool.loomyPermanentLocked()).toBe(true)
+    })
+
+    /** ⚠️ 改模型黑名单不得抹掉锁定。 */
+    it('写黑名单不会抹掉锁定', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+      await pool.setModelDisabled('loomy', 'spark-x', true)
+
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+      expect(pool.loomyPermanentLocked()).toBe(true)
+    })
+
+    /** ⚠️ 反向：写锁定不得抹掉账号与黑名单。 */
+    it('写锁定不会抹掉账号列表与黑名单', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.addAccount({
+        id: 'buddy-z', provider: 'buddy', nickname: 'Z', enabled: true,
+        credentialRef: 'BUDDY_ACCOUNT_Z', createdAt: Date.now(), refreshable: true,
+      })
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      await pool.setLoomyPermanentLocked(true)
+
+      const last = ctx.replacePayloads.at(-1)!
+      expect(last.accounts).toHaveLength(1)
+      expect(last.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+    })
+
+    it('跨实例读回（模拟重启）', async () => {
+      const ctx1 = createMockContext()
+      await new AccountPool(ctx1 as never).setLoomyPermanentLocked(true)
+      // 用第一实例落盘的载荷作为「新进程」的初始状态
+      const persisted = ctx1.replacePayloads.at(-1) as { loomyPermanentLocked?: boolean }
+
+      const ctx2 = createMockContext([], {
+        initialLoomyPermanentLocked: persisted.loomyPermanentLocked,
+      })
+      expect(new AccountPool(ctx2 as never).loomyPermanentLocked()).toBe(true)
+    })
+
+    it('初始状态为已锁定时可读回（模拟重启后首次载入）', () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialLoomyPermanentLocked: true,
+      }) as never)
+      expect(pool.loomyPermanentLocked()).toBe(true)
+    })
   })
 
   it('配置文件里的脏数据被忽略而不是抛错', () => {

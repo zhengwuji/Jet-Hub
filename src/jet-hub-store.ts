@@ -55,6 +55,18 @@ export type ModelDisableMap = Record<string, Record<string, boolean>>
 export interface JetHubState {
   accounts: ProviderAccountEntry[]
   disabledModels: ModelDisableMap
+  /**
+   * Loomy「锁定永久积分」开关（用户要求持久化）。
+   *
+   * 锁定后选号**只允许消耗今日赠送额度**，永久积分不参与 —— 只剩永久积分的
+   * 账号在锁定期间等同于不可用（用户语义：「没有临时积分后找可用账号就是
+   * 没有可用账号」）。
+   *
+   * ⚠️ 这是**全局**开关（不分账号），也是本状态文档的**第三个字段**：
+   * 三处写入点（`writeAccounts` / `writeModels` / `replaceAll`）都必须携带它，
+   * 漏一处就会被整体写入抹掉（与 `disabledModels` 当年踩过的坑同型）。
+   */
+  loomyPermanentLocked?: boolean
 }
 
 /** 持久化后端的能力标识，供调用方决定要不要告警。 */
@@ -79,6 +91,7 @@ interface SettingsScopeLike {
 const jetHubSchema = Schema.object({
   accounts: Schema.array(Schema.any()).default([]),
   disabledModels: Schema.dict(Schema.any()).default({}),
+  loomyPermanentLocked: Schema.boolean().default(false),
 })
 
 /**
@@ -137,16 +150,24 @@ class SettingsStore implements JetHubStore {
   constructor(private readonly scope: SettingsScopeLike) {}
 
   load(): JetHubState | undefined {
-    const value = this.scope.get() as { accounts?: unknown; disabledModels?: unknown } | undefined
+    const value = this.scope.get() as
+      | { accounts?: unknown; disabledModels?: unknown; loomyPermanentLocked?: unknown }
+      | undefined
     if (value === undefined || value === null) return undefined
     return {
       accounts: sanitizeAccounts(value.accounts),
       disabledModels: sanitizeDisabledModels(value.disabledModels),
+      // 老文档没有该字段 → 缺省 false（解锁），与既有行为一致。
+      loomyPermanentLocked: value.loomyPermanentLocked === true,
     }
   }
 
   async save(state: JetHubState): Promise<void> {
-    await this.scope.replace({ accounts: state.accounts, disabledModels: state.disabledModels })
+    await this.scope.replace({
+      accounts: state.accounts,
+      disabledModels: state.disabledModels,
+      loomyPermanentLocked: state.loomyPermanentLocked === true,
+    })
   }
 }
 
@@ -242,10 +263,16 @@ class FileStore implements JetHubStore {
       if (!existsSync(this.path)) return this.bootstrapFromCredentialRefs()
       const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown
       if (typeof parsed !== 'object' || parsed === null) return undefined
-      const value = parsed as { accounts?: unknown; disabledModels?: unknown }
+      const value = parsed as {
+        accounts?: unknown
+        disabledModels?: unknown
+        loomyPermanentLocked?: unknown
+      }
       return {
         accounts: sanitizeAccounts(value.accounts),
         disabledModels: sanitizeDisabledModels(value.disabledModels),
+        // 老文档没有该字段 → 缺省 false（解锁），与既有行为一致。
+        loomyPermanentLocked: value.loomyPermanentLocked === true,
       }
     } catch (error) {
       this.logger?.warn(`[jet-hub] 读取 ${this.path} 失败，本次以空列表启动: ${String(error)}`)
@@ -284,7 +311,7 @@ class FileStore implements JetHubStore {
       const accounts = extractCredentialRefNames(readFileSync(credentialsPath, 'utf-8'))
         .flatMap(ref => accountFromCredentialRef(ref) ?? [])
       if (accounts.length === 0) return undefined
-      const state: JetHubState = { accounts, disabledModels: {} }
+      const state: JetHubState = { accounts, disabledModels: {}, loomyPermanentLocked: false }
       try {
         this.write(state)
       } catch (error) {

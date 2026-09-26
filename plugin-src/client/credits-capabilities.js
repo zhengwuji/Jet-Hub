@@ -115,6 +115,50 @@ export const CREDITS_CAPABILITIES = Object.freeze({
 });
 
 /**
+ * 各 provider 是否具备「**模型限流**」这一机制（即服务端会因限流而拒绝请求）。
+ *
+ * ## 为什么需要它（真实发现）
+ *
+ * Loomy **不会返回限流错误**：实测今日赠送额度（每天 5000）用完后，服务端
+ * 继续扣永久积分且照常返回（静默降级）。因此「重测 / 重置」这组按钮对它
+ * **毫无意义** —— 重测永远测不出限流，重置也没有标记可清。
+ * 用户报障：「这个 provider 好像没发现模型限流，把重置所有按钮删掉」。
+ *
+ * ## 为什么「未登记 = 视为有限流」（与上面的积分能力约定**相反**）
+ *
+ * 积分能力的约定是「默认关闭」（未登记就不发请求，避免必然失败的请求）。
+ * 但限流按钮**是既有 UI**：若这里也默认关闭，将来新增 provider 时忘记登记，
+ * 会让老用户**凭空失去**「重测 / 重置」按钮 —— 那是可见的功能回退。
+ * 故这里默认**开启**，只有明确知道「该渠道不会限流」时才显式登记 `false`。
+ */
+export const RATE_LIMIT_CAPABILITIES = Object.freeze({
+  // Loomy（讯飞）：**不返回限流错误** —— 积分耗尽时静默降级为扣永久积分，
+  // 故「重测 / 重置」这组按钮对它无意义（重测还会白烧积分）。
+  loomy: Object.freeze({ rateLimit: false }),
+});
+
+/**
+ * 该 provider 的请求是否会因**模型限流**被拒（决定是否渲染「重测 / 重置」）。
+ *
+ * ⚠️ 默认 `true`（未登记即视为有限流），理由见 {@link RATE_LIMIT_CAPABILITIES}。
+ */
+export function supportsRateLimit(provider) {
+  return RATE_LIMIT_CAPABILITIES[provider]?.rateLimit !== false;
+}
+
+/**
+ * 该 provider 是否支持「锁定永久积分」（只允许消耗每日赠送额度）。
+ *
+ * ⚠️ 目前只有 Loomy 具备：它有两个独立的积分池（永久 / 每日赠送），
+ * 而其他渠道的积分模型不同（无「永久 vs 每日」的区分）。
+ *
+ * 为 false 时面板**不得**渲染该按钮，也不得发起 `loomy.permanentLock`。
+ */
+export function supportsPermanentLock(provider) {
+  return provider === 'loomy';
+}
+
+/**
  * 该 provider 是否能查询积分余额。
  *
  * 为 false 时调用方**不得**发起 `credits.balances`，也不应渲染账号卡片的

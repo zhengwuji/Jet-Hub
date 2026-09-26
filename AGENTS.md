@@ -2944,6 +2944,55 @@ loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
 积分模型不同，且多数会返回限流错误）。Loomy 的 `resolveCredential` 自己
 `listAccountsByProvider` + 过滤 + 调选择器。
 
+### ⚠️ 锁定永久积分（Loomy 全局开关，**必须持久化**）
+
+**用户需求**：面板上一个开关，锁定后**只允许消耗今日赠送额度**，永久积分不参与
+选号 —— 只剩永久积分的账号在锁定期间**等同于不可用**。用户原话：
+「锁定永久积分后没有临时积分后找可用账号就是没有可用账号，解锁以后才能再没有
+临时积分的时候找到有永久积分的账号」。
+
+实现分三层，**每层都有非显然的约束**：
+
+| 层 | 落点 | 关键约束 |
+|---|---|---|
+| 纯函数 | `loomy-balance-rank.ts` 的 `LoomyTierOptions.allowPermanent` | 锁定时只剩永久积分的账号落 **`none` 档**（不是降到 permanent 档） |
+| 选号 | `loomy-balance-selector.ts` 的 `select(candidates, options)` | ⚠️ 只在**锁定**时把「全部不可用」判成 `undefined`；解锁时**保持既有行为**（全 0 也返回第一个，让上游报余额不足） |
+| 宿主 | `index.ts` 的 `resolveCredential` | ⚠️ 锁定时**绝不可落到单凭据兜底** —— 那会绕过锁定照样烧永久积分 |
+
+⚠️ **持久化是本改动最容易出错的地方**：`JetHubState` 由「两字段」变「三字段」，
+而**所有写入点都是整体替换**（`writeAccounts` / `writeModels` /
+`setLoomyPermanentLocked` / `replaceAll` / `store.save`）。漏带一处，用户的锁就会
+被下一次「新增账号」「改模型开关」静默解开 —— 与 `disabledModels` 当年踩过的坑
+**完全同型**。`tests/unit/account-pool.spec.ts` 的「Loomy 永久积分锁定」段专门
+守着它，且已做**反向验证**（注入「新增账号漏带锁定」时用例会失败）。
+
+⚠️ **缺省必须为「解锁」**：老文档/老备份没有该字段，读到时按 `false` 处理
+（与既有行为一致），**不要**因为字段缺失就报错或让整次载入失败。
+`replaceAll` 对 `undefined` 的处理是**保持当前值**而不是重置为 false ——
+否则导入一份老备份会静默解锁用户的永久积分。
+
+⚠️ **写锁定后要广播 `llm/adapters-updated`**（包 try/catch）：它改变**选号结果**，
+与 `model.setDisabled` 同一判据（「这次写入会不会改变 `listModels` 的结果」→
+这里换成「会不会改变选号结果」）。通知失败不能反噬已落盘的开关。
+
+### ⚠️ Loomy 没有「模型限流」，故不渲染「重测 / 重置」
+
+**用户报障**：「这个 provider 好像没发现模型限流，把重置所有按钮删掉」。
+
+根因就是上一条：Loomy 积分耗尽时**静默降级**（继续扣永久积分），从不返回限流
+错误，故那组按钮对它毫无意义 —— 重测永远测不出限流、还会**白烧积分**。
+
+实现用**独立的能力矩阵** `RATE_LIMIT_CAPABILITIES`
+（`plugin-src/client/credits-capabilities.js`），Loomy 显式登记 `rateLimit: false`。
+
+⚠️ **它的默认值与积分能力矩阵相反**：积分能力是「未登记 = 不支持」（避免必然
+失败的请求），而限流这里必须是「未登记 = **支持**」—— 那组按钮是**既有 UI**，
+若默认关闭，将来新增 provider 忘记登记会让老用户**凭空失去**按钮（可见的功能
+回退）。故判据写成 `rateLimit !== false`。
+
+⚠️ 面板级（「重测所有 / 重置所有」）与卡片级（「重测 / 重置」）**都要门控**：
+只改面板级会让卡片上仍留着两个永远无效的按钮。
+
 ### ⚠️ AccessKey 明文入库（用户明确同意）
 
 `src/loomy-product.ts` 内含从 Loomy 客户端解密得到的讯飞账号 AccessKey。

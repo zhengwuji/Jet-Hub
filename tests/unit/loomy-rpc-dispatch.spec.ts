@@ -77,6 +77,34 @@ describe('Loomy RPC 分派', () => {
     }
   })
 
+  /**
+   * ⚠️ **Loomy 永久积分锁定**端点（用户需求）。
+   *
+   * 锁定后选号只允许消耗今日赠送额度，永久积分不参与。
+   */
+  it('新增了 loomy.permanentLock 端点（读 / 写两用）', () => {
+    expect(rpcSource).toContain("case 'loomy.permanentLock'")
+    expect(rpcSource).toMatch(/pool\.loomyPermanentLocked\(\)/)
+    expect(rpcSource).toMatch(/pool\.setLoomyPermanentLocked\(/)
+    // locked 省略 = 只读
+    expect(rpcSource).toMatch(/req\.locked === undefined/)
+  })
+
+  /**
+   * ⚠️ 写锁定会改变**选号结果**，故必须广播 `llm/adapters-updated`
+   * （与 `model.setDisabled` 同理，见 AGENTS.md 的对应章节）。
+   */
+  it('写锁定后广播 llm/adapters-updated，且包 try/catch', () => {
+    const start = rpcSource.indexOf("case 'loomy.permanentLock'")
+    expect(start).toBeGreaterThan(-1)
+    const end = rpcSource.indexOf("case 'onboarding.claim'", start)
+    expect(end).toBeGreaterThan(start)
+    const body = rpcSource.slice(start, end)
+    expect(body).toContain("ctx.emit('llm/adapters-updated')")
+    // 通知失败不能反噬已落盘的开关
+    expect(body).toMatch(/try \{[\s\S]{0,200}ctx\.emit\([\s\S]{0,300}catch/)
+  })
+
   it('未登记的 provider 调 onboarding.* 时返回可读错误（不是泛化文案）', () => {
     expect(rpcSource).toMatch(/onboarding[\s\S]{0,3000}unsupported provider/)
   })
