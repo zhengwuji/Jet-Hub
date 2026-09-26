@@ -428,6 +428,69 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 - `reconcileWithFallback` 是**白名单式重建**：新增的远端字段不在此显式搬运就会
   被静默丢弃（`creditsRate` / `discountedCreditsRate` 已加）
 
+### ⚠️ TRAE 思考档位：多通道合并**不得**用空档位条目覆盖有档位的条目（Issue IKI7WT/IKILR7）
+
+**真实缺陷**（用户报障「模型缺少思考强度」）：`parseTraeBatchModelList` 用
+**无条件「后面的覆盖前面的」**合并同名模型，其注释假设「后面的条目带着更完整的
+配置」——**该假设与真实数据正好相反**。上游把**空档位**的 `solo_work_lite` /
+`solo_design_remote` 等条目排在**最后**，于是信息更全的条目被覆盖成了更空的条目。
+UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reasoning` →
+「当前模型未提供推理等级」。
+
+实测（2026-09-26，`scripts/probe-trae-reasoning-order.ts`）：**13 个模型**丢掉档位
+（`deepseek-v4.1-flash` / `glm-5.2` / `glm-5.3` / `kimi-k3` / `qwen3.8-max` /
+`DeepSeek-V4-Flash-Official` / `DeepSeek-V4-Pro-Official` …）。修复后目录里
+**有档位的模型从 5 个恢复到 15 个**。
+
+同一模型在不同通道的档位**不一致**（这正是「后覆盖前」出事的原因）：
+
+| 通道 | `deepseek-v4.1-flash` 的 `reasoning_effort_config` | 顺序 |
+|---|---|---|
+| `chat_v3` | `{default:high, options:[light,high,extra_high], support_thinking:true}` | 早 |
+| `solo_agent` | 同上，且 `max_tokens` 32000 / `context_window.max` 1000000 / `max_mode:true` | 中 |
+| `solo_agent_remote` / `solo_agent_lite` | 同上 | 中 |
+| `solo_work_remote` / **`solo_work_lite`** | `{options:[], support_thinking:false}` | **最后** |
+
+修正后的合并规则（三条，见 `parseTraeBatchModelList` 注释）：
+
+1. **空档位不得覆盖有档位**（已选有档位 + 候选无档位 → 保留已选）；
+2. **两侧都有档位时按 `channelPriority` 取更靠前者**（默认 `TRAE_CHANNELS`，
+   「顺序即优先级」，故通常落到 `solo_agent`）；
+3. **其余情形（含两侧都无档位）保持既有「后覆盖前」**，避免与本缺陷无关的
+   通道迁移 —— 这条保证 `glm-5.1` / `qwen-3.5` 等无档位模型行为**逐字节不变**。
+
+四个必须记住的点：
+
+- ⚠️ **档位必须与 `function` 同源，整条择优**：发档位的通道必须正是声明支持它的
+  通道。**不要**只把 `reasoningConfig` 单独搬运到另一条条目上（例如保留
+  `solo_work_lite` 的 `function` 却声明档位）——那是在一个自称
+  `support_thinking:false` 的通道上宣布档位。
+- ⚠️ **判据必须与 `TraeAdapter.reasoningFor` 完全一致**：配置存在 **且**
+  `support_thinking !== false` **且** `options` 非空（`declaresReasoningOptions`）。
+  只判「配置存在」会选中 `{support_thinking:false, options:['high']}` 这种
+  适配器里仍返回 `undefined` 的条目，**等于没修**。两处改动必须同步。
+- ⚠️ **可调用性不受影响**：候选始终只来自**列出了该模型的通道**，故无论选中哪条
+  都不会路由到「未列出该模型」的通道（那才会回流内 4001）。已实测：
+  `deepseek-v4.1-flash` 通道从 `solo_work_lite` 迁到 `solo_agent` 后，
+  不带档位与 `reasoning_effort=extra_high` **各发一次均 HTTP 200、正常返回**。
+- ⚠️ **`DeepSeek-V4-Flash` / `DeepSeek-V4-Pro`（无后缀）修好后仍然无档位** ——
+  它们**所有**带档位的通道条目都被 `is_invisible_to_user=true` 剔除（官方隐藏），
+  只剩 `solo_coder` / `chat` 的可见条目。这是官方可见性，**不是**合并缺陷；
+  带 `-Official` 后缀的那两个已正常恢复。
+
+排查/回归：
+
+- `scripts/probe-trae-reasoning-order.ts` —— 按上游顺序回放「后覆盖前」，列出被吃掉的
+  模型与修复后的目录（只读，零额度）
+- `scripts/probe-trae-merge-replay.ts <模型 id…>` —— 打印指定模型在**全部通道**的条目
+  （含三条硬过滤的 DROP 原因、`max_tokens` / `context_window` / `max_mode` 差异）
+  与最终合并结果
+- `tests/unit/trae.spec.ts` 的「档位不被空档位条目覆盖」段（7 条）—— ⚠️ 已做**反向
+  验证**：临时退回「无条件后覆盖前」时其中 4 条会失败，故不是同义反复
+- `tests/e2e/trae-reasoning-probe.e2e.spec.ts`（`pnpm test:e2e:trae-reasoning`，**消耗
+  额度**，双闸门 `DSH_TRAE_REASONING_E2E=1` + `…_CONFIRM=yes`）—— 真实目录档位断言
+  + `resolveModel` 真声明出 `efforts` + 新通道真实收发两次
+
 ### TRAE 倍率（藏在 `display_contact_config` 里，且该字段是** JSON 字符串**）
 
 ⚠️ **最大的坑**：`display_contact_config` 的值是**一个字符串**，里面才是 JSON。
@@ -1846,13 +1909,45 @@ POST {agentHost}/api/ide/v1/batch_get_detail_param
 - 不声明 `reasoning` 的两种情形：**远端没有该配置**（UI 显示「当前模型未提供
   推理等级」）与 **`support_thinking === false`**（远端明确说不支持思考）。
   后者若照旧声明档位，会让用户选一个发了也没用的值。
-- ⚠️ **默认档取「最强档」，不采信远端的 `default_level`**：上游那个是它自己的保守
-  默认（实测多为 `high`，而最高档常是 `extra_high`）。用户要求「所有模型默认用 max」，
-  故 `strongestTraeEffort` 按三条规则逐级退化挑默认值：
-  1. `options` 里显式含 `max` → 用它；
-  2. 否则取 `TRAE_EFFORT_RANK` 里排名最高的（`light < high < extra_high < xhigh < max`）；
-  3. 全都未登记（上游新增档位）→ 取数组**末项**（远端按强度升序给出）。
-  `TRAE_EFFORT_RANK` **只用于挑默认档**，不参与 wire 取值。
+- ⚠️ **默认档优先采信远端 `default_level`**（2026-09-26 变更，此前是「一律取最强档」）：
+  用户报障「为什么默认是最高档位的思考？按说应该用次高档做默认吧？」。旧行为
+  （AGENTS.md 更早版本记的「用户要求所有模型默认用 max」）代价是每次请求都顶格
+  思考，而思考 token **计入 `completion_tokens`**、与正文共享额度。
+  现规则见 `defaultTraeEffort()`：`default_level` **存在且在 `options` 内**就用它，
+  否则退 `strongestTraeEffort`。实测 6 个模型的新旧对照：
+
+  | 模型 | options | 上游 `default_level` | 旧默认 | 新默认 |
+  |---|---|---|---|---|
+  | `deepseek-v4.1-flash` | light,high,extra_high | `high` | extra_high | **high** |
+  | `glm-5.2` | high,extra_high | `high` | extra_high | **high** |
+  | `qwen3.8-max` | light,high,extra_high | `high` | extra_high | **high** |
+  | `Doubao-Seed-2.1-Pro` | light,high | `high` | high | high |
+  | `glm-5.3` | light,high,extra_high | `extra_high` | extra_high | extra_high |
+  | `kimi-k3` | light,high,extra_high | `extra_high` | extra_high | extra_high |
+
+  ⚠️ **不要改成「固定取次高档」**：后两行说明上游**自己**在 `glm-5.3` / `kimi-k3`
+  上选了最高档，机械取次高会把它们无谓降下来。以**上游的判断**为准。
+- ⚠️ **`default_level` 是外部输入，必须校验它在 `options` 内**：DSH 会拿
+  `defaultEffort` 直接发请求，给不存在的档位抛 `UNSUPPORTED_REASONING_EFFORT`
+  （`dsh-llm` 的 `resolveCallWithInfo`）。实测上游确实会下发
+  `default_level: 'max'` 而 `options` 里没有 `max` —— 此时必须退到最强**可用**档。
+- ⚠️ **UI 里没有「Default（跟随上游默认）」这一档**：`dsh-client-ui-model-selection`
+  只在 `reasoning.defaultEffort === undefined` 时才注入该选项
+  （`client.js` 的 `effortChoices`）。我们总是声明 `defaultEffort`，故用户可选项
+  只有 `Light / High / Extra High`。
+- ⚠️ **DSH 不按模型记忆档位**：切换模型时走 `client.js` 的
+  `state.current?.provider === group.id && state.current.model === model.id ? … :
+  model.reasoning?.defaultEffort` —— 切到别的模型再切回来取的是**新模型的
+  `defaultEffort`**，不是上次手选的档位。故「切走再切回仍是最高档」在旧行为下
+  是必然结果（默认档就是最高档），不是"记住了"。**区分方法**：先选次高档
+  `high`、切走、再切回，若回到 `extra_high` 即为该机制而非记忆。
+- ⚠️ **`extra_high` 下正文可能为空，这是模型行为、不是档位被拒**：实测
+  `maxTokens` 给到 4096，同一档位重复调用仍**随机地**有时返回「好的」、有时
+  只回思考不吐正文（`outputTokens` 仅 41~113、几乎全是 `reasoningTokens`，
+  `finish.reason` 均为 `stop`）。故 e2e **不要断言「正文非空」**（会随机失败），
+  判据用 `finish.reason.kind === 'stop'`。排查脚本
+  `scripts/probe-trae-effort-stream.ts <model> <effort|''> <maxTokens>`（打印
+  每个 chunk 类型、usage 与 finish 原因；**消耗额度**）。
 - `defaultEffort` 必须落在 `efforts` 内 —— DSH 会拿它直接发请求，给一个不存在的
   档位会抛 `UNSUPPORTED_REASONING_EFFORT`。因为取值来自 `options` 本身，天然满足。
   实测 DSH 侧物化逻辑：`dsh-llm` 的 `LlmRuntime` 在 `requested ?? reasoning.defaultEffort`

@@ -421,7 +421,23 @@ describe('多通道批量解析（batch_get_detail_param）', () => {
     }
   }
 
-  it('后面的覆盖前面的——同一模型在多个 function 中取最后一条', () => {
+  /** 一条带思考档位的条目（真实形状）。 */
+  function effortEntry(
+    id: string,
+    options: string[],
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return entry(id, {
+      reasoning_effort_config: {
+        default_level: options[options.length - 1],
+        options,
+        support_thinking: true,
+      },
+      ...extra,
+    })
+  }
+
+  it('两侧都无档位时后面的覆盖前面的——同一模型在多个 function 中取最后一条', () => {
     const models = parseTraeBatchModelList(batch([
       ['solo_work_lite', [entry('glm-5.2'), entry('glm-5-turbo')]],
       ['solo_agent_remote', [entry('glm-5.2'), entry('glm-5.1')]],
@@ -432,6 +448,91 @@ describe('多通道批量解析（batch_get_detail_param）', () => {
       ['glm-5-turbo', 'solo_work_lite'],
       ['glm-5.1', 'solo_agent_remote'],
     ])
+  })
+
+  // ── issue IKI7WT/IKILR7「模型缺少思考强度」──
+  //
+  // 真实数据里上游把**空档位**的 `solo_work_lite` / `solo_design_remote` 等条目
+  // 排在**最后**，原实现的「无条件后覆盖前」于是用空条目覆盖了信息更全的条目，
+  // 实测（2026-09-26）13 个模型丢掉档位、UI 显示「未提供推理等级」。
+  describe('档位不被空档位条目覆盖（issue IKI7WT/IKILR7）', () => {
+    it('空档位条目排在最后时不得覆盖有档位条目', () => {
+      const models = parseTraeBatchModelList(batch([
+        ['chat_v3', [effortEntry('deepseek-v4.1-flash', ['light', 'high', 'extra_high'])]],
+        ['solo_agent', [effortEntry('deepseek-v4.1-flash', ['light', 'high', 'extra_high'])]],
+        ['solo_work_lite', [entry('deepseek-v4.1-flash', {
+          reasoning_effort_config: { options: [], support_thinking: false },
+        })]],
+      ]))
+      const model = models[0]!
+      // ⚠️ 反向验证：把本用例喂给修改前的「无条件后覆盖前」实现，
+      // `function` 会变成 `solo_work_lite`、`reasoningConfig.options` 会变成 `[]`。
+      expect(model.function).toBe('solo_agent')
+      expect(model.reasoningConfig?.options).toEqual(['light', 'high', 'extra_high'])
+    })
+
+    it('完全没有 reasoning_effort_config 的条目同样不得覆盖有档位条目', () => {
+      const models = parseTraeBatchModelList(batch([
+        ['solo_agent', [effortEntry('glm-5.2', ['high', 'extra_high'])]],
+        ['solo_design_remote', [entry('glm-5.2')]],
+      ]))
+      expect(models[0]!.function).toBe('solo_agent')
+      expect(models[0]!.reasoningConfig?.options).toEqual(['high', 'extra_high'])
+    })
+
+    it('两侧都有档位时按通道优先级取更靠前者（不是后覆盖前）', () => {
+      const models = parseTraeBatchModelList(batch([
+        ['solo_agent_remote', [effortEntry('glm-5.2', ['high', 'extra_high'])]],
+        ['solo_agent', [effortEntry('glm-5.2', ['light', 'high', 'extra_high'])]],
+      ]))
+      // solo_agent 在 TRAE_CHANNELS 中位于首位，虽然后出现仍应胜出。
+      expect(models[0]!.function).toBe('solo_agent')
+      expect(models[0]!.reasoningConfig?.options).toEqual(['light', 'high', 'extra_high'])
+    })
+
+    it('优先级表可用第二参数覆盖', () => {
+      const body = batch([
+        ['solo_agent', [effortEntry('glm-5.2', ['high'])]],
+        ['solo_work_lite', [effortEntry('glm-5.2', ['high', 'extra_high'])]],
+      ])
+      expect(parseTraeBatchModelList(body)[0]!.function).toBe('solo_agent')
+      // 显式把 solo_work_lite 提到首位 → 选中它。
+      expect(parseTraeBatchModelList(body, ['solo_work_lite'])[0]!.function).toBe('solo_work_lite')
+    })
+
+    it('已选条目不在优先级表内时，有档位者仍胜出（档位优先于顺序）', () => {
+      const models = parseTraeBatchModelList(batch([
+        ['chat', [effortEntry('x', ['high'])]],
+        ['solo_agent', [effortEntry('x', ['light', 'high', 'extra_high'])]],
+      ]))
+      expect(models[0]!.function).toBe('solo_agent')
+      expect(models[0]!.reasoningConfig?.options).toEqual(['light', 'high', 'extra_high'])
+    })
+
+    it('support_thinking:false 的条目不算「能声明档位」（与适配器判据一致）', () => {
+      const models = parseTraeBatchModelList(batch([
+        ['solo_agent', [effortEntry('x', ['high', 'extra_high'])]],
+        // options 非空但显式不支持思考：适配器 `reasoningFor` 仍会返回 undefined，
+        // 故它不得把真正能声明的条目覆盖掉（否则等于没修）。
+        ['solo_work_lite', [entry('x', {
+          reasoning_effort_config: { options: ['high'], support_thinking: false },
+        })]],
+      ]))
+      expect(models[0]!.function).toBe('solo_agent')
+      expect(models[0]!.reasoningConfig?.supportThinking).toBe(true)
+    })
+
+    it('有档位条目之后的空档位条目仍可用于过滤（isHidden 等三条硬过滤不受影响）', () => {
+      const models = parseTraeBatchModelList(batch([
+        ['solo_agent', [effortEntry('x', ['high'])]],
+        ['solo_work_lite', [
+          entry('x', { reasoning_effort_config: { options: [], support_thinking: false }, is_invisible_to_user: true }),
+          entry('y', { is_invisible_to_user: true }),
+        ]],
+      ]))
+      expect(models.map((m) => m.id)).toEqual(['x'])
+      expect(models[0]!.function).toBe('solo_agent')
+    })
   })
 
   it('读取 context_window_tokens.dev（不是 max）与 model_detail_list.max_tokens', () => {

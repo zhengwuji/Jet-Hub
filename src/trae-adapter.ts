@@ -41,6 +41,7 @@ import {
   transformToSOLOBody,
   type TraeCredential,
   type TraeSSEEvent,
+  type TraeReasoningConfig,
   type TraeRemoteModel,
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
@@ -118,6 +119,47 @@ function strongestTraeEffort(options: readonly string[]): string | undefined {
     }
   }
   return best ?? options[options.length - 1]
+}
+
+/**
+ * 挑默认思考档：**上游 `default_level` 优先**，缺失或非法才退到 `fallback`。
+ *
+ * ## 为什么是「采信上游」而不是自己定规则
+ *
+ * 早期实现一律取最强档（用户当时的要求），但那会让每次请求都顶格思考 ——
+ * 思考 token **计入 `completion_tokens`**，与正文共享额度，于是正文更早撞
+ * `max_tokens`、首字更慢。改为采信上游后，实测（2026-09-26，`solo_agent` 可见集）：
+ *
+ * | 模型 | options | 上游 `default_level` | 旧默认 | 新默认 |
+ * |---|---|---|---|---|
+ * | `deepseek-v4.1-flash` | light,high,extra_high | `high` | extra_high | **high** |
+ * | `glm-5.2` | high,extra_high | `high` | extra_high | **high** |
+ * | `qwen3.8-max` | light,high,extra_high | `high` | extra_high | **high** |
+ * | `Doubao-Seed-2.1-Pro` | light,high | `high` | high | high |
+ * | `glm-5.3` | light,high,extra_high | `extra_high` | extra_high | extra_high |
+ * | `kimi-k3` | light,high,extra_high | `extra_high` | extra_high | extra_high |
+ *
+ * ⚠️ 注意后两行：上游**自己**在 `glm-5.3` / `kimi-k3` 上选了最高档。故不能改成
+ * 「固定取次高档」——那会把这两个上游认可的最高档无谓降下来。
+ *
+ * ⚠️ `default_level` 是**外部输入**，必须校验它真的在 `options` 里：DSH 会拿
+ * `defaultEffort` 直接发请求，给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
+ * （见 `dsh-llm` 的 `resolveCallWithInfo`）。实测上游确实会下发
+ * `default_level: 'max'` 而 `options` 里没有 `max` —— 此时必须退到 `fallback`，
+ * **不能**照抄。
+ *
+ * @param config 远端档位配置（`options` / `defaultLevel`）。
+ * @param fallback `default_level` 不可用时的兜底档（通常是最强档）。
+ */
+function defaultTraeEffort(
+  config: TraeReasoningConfig,
+  fallback: string | undefined,
+): string | undefined {
+  const declared = config.defaultLevel
+  if (declared !== undefined && declared.length > 0 && config.options.includes(declared)) {
+    return declared
+  }
+  return fallback
 }
 
 /** SSE 空闲超时（分两阶段，环境变量可覆盖）。 */
@@ -632,13 +674,17 @@ export class TraeAdapter extends LlmAdapter {
       id: ReasoningEffortId(option),
       name: TRAE_EFFORT_NAMES[option] ?? option,
     }))
-    // ⚠️ 默认档取**最强档**，不采信远端 `default_level`：上游那个是它自己的
-    // 保守默认（实测多为 `high`，而最高档常是 `extra_high`）。本插件按用户
-    // 要求一律默认最强，用户仍可在 DSH 里手动降档。
-    const strongest = strongestTraeEffort(config.options)
+    // ⚠️ 默认档**优先采信上游 `default_level`**（见 {@link defaultTraeEffort}）。
+    // 早期实现一律取最强档（用户当时要求「所有模型默认用 max」），代价是思考
+    // token 与正文共享 `completion_tokens`、正文更早撞上限。改为采信上游后：
+    // 实测 6 个模型里 4 个上游给的就是次高档 `high`，而 `glm-5.3` / `kimi-k3`
+    // 上游自己选的是 `extra_high` —— 机械取「次高档」会把后两者无谓降档，
+    // 故以**上游的判断**为准，而不是自己定一条规则。
+    const fallback = strongestTraeEffort(config.options)
+    const chosen = defaultTraeEffort(config, fallback)
     return {
       efforts,
-      ...strongest !== undefined ? { defaultEffort: ReasoningEffortId(strongest) } : {},
+      ...chosen !== undefined ? { defaultEffort: ReasoningEffortId(chosen) } : {},
     }
   }
 

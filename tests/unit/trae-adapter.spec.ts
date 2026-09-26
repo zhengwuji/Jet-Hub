@@ -512,7 +512,7 @@ describe('TRAE 适配器 · resolveModel', () => {
 
   // ── 推理强度（reasoning_effort_config）──
 
-  it('reasoning 档位取自远端 reasoningConfig.options，默认档取最强档', async () => {
+  it('默认档采信远端 default_level（不再一律取最强档）', async () => {
     const { adapter } = makeAdapter({
       remoteModels: [{
         id: 'glm-5.3', name: 'GLM-5.3',
@@ -523,15 +523,50 @@ describe('TRAE 适配器 · resolveModel', () => {
     expect(reasoning?.efforts.map((e) => e.id)).toEqual(['light', 'high', 'extra_high'])
     // 展示名做了美化（extra_high → Extra High），但 id 仍是 wire 值
     expect(reasoning?.efforts.find((e) => e.id === 'extra_high')?.name).toBe('Extra High')
-    // ⚠️ 不采信远端 default_level（'high'），一律取最强档 'extra_high'
-    expect(reasoning?.defaultEffort).toBe('extra_high')
+    // ⚠️ 采信远端 default_level（'high'），不再一律取最强档 'extra_high'
+    expect(reasoning?.defaultEffort).toBe('high')
   })
 
-  it('options 含 max 时默认档取 max（即便它在数组中间）', async () => {
+  it('远端 default_level 就是最高档时照用（glm-5.3 / kimi-k3 的真实形态）', async () => {
+    const { adapter } = makeAdapter({
+      remoteModels: [{
+        id: 'kimi-k3', name: 'Kimi-K3',
+        reasoningConfig: { defaultLevel: 'extra_high', options: ['light', 'high', 'extra_high'] },
+      }],
+    })
+    // 上游自己选了最高档 → 不能被「固定取次高档」的规则降下来。
+    expect((await adapter.resolveModel('trae', 'kimi-k3')).reasoning?.defaultEffort).toBe('extra_high')
+  })
+
+  it('无 default_level 时退到最强档', async () => {
     const { adapter } = makeAdapter({
       remoteModels: [{
         id: 'x', name: 'X',
-        reasoningConfig: { defaultLevel: 'low', options: ['low', 'max', 'high'] },
+        reasoningConfig: { options: ['light', 'high', 'extra_high'] },
+      }],
+    })
+    expect((await adapter.resolveModel('trae', 'x')).reasoning?.defaultEffort).toBe('extra_high')
+  })
+
+  it('default_level 不在 options 内时退到最强可用档（不照抄非法值）', async () => {
+    // ⚠️ 实测上游确实会下发 default_level='max' 而 options 里没有 max。
+    // 照抄会让 DSH 抛 UNSUPPORTED_REASONING_EFFORT，整轮对话起不来。
+    const { adapter } = makeAdapter({
+      remoteModels: [{
+        id: 'x', name: 'X',
+        reasoningConfig: { defaultLevel: 'max', options: ['low', 'high'] },
+      }],
+    })
+    const reasoning = (await adapter.resolveModel('trae', 'x')).reasoning
+    expect(reasoning?.defaultEffort).toBe('high')
+    expect(reasoning?.efforts.some((e) => e.id === reasoning?.defaultEffort)).toBe(true)
+  })
+
+  it('options 含 max 时默认档取 max（即便它在数组中间，且上游未声明 default_level）', async () => {
+    const { adapter } = makeAdapter({
+      remoteModels: [{
+        id: 'x', name: 'X',
+        reasoningConfig: { options: ['low', 'max', 'high'] },
       }],
     })
     expect((await adapter.resolveModel('trae', 'x')).reasoning?.defaultEffort).toBe('max')
@@ -550,8 +585,6 @@ describe('TRAE 适配器 · resolveModel', () => {
   })
 
   it('defaultEffort 恒落在 efforts 内（否则 DSH 会拿不存在的档位去请求）', async () => {
-    // 远端声明 default_level='max' 但 options 里没有 max —— 旧实现会退化为
-    // 不声明默认值；现在改为取最强**可用**档，仍然是合法值。
     const { adapter } = makeAdapter({
       remoteModels: [{
         id: 'x', name: 'X',
