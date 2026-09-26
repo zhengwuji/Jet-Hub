@@ -147,6 +147,17 @@ const STYLES = `
 /* 复用登录弹窗的遮罩模式：fixed 覆盖全屏，z-index 高于设置页内容。
    3000 高于 .dim-jh-loginOverlay 的 1000，保证两个弹窗同时存在时模型列表在上。 */
 .dim-jh-modalOverlay { position: fixed; inset: 0; z-index: 3000; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(0,0,0,0.32); }
+/* 模型列表弹窗：**顶部锚定**而非垂直居中。
+   ⚠️ 这是修真实缺陷（用户报障「输入文字后整个弹框的位置会发生改变，有点突兀」）：
+   弹窗高度随列表长度变化，而 align-items: center 会把高度变化直接变成**整体
+   位置跳动** —— 实测输入搜索词后 top 从 4px 跳到 187px（结果变少 → 弹窗变矮 →
+   居中的位置跟着上移）。顶部锚定后上边缘固定，只在下方伸缩，视觉上稳定。
+   只作用于模型列表，不影响账号备份弹窗。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。 */
+.dim-jh-modalOverlay--top { align-items: flex-start; padding-top: max(24px, 8vh); }
+/* 顶锚后可用高度由 padding 决定，故 max-height 按 padding box 计算（100%），
+   不再用 100vh - 48px 这类视口算式 —— 否则 8vh 大于 24px 时会溢出视口。 */
+.dim-jh-modalOverlay--top .dim-jh-modal { max-height: 100%; }
 .dim-jh-modal { display: flex; flex-direction: column; width: min(560px, 100%); max-height: min(640px, calc(100vh - 48px)); padding: 20px 22px; border-radius: 14px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
 .dim-jh-modalHead { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .dim-jh-modalTitle { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
@@ -160,20 +171,43 @@ const STYLES = `
 .dim-jh-emph-warn { color: #b45309; font-weight: 600; }
 .dim-jh-modal .dim-jh-probeNotice { flex: none; margin: 10px 0 0; }
 /* 批量工具条（打开全部 / 关闭全部）：固定不滚动，紧跟在说明文字下方 */
-.dim-jh-modelBulkBar { flex: none; display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.dim-jh-modelBulkBar { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+/* 搜索 + 状态筛选条（Cline 目录近 500 条，没有它就只能一页页翻）。
+   允许换行：窄面板下搜索框与三个状态按钮放不进一行。 */
+.dim-jh-modelFilterBar { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+/* 搜索框占据剩余宽度，最小 140px —— 再窄就输不下有意义的模型名片段。 */
+.dim-jh-modelSearch { flex: 1 1 140px; min-width: 140px; width: auto; }
+.dim-jh-modelStatusFilter { flex: none; display: flex; align-items: center; gap: 6px; }
+/* 选中的筛选按钮高亮：三个按钮外观一致时用户看不出当前筛的是什么。 */
+.dim-jh-modelStatusFilter .dim-jh-btn[data-active="true"] { border-color: #1677ff; color: #1677ff; background: color-mix(in srgb, #1677ff 10%, var(--dsw-alias-bg-layer-3, #fff)); font-weight: 600; }
 /* 列表区独立滚动：头部与说明固定，模型多时只滚中间 */
-.dim-jh-modalBody { flex: 1 1 auto; min-height: 0; margin-top: 10px; overflow-y: auto; }
+/* ⚠️ overflow-x: hidden 是**兜底**，不是主修复（主修复见下方 grid 的 minmax）。
+   没有它时，任何一行的偶然溢出都会让整个弹窗出现横向滚动条，而横向滚动条会把
+   每一行的**开关**一起推出可视区 —— 用户报障「开关在最右边，要横向滑动才看得到」。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串，
+   本次就因此构建失败过一次）—— 说明 CSS 属性时一律不加反引号。 */
+.dim-jh-modalBody { flex: 1 1 auto; min-height: 0; margin-top: 10px; overflow-y: auto; overflow-x: hidden; }
 .dim-jh-modalBody .dim-jh-empty { padding: 24px; }
 
 /* 每行一个模型：左侧名称 + id，右侧开关 */
-.dim-jh-modelList { display: grid; gap: 2px; }
-.dim-jh-modelRow { display: flex; align-items: center; gap: 12px; padding: 7px 8px; border-radius: 8px; cursor: pointer; transition: background .15s ease; }
+/* ⚠️ grid-template-columns: minmax(0, 1fr) 是**必须的**，不能省。
+   单列 grid 的列宽默认是 auto，而 grid 项的 min-width 默认也是 auto ——
+   两者叠加会让列宽按**最宽内容**撑开，于是长 id 把行推宽、行末的开关被挤出
+   弹窗右边缘（真实缺陷：Cline 有 300 个 id 超过 20 字符，几乎每行都中招，
+   表现为「开关在最后，需要横向滑动，我看不到」）。
+   minmax(0, 1fr) 把列的最小宽度显式压到 0，行才会跟着容器收缩。 */
+.dim-jh-modelList { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; }
+/* 行本身是 grid 项也是 flex 容器，两处都需要 min-width: 0 才允许收缩。 */
+.dim-jh-modelRow { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 7px 8px; border-radius: 8px; cursor: pointer; transition: background .15s ease; }
 .dim-jh-modelRow:hover { background: var(--dsw-alias-bg-layer-2, #f7f8fa); }
 /* 已关闭的模型整体降透明度：一眼能看出哪些被隐藏了 */
 .dim-jh-modelRow[data-disabled="true"] .dim-jh-modelInfo { opacity: 0.5; }
 .dim-jh-modelInfo { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
-.dim-jh-modelName { min-width: 0; overflow: hidden; font-size: 13px; line-height: 19px; font-weight: 500; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
-.dim-jh-modelId { flex: none; overflow: hidden; padding: 1px 5px; border-radius: 5px; background: var(--dsw-alias-bg-layer-2, #f4f5f7); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); text-overflow: ellipsis; white-space: nowrap; }
+/* 名称与 id 都必须能收缩（min-width: 0 + 可收缩的 flex-basis），否则长内容会
+   顶宽整行。展示名优先保留，故 id 另加 max-width 上限。
+   ⚠️ id 早期是 flex: none（拒绝收缩）—— 那正是「开关被挤出可视区」最直接的成因。 */
+.dim-jh-modelName { flex: 0 1 auto; min-width: 0; overflow: hidden; font-size: 13px; line-height: 19px; font-weight: 500; color: var(--dsw-alias-label-primary, #1f2329); text-overflow: ellipsis; white-space: nowrap; }
+.dim-jh-modelId { flex: 0 1 auto; min-width: 0; max-width: 46%; overflow: hidden; padding: 1px 5px; border-radius: 5px; background: var(--dsw-alias-bg-layer-2, #f4f5f7); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); text-overflow: ellipsis; white-space: nowrap; }
 
 /* 开关：基于 checkbox 绘制，保持原生语义（可聚焦、可键盘操作、可读屏） */
 .dim-jh-switch { flex: none; appearance: none; -webkit-appearance: none; position: relative; width: 34px; height: 20px; margin: 0; border-radius: 999px; background: var(--dsw-alias-border-l2, #d0d3d9); cursor: pointer; transition: background .18s ease; }
@@ -184,9 +218,16 @@ const STYLES = `
 .dim-jh-switch:disabled { opacity: 0.5; cursor: default; }
 
 /* ── 账号备份（导出 / 恢复）── */
-/* 口令输入框：宽度撑满弹窗内容区，避免在窄面板下挤坏布局 */
-.dim-jh-input { box-sizing: border-box; width: 100%; padding: 6px 10px; border: 1px solid var(--dsw-alias-border-l2, #d0d3d9); border-radius: 6px; background: var(--dsw-alias-bg-input, #fff); font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); }
+/* 口令输入框：宽度撑满弹窗内容区，避免在窄面板下挤坏布局。
+   ⚠️ 背景必须用**真实存在**的 token。早期写的是 --dsw-alias-bg-input，而主题里
+   根本没有这个 token（真实的是 bg-base / bg-layer-1/2/3）—— var() 遇不存在的
+   token **不报错**，静默取 fallback #fff，于是深色模式下变成「浅色文字 + 白底」，
+   文字完全看不见（用户报障）。这里对齐官方 Input 原语用的 bg-layer-1，
+   并去掉 fallback 以免再次掩盖 token 拼错。 */
+.dim-jh-input { box-sizing: border-box; width: 100%; padding: 6px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; background: var(--dsw-alias-bg-layer-1); font-size: 13px; color: var(--dsw-alias-label-primary); }
 .dim-jh-input:focus { outline: none; border-color: #1677ff; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 20%, transparent); }
+/* placeholder 用官方 Input 的 dimmed 色：默认色在深色模式下对比度不足。 */
+.dim-jh-input::placeholder { color: var(--dsw-alias-label-dimmed); }
 /* 加密勾选行：勾选框 + 文案一行排开 */
 .dim-jh-checkRow { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; font-size: 13px; color: var(--dsw-alias-label-primary, #1f2329); cursor: pointer; }
 .dim-jh-checkRow input[type="checkbox"] { margin: 0; accent-color: #1677ff; }
