@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from '../../src/account-pool.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -12,11 +15,23 @@ import type { ProviderAccountEntry } from '../../src/types.js'
  */
 function createMockContext(
   initialAccounts: ProviderAccountEntry[] = [],
-  options: { staleReads?: boolean; initialDisabledModels?: Record<string, Record<string, boolean>> } = {},
+  options: {
+    staleReads?: boolean
+    initialDisabledModels?: Record<string, Record<string, boolean>>
+    /** 初始的 Loomy 永久积分锁定状态（模拟「已落盘的老状态」）。 */
+    initialLoomyPermanentLocked?: boolean
+  } = {},
 ) {
-  let stored: { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, Record<string, boolean>> } = {
+  let stored: {
+    accounts?: ProviderAccountEntry[]
+    disabledModels?: Record<string, Record<string, boolean>>
+    loomyPermanentLocked?: boolean
+  } = {
     accounts: initialAccounts,
     ...options.initialDisabledModels !== undefined ? { disabledModels: options.initialDisabledModels } : {},
+    ...options.initialLoomyPermanentLocked !== undefined
+      ? { loomyPermanentLocked: options.initialLoomyPermanentLocked }
+      : {},
   }
   // 滞后读：get() 返回的这个值只在"下一次 replace 之后"才追平
   let visible = stored
@@ -30,6 +45,7 @@ function createMockContext(
       replace: async (value: {
         accounts?: ProviderAccountEntry[]
         disabledModels?: Record<string, Record<string, boolean>>
+        loomyPermanentLocked?: boolean
       }) => {
         if (options.staleReads) {
           // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
@@ -465,6 +481,46 @@ describe('AccountPool', () => {
     // 三条记录都必须留存（fix 前这里会是 [undefined, undefined, t3] 或类似）
     expect(limits).toEqual([t1, t2, t3])
   })
+
+  describe('getStateSnapshot / replaceAll（备份导入用）', () => {
+    it('getStateSnapshot 返回账号与黑名单副本（与进程内解耦）', async () => {
+      await pool.addAccount(makeMockAccount())
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      const snapshot = pool.getStateSnapshot()
+      expect(snapshot.accounts.map(a => a.id)).toEqual(['buddy-001'])
+      expect(snapshot.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+      // 修改快照不应污染进程内权威副本
+      snapshot.accounts.push(makeMockAccount({ id: 'buddy-002' }))
+      snapshot.disabledModels.buddy!['glm-5.3'] = true
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['buddy-001'])
+      expect(pool.disabledModelsFor('buddy').has('glm-5.3')).toBe(false)
+    })
+
+    it('replaceAll 整体替换账号与黑名单', async () => {
+      await pool.addAccount(makeMockAccount())
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      const incoming = [
+        makeMockAccount({ id: 'codearts-9', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_9' }),
+      ]
+      await pool.replaceAll(incoming, { trae: { 'qwen3.8-flash': true } })
+      // 旧账号与旧黑名单被整体清掉
+      expect((await pool.listAllAccounts()).map(a => a.id)).toEqual(['codearts-9'])
+      expect(pool.disabledModelsFor('buddy').size).toBe(0)
+      expect(pool.disabledModelsFor('trae').has('qwen3.8-flash')).toBe(true)
+    })
+
+    it('replaceAll 归一化坏条目（丢弃缺 id/provider/credentialRef 的账号）', async () => {
+      await pool.addAccount(makeMockAccount())
+      // 手工编辑的备份可能带残缺条目：缺 credentialRef 的应被丢弃
+      const incoming = [
+        makeMockAccount(),
+        { id: 'broken', provider: 'buddy' } as ProviderAccountEntry,
+      ]
+      await pool.replaceAll(incoming, {})
+      const list = await pool.listAllAccounts()
+      expect(list.map(a => a.id)).toEqual(['buddy-001'])
+    })
+  })
 })
 
 describe('findAccountIdByCredential 的 provider 字段选择', () => {
@@ -719,6 +775,125 @@ describe('AccountPool 模型黑名单', () => {
     expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'hy3', 'kimi-k2.6'])
   })
 
+  /**
+   * 批量开关（Jet Hub 模型列表的「打开全部 / 关闭全部」）。
+   *
+   * 两个方向的语义**刻意不对称**，这是需求明确规定的：
+   * - 关闭全部（`setModelsDisabled`）：按**当前列表**逐项写入黑名单；
+   * - 打开全部（`clearDisabledModels`）：直接**删除该 provider 的全部关闭项**，
+   *   不需要模型目录。
+   *
+   * 拆成两个方法而不是「一个带 disabled 布尔的方法」的理由：两者需要的入参本就
+   * 不同（关闭要 id 列表、打开不要），合并只会让调用方传一个打开时被忽略的参数。
+   * 不对称还有实质好处：打开全部若也按列表走，那些「曾被关闭、后来从服务端目录
+   * 里下线」的历史遗留键永远清不掉 —— 黑名单会积累死键，且残留键将来若被同名
+   * 模型复用会莫名隐藏它。
+   */
+  describe('批量开关（打开全部 / 关闭全部）', () => {
+    it('关闭全部：把给定 id 全部写入黑名单', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3', 'kimi-k2.6'])
+
+      expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'hy3', 'kimi-k2.6'])
+    })
+
+    it('关闭全部只写一次（不逐条落盘）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3', 'kimi-k2.6'])
+
+      // 逐条写会产生 3 次 replace；批量必须只写一次，否则 30 个模型就是
+      // 30 次整体重写 + 30 次目录广播。
+      expect(ctx.replacePayloads).toHaveLength(1)
+      expect(ctx.replacePayloads[0]!.disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, hy3: true, 'kimi-k2.6': true },
+      })
+    })
+
+    it('关闭全部保留该 provider 原有的其它关闭项', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { buddy: { 'old-model': true } },
+      }) as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2'])
+
+      expect([...pool.disabledModelsFor('buddy')].sort()).toEqual(['glm-5.2', 'old-model'])
+    })
+
+    it('打开全部：清空该 provider 的全部关闭项', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { buddy: { 'glm-5.2': true, hy3: true } },
+      }) as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(pool.disabledModelsFor('buddy').size).toBe(0)
+    })
+
+    /**
+     * 打开全部**不看模型目录**：目录里已下线的历史遗留键同样要清掉。
+     *
+     * 若按当前目录删除，`gone-model` 这类「曾被关闭、如今已不在目录里」的键会
+     * 永远留在黑名单中，用户点「打开全部」却仍有残留。
+     */
+    it('打开全部：清掉不在当前目录里的历史遗留键', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { buddy: { 'glm-5.2': true, 'gone-model': true } },
+      }) as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(pool.listDisabledModels('buddy')).toEqual({})
+    })
+
+    it('打开全部后 provider 表整体消失（不留 { buddy: {} } 噪音）', async () => {
+      const ctx = createMockContext([], {
+        initialDisabledModels: { buddy: { 'glm-5.2': true } },
+      })
+      const pool = new AccountPool(ctx as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(ctx.replacePayloads.at(-1)!.disabledModels).toEqual({})
+    })
+
+    it('批量操作不影响其它 provider 的黑名单', async () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialDisabledModels: { workbuddy: { 'gpt-5.4': true } },
+      }) as never)
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3'])
+      await pool.clearDisabledModels('buddy')
+
+      expect(pool.disabledModelsFor('buddy').size).toBe(0)
+      expect([...pool.disabledModelsFor('workbuddy')]).toEqual(['gpt-5.4'])
+    })
+
+    it('批量写黑名单不会抹掉账号列表（整体写入语义）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.addAccount({
+        id: 'buddy-bulk', provider: 'buddy', nickname: 'B', enabled: true,
+        credentialRef: 'BUDDY_ACCOUNT_BULK', createdAt: Date.now(), refreshable: true,
+      })
+      await pool.setModelsDisabled('buddy', ['glm-5.2', 'hy3'])
+
+      expect(ctx.replacePayloads.at(-1)!.accounts).toHaveLength(1)
+      expect(await pool.listAllAccounts()).toHaveLength(1)
+    })
+
+    it('关闭全部传空列表时不写盘（没有变更就不该惊动落盘）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setModelsDisabled('buddy', [])
+
+      expect(ctx.replacePayloads).toHaveLength(0)
+    })
+
+    it('打开全部在本就为空时不写盘', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.clearDisabledModels('buddy')
+
+      expect(ctx.replacePayloads).toHaveLength(0)
+    })
+  })
+
   it('从已有配置载入黑名单', () => {
     const pool = new AccountPool(createMockContext([], {
       initialDisabledModels: { buddy: { 'glm-5.2': true } },
@@ -760,6 +935,97 @@ describe('AccountPool 模型黑名单', () => {
     expect(await pool.listAllAccounts()).toHaveLength(1)
   })
 
+  /**
+   * ⚠️ **Loomy 永久积分锁定**（用户要求「需要支持持久化」）。
+   *
+   * 这是**第三个**整体写入的字段，与 `disabledModels` 当年踩过的坑同型：
+   * 任何一处写入漏带它，就会被静默抹掉（用户看到「锁自己解开了」）。
+   */
+  describe('Loomy 永久积分锁定', () => {
+    it('默认解锁（未设置时为 false）', () => {
+      const pool = new AccountPool(createMockContext() as never)
+      expect(pool.loomyPermanentLocked()).toBe(false)
+    })
+
+    it('设置后可读回，并落盘到 replace 载荷', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+
+      expect(pool.loomyPermanentLocked()).toBe(true)
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+    })
+
+    it('可再解锁', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+      await pool.setLoomyPermanentLocked(false)
+      expect(pool.loomyPermanentLocked()).toBe(false)
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(false)
+    })
+
+    /** ⚠️ 新增账号不得抹掉锁定（与黑名单那次同型缺陷）。 */
+    it('新增账号不会抹掉锁定', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+      await pool.addAccount({
+        id: 'loomy-x', provider: 'loomy', nickname: 'X', enabled: true,
+        credentialRef: 'LOOMY_ACCOUNT_X', createdAt: Date.now(), refreshable: false,
+      })
+
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+      expect(pool.loomyPermanentLocked()).toBe(true)
+    })
+
+    /** ⚠️ 改模型黑名单不得抹掉锁定。 */
+    it('写黑名单不会抹掉锁定', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setLoomyPermanentLocked(true)
+      await pool.setModelDisabled('loomy', 'spark-x', true)
+
+      expect(ctx.replacePayloads.at(-1)!.loomyPermanentLocked).toBe(true)
+      expect(pool.loomyPermanentLocked()).toBe(true)
+    })
+
+    /** ⚠️ 反向：写锁定不得抹掉账号与黑名单。 */
+    it('写锁定不会抹掉账号列表与黑名单', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.addAccount({
+        id: 'buddy-z', provider: 'buddy', nickname: 'Z', enabled: true,
+        credentialRef: 'BUDDY_ACCOUNT_Z', createdAt: Date.now(), refreshable: true,
+      })
+      await pool.setModelDisabled('buddy', 'glm-5.2', true)
+      await pool.setLoomyPermanentLocked(true)
+
+      const last = ctx.replacePayloads.at(-1)!
+      expect(last.accounts).toHaveLength(1)
+      expect(last.disabledModels).toEqual({ buddy: { 'glm-5.2': true } })
+    })
+
+    it('跨实例读回（模拟重启）', async () => {
+      const ctx1 = createMockContext()
+      await new AccountPool(ctx1 as never).setLoomyPermanentLocked(true)
+      // 用第一实例落盘的载荷作为「新进程」的初始状态
+      const persisted = ctx1.replacePayloads.at(-1) as { loomyPermanentLocked?: boolean }
+
+      const ctx2 = createMockContext([], {
+        initialLoomyPermanentLocked: persisted.loomyPermanentLocked,
+      })
+      expect(new AccountPool(ctx2 as never).loomyPermanentLocked()).toBe(true)
+    })
+
+    it('初始状态为已锁定时可读回（模拟重启后首次载入）', () => {
+      const pool = new AccountPool(createMockContext([], {
+        initialLoomyPermanentLocked: true,
+      }) as never)
+      expect(pool.loomyPermanentLocked()).toBe(true)
+    })
+  })
+
   it('配置文件里的脏数据被忽略而不是抛错', () => {
     // 模拟手工编辑过的/老版本的配置文件：数组、字符串、false 都应被丢弃
     const pool = new AccountPool(createMockContext([], {
@@ -779,6 +1045,80 @@ describe('AccountPool 模型黑名单', () => {
     const pool = new AccountPool({ get: () => undefined, logger: { warn: () => {}, info: () => {} } } as never)
     await pool.setModelDisabled('buddy', 'glm-5.2', true)
     expect(pool.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+  })
+
+})
+
+/**
+ * Gitee issue IKI7WT 的回归：DSH 0.1.7-rc.1 把 `ctx.settings` 换成
+ * `SettingsForms`（**没有 `register`**，命名空间只能是 profile 条目 id）。
+ * 旧实现因此把账号列表与模型黑名单退化成纯内存 —— 重启即丢。
+ * 这里锁死「settings 无 register 时仍要落盘并跨实例存活」。
+ */
+describe('AccountPool · 0.1.7 契约（settings 无 register）', () => {
+  let stateDir: string
+  let previousDir: string | undefined
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'account-pool-017-'))
+    previousDir = process.env.DSH_JET_HUB_STATE_DIR
+    process.env.DSH_JET_HUB_STATE_DIR = stateDir
+  })
+
+  afterEach(() => {
+    if (previousDir === undefined) delete process.env.DSH_JET_HUB_STATE_DIR
+    else process.env.DSH_JET_HUB_STATE_DIR = previousDir
+    rmSync(stateDir, { recursive: true, force: true })
+  })
+
+  /** 0.1.7 的 SettingsForms 形状：有 describe/configure，但没有 register。 */
+  function make017Context() {
+    return {
+      get: (key: string) => key === 'settings'
+        ? { describe: () => [], configure: () => () => {} }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: true, writable: true, source: 'test' as const }),
+      },
+    }
+  }
+
+  it('账号列表与黑名单跨实例存活（本 issue 的核心断言）', async () => {
+    const first = new AccountPool(make017Context() as never)
+    await first.addAccount({
+      id: 'buddy-01700001',
+      provider: 'buddy',
+      nickname: '0.1.7 用例',
+      enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_01700001',
+      createdAt: Date.now(),
+      refreshable: true,
+    })
+    await first.setModelDisabled('buddy', 'glm-5.2', true)
+
+    // 新实例 = 模拟重启：必须从磁盘读回，而不是空列表。
+    const second = new AccountPool(make017Context() as never)
+    expect((await second.listAccounts('buddy')).map(a => a.id)).toEqual(['buddy-01700001'])
+    expect(second.disabledModelsFor('buddy').has('glm-5.2')).toBe(true)
+  })
+
+  it('写黑名单时不会抹掉账号列表（整体写入语义）', async () => {
+    const pool = new AccountPool(make017Context() as never)
+    await pool.addAccount({
+      id: 'buddy-01700002',
+      provider: 'buddy',
+      nickname: 'x',
+      enabled: true,
+      credentialRef: 'BUDDY_ACCOUNT_01700002',
+      createdAt: Date.now(),
+      refreshable: true,
+    })
+    await pool.setModelDisabled('buddy', 'hy3', true)
+
+    const reloaded = new AccountPool(make017Context() as never)
+    expect((await reloaded.listAccounts('buddy')).map(a => a.id)).toEqual(['buddy-01700002'])
+    expect(reloaded.disabledModelsFor('buddy').has('hy3')).toBe(true)
   })
 })
 

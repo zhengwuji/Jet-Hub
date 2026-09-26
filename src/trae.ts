@@ -36,7 +36,7 @@
 
 import { createHash } from 'node:crypto'
 import { jwtExpiresAtMs } from './buddy.js'
-import type { TraeProduct } from './trae-product.js'
+import { TRAE_CHANNELS, type TraeProduct } from './trae-product.js'
 
 // ── 端点路径 ──
 
@@ -1038,22 +1038,58 @@ export function parseTraeModelList(body: unknown): TraeRemoteModel[] {
  * | `solo_work_remote` / `solo_work_lite` | 44 / 45 | 28 |
  * | `solo_design_remote` / `solo_design_lite` | 27 / 28 | 19 |
  *
- * 合并规则：**后面的覆盖前面的**（同一个 `config_name` 出现在多个 function 中时，
- * 取最后一条）。因为后面的条目可能带着更完整的配置（`display_contact_config` /
- * `reasoning_effort_config` / `model_detail_list`），直接用覆盖保证用到最完整的
- * 那条。同时三条硬性过滤在合并时执行：
+ * 合并规则（**修正后**，见 issue IKI7WT/IKILR7「模型缺少思考强度」）：同一个
+ * `config_name` 出现在多个 function 中时，按下列优先级取**一条**条目——
+ *
+ * 1. **空档位不得覆盖有档位**：候选与已选条目各自「能否声明出思考档位」由
+ *    {@link declaresReasoningOptions} 判定（与 `TraeAdapter.reasoningFor` 同一判据）。
+ *    已选条目有档位而候选没有时**保留已选条目**。
+ * 2. **两侧都声明档位时按 `channelPriority` 取更靠前者**（默认
+ *    {@link TRAE_CHANNELS}，「顺序即优先级」）。
+ * 3. **其余情形保持既有「后覆盖前」语义**（含两侧都无档位），以免造成与本
+ *    缺陷无关的通道迁移。
+ *
+ * ⚠️ 原实现是**无条件「后面的覆盖前面的」**，其注释假设「后面的条目带着更完整的
+ * 配置」——**该假设与真实数据相反**：上游把空档位的 `solo_work_lite` /
+ * `solo_design_remote` 等条目排在**最后**，于是信息更全的条目被覆盖成更空的条目。
+ * 实测（2026-09-26）13 个模型因此丢掉 `reasoning_effort_config`，
+ * `deepseek-v4.1-flash` / `glm-5.2` / `DeepSeek-V4-Pro` 等全部显示「未提供推理等级」。
+ *
+ * ⚠️ **档位必须与 `function` 同源**：发档位的通道必须正是声明支持它的通道，
+ * 否则上游按 `support_thinking:false` 处理（甚至回流内 4001）。故这里整条择优，
+ * 而不是把 `reasoningConfig` 单独搬运到另一条条目上。
+ *
+ * 候选始终只来自**列出了该模型的通道**，因此无论选中哪条，都不会路由到
+ * 「未列出该模型」的通道（上游对那种请求回流内 4001）。
+ *
+ * 同时三条硬性过滤在合并时执行：
  *
  * - `usage` 非 `chat_completion` 的排除
  * - `config_switch === false`（上游已停用）排除
  * - `is_invisible_to_user === true`（官方隐藏）排除
+ *
+ * @param channelPriority 通道优先级（下标越小越优先）。不在其中的通道视为
+ *   最低优先级。仅用于规则 2 的择优。
  */
-export function parseTraeBatchModelList(body: unknown): TraeRemoteModel[] {
+export function parseTraeBatchModelList(
+  body: unknown,
+  channelPriority: readonly string[] = TRAE_CHANNELS,
+): TraeRemoteModel[] {
   if (typeof body !== 'object' || body === null) return []
   const record = body as Record<string, unknown>
   const groups = record.function_configs ?? record.FunctionConfigs
   if (!Array.isArray(groups)) return []
 
+  /** 通道优先级下标；未收录的通道返回 `MAX_SAFE_INTEGER`（最低）。 */
+  const rankOf = (channel: string | undefined): number => {
+    if (channel === undefined) return Number.MAX_SAFE_INTEGER
+    const index = channelPriority.indexOf(channel)
+    return index < 0 ? Number.MAX_SAFE_INTEGER : index
+  }
+
   const byId = new Map<string, TraeRemoteModel>()
+  /** 已选条目所在通道的优先级（仅用于规则 2 的择优）。 */
+  const chosenRank = new Map<string, number>()
   for (const group of groups) {
     if (typeof group !== 'object' || group === null) continue
     const g = group as Record<string, unknown>
@@ -1076,13 +1112,47 @@ export function parseTraeBatchModelList(body: unknown): TraeRemoteModel[] {
       if (model.usage !== undefined && model.usage !== 'chat_completion') continue
       if (model.isEnabled === false) continue
       if (model.isHidden === true) continue
-      // ⚠️ 后面的覆盖前面的：function_configs 中同一个 config_name 可能在多个
-      // function 中出现，后面的条目带着更完整的配置（`display_contact_config` /
-      // `reasoning_effort_config` / `model_detail_list` 等可能更全），直接覆盖。
+      const incumbent = byId.get(model.id)
+      if (incumbent === undefined) {
+        byId.set(model.id, model)
+        chosenRank.set(model.id, rankOf(model.function))
+        continue
+      }
+      // ⚠️ 规则 1 与 2，详见函数注释（issue IKI7WT/IKILR7）。
+      const incumbentHasEffort = declaresReasoningOptions(incumbent)
+      const candidateHasEffort = declaresReasoningOptions(model)
+      // 规则 1：空档位不得覆盖有档位。
+      if (incumbentHasEffort && !candidateHasEffort) continue
+      // 规则 2：两侧都有档位时按通道优先级取更靠前者（档位与 function 同源）。
+      if (incumbentHasEffort && candidateHasEffort) {
+        const current = chosenRank.get(model.id) ?? Number.MAX_SAFE_INTEGER
+        // `current` 为 MAX 表示已选条目不在优先级表内 —— 此时不设限，
+        // 退回「后覆盖前」，避免引入与优先级表无关的行为差异。
+        if (current !== Number.MAX_SAFE_INTEGER && rankOf(model.function) >= current) continue
+      }
+      // 规则 3：其余情形沿用既有的「后覆盖前」。
       byId.set(model.id, model)
+      chosenRank.set(model.id, rankOf(model.function))
     }
   }
   return [...byId.values()]
+}
+
+/**
+ * 该条目**能否真正声明出思考档位**。
+ *
+ * 判据必须与 `TraeAdapter.reasoningFor` 完全一致（配置存在 + 未显式
+ * `support_thinking: false` + `options` 非空）。⚠️ 只判「配置存在」是不够的：
+ * `{support_thinking: false, options: []}` 与 `{support_thinking: false,
+ * options: ['high']}` 都「存在配置」，但前者在适配器里仍会返回 `undefined`
+ * （UI 依旧显示「未提供推理等级」）——若按「存在即优先」合并，就会选中这种
+ * 条目、等于没修。
+ */
+function declaresReasoningOptions(model: TraeRemoteModel): boolean {
+  const config = model.reasoningConfig
+  if (config === undefined) return false
+  if (config.supportThinking === false) return false
+  return config.options.length > 0
 }
 
 // ── 身份 ID 与随机值生成 ──

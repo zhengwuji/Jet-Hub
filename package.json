@@ -11,10 +11,12 @@
       "default": "./lib/index.js"
     },
     "./client": "./lib/client/jet-hub.js",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
+    "locale/*.json",
     "cordis.patch.yml"
   ],
   "scripts": {
@@ -39,6 +41,7 @@
     "test:e2e:lobsterai": "cross-env DSH_LOBSTERAI_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/lobsterai-probe.e2e.spec.ts",
     "test:e2e:lobsterai-claim": "cross-env DSH_LOBSTERAI_E2E=1 DSH_LOBSTERAI_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/lobsterai-claim-probe.e2e.spec.ts",
     "test:e2e:qoder": "cross-env DSH_QODER_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/qoder-probe.e2e.spec.ts",
+    "test:e2e:qoder-credits": "cross-env DSH_QODER_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/qoder-credits-probe.e2e.spec.ts",
     "test:e2e:qoder-chat": "cross-env DSH_QODER_CHAT_E2E=1 DSH_QODER_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/qoder-chat-probe.e2e.spec.ts",
     "test:e2e:trae": "cross-env DSH_TRAE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/trae-probe.e2e.spec.ts",
     "test:e2e:trae-claim": "cross-env DSH_TRAE_E2E=1 DSH_TRAE_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/trae-claim-probe.e2e.spec.ts",
@@ -46,7 +49,15 @@
     "test:e2e:antigravity": "cross-env DSH_ANTIGRAVITY_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/antigravity.e2e.spec.ts",
     "test:e2e:antigravity:full": "cross-env DSH_ANTIGRAVITY_E2E=1 DSH_ANTIGRAVITY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/antigravity.e2e.spec.ts",
     "test:e2e:antigravity-local": "cross-env DSH_ANTIGRAVITY_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/antigravity-local.e2e.spec.ts",
-    "test:e2e:antigravity-local:full": "cross-env DSH_ANTIGRAVITY_E2E=1 DSH_ANTIGRAVITY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/antigravity-local.e2e.spec.ts"
+    "test:e2e:antigravity-local:full": "cross-env DSH_ANTIGRAVITY_E2E=1 DSH_ANTIGRAVITY_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/antigravity-local.e2e.spec.ts",
+    "test:e2e:trae-reasoning": "cross-env DSH_TRAE_REASONING_E2E=1 DSH_TRAE_REASONING_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/trae-reasoning-probe.e2e.spec.ts",
+    "test:e2e:loomy": "cross-env DSH_LOOMY_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/loomy-probe.e2e.spec.ts",
+    "test:e2e:loomy-chat": "cross-env DSH_LOOMY_CHAT_E2E=1 DSH_LOOMY_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/loomy-chat-probe.e2e.spec.ts",
+    "test:e2e:cline": "cross-env DSH_CLINE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/cline-probe.e2e.spec.ts",
+    "test:e2e:cline-chat": "cross-env DSH_CLINE_CHAT_E2E=1 DSH_CLINE_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/cline-chat-probe.e2e.spec.ts",
+    "test:e2e:raccoon": "cross-env DSH_RACCOON_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-probe.e2e.spec.ts",
+    "test:e2e:raccoon-chat": "cross-env DSH_RACCOON_CHAT_E2E=1 DSH_RACCOON_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-chat-probe.e2e.spec.ts",
+    "test:e2e:raccoon-tools": "cross-env DSH_RACCOON_TOOLS_E2E=1 DSH_RACCOON_TOOLS_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-tools-probe.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {
@@ -58,21 +69,22 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-commands": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.0"
+    "@deepseek-ai/schemastery": "^3.18.4"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.0",
+    "@deepseek-ai/cosmokit": "^1.8.5",
+    "@deepseek-ai/schemastery": "^3.18.4",
     "jose": "^6.1.3"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-commands": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.0",
+    "@deepseek-ai/schemastery": "^3.18.4",
     "@types/node": "^22.0.0",
     "cross-env": "^7.0.3",
     "esbuild": "^0.24.0",

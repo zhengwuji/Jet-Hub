@@ -18,6 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -30,7 +31,8 @@ import {
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
-import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { normalizeHarnessMessages } from './message-shape.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /**
  * CodeBuddy（中国版）的 chat completions 基址。
@@ -260,11 +262,23 @@ function serializeMessages(
   //
   // 适配器是最后一道防线：发出请求前把无法配对的 tool_calls 与 tool 结果
   // 一并剔除，让会话自愈。宁可丢失一轮工具上下文，也好过整条会话死亡。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+  // ⚠️ 先归一化 DSH 0.1.7 的消息形状（见 `message-shape.ts`）：0.1.7 把工具结果
+  // 改为一等 `role:'tool'` 消息，不再有 `tool-result` 块。若不归一化，下面所有
+  // 按 `type === 'tool-result'` 的判据恒不命中 → 结果 id 集合为空 →
+  // `resolveToolPairing` 把**全部 tool_calls 剔除**，模型看不到自己调用过什么，
+  // 表现为「无工具调用即判对话结束」或「陷入循环思考」。
+  const normalized = normalizeHarnessMessages(messages)
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
 
-  for (const message of messages) {
+  for (const message of normalized) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCallBlocks = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -1043,15 +1057,76 @@ export class BuddyAdapter extends LlmAdapter {
     }
     const body = JSON.stringify(bodyObj)
 
-    // 4. 发送请求（401/403 时刷新一次凭据后重试）
+    // 4. 发送请求（401/403 时刷新当前账号一次，仍认证失败则换号重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      await this.options.refresh()
-      credential = await this.options.resolveCredential()
-      if (credential === undefined || credential.access_token.length === 0) {
-        throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: response.status })
+      // ⚠️ 真实缺陷（2026-09-26，用户报障「账号池里明明有 3~4 个账号没被限流，
+      // 却报『未配置凭据，请先登录』」）。早期实现在这里刷新一次就 `return`：
+      //
+      // ① **不换号** —— 池首账号被服务端拒绝（401/403）时，池里其余可用账号
+      //    一个都用不上。轮换逻辑（下一段）只覆盖 `isRateLimited` 的 429 类，
+      //    而 401/403 在这里就返回了。
+      // ② **刷新失败直接冒泡** —— 刷新接线一旦指向单凭据 ref（见 `src/index.ts`
+      //    的 buddyRefresh 注释），抛出的「未配置凭据，请先登录」与真实原因
+      //    毫无关系：账号池凭据完好，只是刷错了 ref。
+      // ③ **下一轮必然复现** —— 刷新抛错前没有写回任何凭据，池首账号不变，
+      //    于是「中断后继续 goal」永远撞同一条死路（自锁）。
+      //
+      // 现在的次序：刷新当前账号 → 重试 → 仍认证失败则按池顺序换号，
+      // 全部换完才报 AUTH。
+      const authStatus = response.status
+      // 已尝试过的账号：换号时必须排除，否则会拿回刚失败的那个原地打转。
+      const triedAuth = new Set<string>()
+      if (currentAccountId !== '') triedAuth.add(currentAccountId)
+      let refreshedCredential: BuddyCredential | undefined
+      try {
+        await this.options.refresh()
+        refreshedCredential = await this.options.resolveCredential()
+      } catch (error) {
+        // 刷新失败**不致命**：换号仍有机会，单个账号故障不该让整轮陪葬。
+        console.warn(`[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：${String(error)}`)
       }
-      response = await this.send(credential, body, options)
+      if (refreshedCredential !== undefined && refreshedCredential.access_token.length > 0) {
+        credential = refreshedCredential
+        response = await this.send(credential, body, options)
+        if (response.ok) {
+          yield* this.consumeSse(response, options)
+          return
+        }
+      }
+      let rotated = false
+      if ((response.status === 401 || response.status === 403) && this.options.accountPool !== undefined) {
+        for (;;) {
+          // modelId 参与过滤：正在限流期的账号不会被选中（与限流换号同语义）。
+          const next = await this.options.accountPool.getAvailableAccount(
+            this.product.id, options.model, triedAuth,
+          )
+          if (!next || triedAuth.has(next.entry.id)) break
+          triedAuth.add(next.entry.id)
+          rotated = true
+          credential = next.credential as BuddyCredential
+          currentAccountId = next.entry.id
+          response = await this.send(credential, body, options)
+          if (response.ok) {
+            yield* this.consumeSse(response, options)
+            return
+          }
+          // 只有认证类失败才继续换号；429/5xx/400 交给下面的既有分类逻辑。
+          if (response.status !== 401 && response.status !== 403) break
+        }
+      }
+      // 刷新既没产出凭据、也没换到别的账号：保留原有的可诊断报错。
+      if (refreshedCredential === undefined && !rotated) {
+        throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: authStatus })
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new LlmError(
+          `buddy: 所有账号均认证失败（HTTP ${authStatus}），请在 Jet Hub 重新登录`,
+          'AUTH',
+          { status: authStatus },
+        )
+      }
+      // 换号途中遇到非认证类错误 → 落到下面的限流换号 / 错误码归类逻辑。
     }
     if (!response.ok) {
       let errorText = await response.text().catch(() => '')
@@ -1161,7 +1236,59 @@ export class BuddyAdapter extends LlmAdapter {
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
-    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    /**
+     * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+     * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
+     *
+     * 本路径正是用户实际报障的那条（`workbuddy/deepseek-v4.1-flash` 报
+     * 「已达到输出 token 上限」）：`reasoning_tokens` 计入 `completion_tokens`，
+     * 思考陷入病态重复就把 128000 额度烧光、正文零产出。
+     */
+    const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let loopDetected = false
+    /**
+     * **正文**死循环检测（**独立实例**）。本路径正是用户实际报障的那条
+     * （`lilishop-go` 会话 / `workbuddy/hy4-preview-f`）：该模型把思考写进
+     * `content` 通道，正文出现真循环（去重率 0.0412），而旧实现只在
+     * reasoning 分支调 `observe` → 正文循环**完全看不见**。
+     *
+     * ⚠️ 必须与 `loopGuard` **分成两个实例**：判据看的是尾部 3000 字符窗口的
+     * 行去重率，两条通道混进同一窗口会互相稀释，使守卫**双双失效**。
+     *
+     * ⚠️ 与思考守卫的**语义差异**：实测正文循环的 wire 顺序恒为
+     * `text-chunks(循环) → tool-call-chunks → finish: tool-calls` —— 工具调用
+     * 在循环正文**之后**到达且有效。故正文守卫**只截断文本**，
+     * **绝不 `reader.cancel()`、绝不改 finish reason**，否则会把有效调用
+     * 整块丢掉（比循环本身更糟）。
+     */
+    const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let proseLoopDetected = false
+    /**
+     * `</think:hex>` 泄漏的待定正文（见 `splitThinkTaggedContent`）。
+     *
+     * 标签可能**跨帧**到达（`</think:612` + `4c78e>`），故不能逐帧判定，
+     * 必须缓冲到收尾时一次性切分。
+     */
+    let proseHasThinkTag = false
+    /**
+     * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
+     * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
+     *
+     * 为什么必须延后建块：`BlockAssembler` 在**没有 `block-end`** 时同样会用
+     * `partial.text` 组装出块，故只在出口过滤挡不住空 Think 块 —— 必须从一开始
+     * 就不发任何 chunk。本路径正是用户实际报障的那条
+     * （`workbuddy/deepseek-v4.1-flash` 偶发只输出一个空格当思考，
+     * 实测 2233 次、`usage.reasoningTokens = 1`）。
+     */
+    const suppressor = createBlankReasoningSuppressor()
+    const toolCalls = new Map<number, {
+      index: number
+      text: string
+      callId?: string
+      name?: string
+      /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+      announced: boolean
+    }>()
     const toolOrder: number[] = []
     // tool_call index → 后端签发的真实 id。缺失时回退 call_{index}，
     // 保证 Start/Delta 使用同一 id。
@@ -1265,18 +1392,52 @@ export class BuddyAdapter extends LlmAdapter {
               blocks.push(block)
               yield { type: 'block-start', index: block.index, blockType: 'text' }
             }
-            block.text += delta.content
-            yield { type: 'text-delta', index: block.index, text: delta.content }
+            // 正文死循环守卫（见 `proseLoopGuard` 注释）。
+            //
+            // ⚠️ 命中后**只停止累积与发射**，绝不 `reader.cancel()`、绝不改
+            // finish reason —— 工具调用在循环正文之后到达且有效（实测）。
+            // 截断靠收尾的 `block-end` 权威覆盖落地（见文件末尾 text 段）。
+            if (proseLoopGuard !== undefined) {
+              if (proseLoopGuard.observe(delta.content)) proseLoopDetected = true
+            }
+            // `</think:hex>` 泄漏探测：标签可能跨帧，故只做廉价子串判定，
+            // 真正切分放在收尾（见文件末尾 text 段）。
+            if (!proseHasThinkTag && delta.content.includes('think:')) proseHasThinkTag = true
+            if (!proseLoopDetected) {
+              block.text += delta.content
+              yield { type: 'text-delta', index: block.index, text: delta.content }
+            }
           }
           if (delta?.reasoning_content) {
-            let block = blocks.find(candidate => candidate.kind === 'reasoning')
-            if (block === undefined) {
-              block = { index: nextIndex++, kind: 'reasoning', text: '' }
-              blocks.push(block)
-              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            // 死循环守卫：命中后不再累积、不再发射。
+            //
+            // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + `break`）在
+            // 本 chunk 的行循环**全部处理完之后**、外层 `for (;;)` 末尾执行（见下方
+            // ★ 止损块）—— 这样同一 chunk 里已到达的 usage / [DONE] 仍会被处理。
+            //
+            // ⚠️ 也**不能用 `continue`**（Task 2 审查发现，已独立复现）：它会
+            // 连带跳过本帧位于 reasoning 分支**之后**的 `usage` 与 `tool_calls`
+            // —— 「reasoning + usage 同帧」时 usage 被静默丢弃（token 记账
+            // 缺失）。故用 `if (!loopDetected)` 守卫分支体。
+            if (loopGuard !== undefined) {
+              if (loopGuard.observe(delta.reasoning_content)) loopDetected = true
             }
-            block.text += delta.reasoning_content
-            yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content }
+            if (!loopDetected) {
+              // 纯空白思考：`emit === undefined` ⇒ 本片一个 chunk 都不发，
+              // 于是既不建块、也不消耗 `nextIndex`（见 helper 注释）。
+              const emit = suppressor.feed(delta.reasoning_content)
+              if (emit !== undefined) {
+                let block = blocks.find(candidate => candidate.kind === 'reasoning')
+                if (block === undefined) {
+                  block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                  blocks.push(block)
+                  yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                }
+                // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本。
+                block.text = suppressor.text()
+                yield { type: 'reasoning-delta', index: block.index, text: emit }
+              }
+            }
           }
           for (const call of delta?.tool_calls ?? []) {
             const wireIndex = call.index ?? 0
@@ -1286,10 +1447,8 @@ export class BuddyAdapter extends LlmAdapter {
             const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
             let block = toolCalls.get(wireIndex)
             if (block === undefined) {
-              block = { index: nextIndex++, text: '', callId }
+              block = { index: nextIndex++, text: '', callId, announced: false }
               toolCalls.set(wireIndex, block)
-              toolOrder.push(block.index)
-              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
             }
             block.callId = callId
             // 后续参数分片会带上空的 function.name（""），它不是 undefined，
@@ -1300,6 +1459,24 @@ export class BuddyAdapter extends LlmAdapter {
             }
             const fragment = call.function?.arguments ?? ''
             block.text += fragment
+            // ⚠️ **名称为空前不发射任何 chunk**（与 `openai-compat.ts` 同因同修，
+            // 见该文件内的详细说明）。只跳过收尾的 `block-end` 不够 ——
+            // `BlockAssembler` 会把没有 block-end 的 partial 也组装成
+            // `name:''`，污染会话后让 workbuddy 以 400 code 11133 拒绝每次请求。
+            if (!block.announced) {
+              if (!hasUsableToolName(block.name)) continue
+              block.announced = true
+              toolOrder.push(block.index)
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+              yield {
+                type: 'tool-call-delta',
+                index: block.index,
+                id: ToolCallId(callId),
+                name: block.name!,
+                argumentsDelta: block.text,
+              }
+              continue
+            }
             yield {
               type: 'tool-call-delta',
               index: block.index,
@@ -1332,22 +1509,53 @@ export class BuddyAdapter extends LlmAdapter {
             }
           }
         }
+        // ★ 止损（终审 C1）：命中死循环后**中止上游**，否则 128000 token 照烧。
+        // 原实现只跳过下行累积/发射，`for (;;)` 仍把流读到底 —— 实测上游
+        // 200 帧被读 200 帧（守卫在 ~2304 字符即命中，99.5% 的额度仍被消耗）。
+        //
+        // ⚠️ 位置：内层行循环**之后**、外层 `for (;;)` 末尾 —— 同一 chunk 里已到达
+        // 的 `usage` / `[DONE]` 因此仍会被处理，但命中后**立即**退出，不再读下一块。
+        //
+        // ⚠️ 只 cancel **reader**，绝不 abort `options.signal`：后者是调用方信号，
+        // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+        // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+        // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+        // 「正常止损」变成一次失败。
+        if (loopDetected) {
+          await reader.cancel().catch(() => {})
+          break
+        }
       }
     } finally {
       reader.releaseLock()
     }
 
+    /**
+     * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
+     *
+     * ⚠️ **不能写成 `blocks.length`**：`blocks` 里可能留着**不会发出**的条目 ——
+     * 纯空白思考块（已被 `suppressor` 压制，连 `block-start` 都没发）、
+     * 或被清洗成空串的块。用 `blocks.length` 会把「零块响应」误判成「有块」，
+     * 于是静默结束的缺陷原样保留。
+     *
+     * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
+     */
+    let blockCount = 0
     // 按创建顺序关闭每个块
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
+      // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
+      if (!hasUsableToolName(block.name)) continue
+      blockCount += 1
       yield {
         type: 'block-end',
         index,
         block: {
           type: 'tool-call',
           id: ToolCallId(block.callId ?? ''),
-          name: block.name ?? '',
+          name: block.name!,
           // 仅把"无参数工具下发的空分片"补成 {}；**残缺参数保持原样**，
           // 由 max-tokens 判定触发重试。切勿把残缺 JSON 也补成 {}——那会
           // 伪造出合法外观，让 harness 报 `missing required property` 而
@@ -1359,11 +1567,62 @@ export class BuddyAdapter extends LlmAdapter {
       }
     }
     if (textBlock !== undefined) {
-      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+      // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+      // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
+      // 无标签时**逐字节不变**。
+      let textOut = textBlock.text
+      if (proseHasThinkTag) {
+        const split = splitThinkTaggedContent(textBlock.text)
+        if (split !== undefined) {
+          // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
+          // reasoning 块的权威，只改 `blocks` 条目不生效。
+          if (split.reasoning !== '') {
+            const existing = blocks.find(candidate => candidate.kind === 'reasoning')
+            if (existing === undefined) {
+              blocks.push({ index: nextIndex++, kind: 'reasoning', text: split.reasoning })
+            } else {
+              existing.text += split.reasoning
+            }
+            suppressor.feed(split.reasoning)
+          }
+          textOut = split.text
+        }
+      }
+      // 正文死循环截断：只保留循环前的干净前缀（与思考守卫同一覆盖机制）。
+      // ⚠️ **不改 finish reason**：工具调用仍要被执行。
+      const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
+        ? textOut.slice(0, proseLoopGuard.cutAt)
+        : textOut
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      const cleaned = stripCourseLeakIfEnabled(truncated)
+      // ⚠️ 归位后正文可能为空串（实测 seq=34768 形态）—— 空块会污染会话，
+      // 且 DSH 的 `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，
+      // 故本响应仍有产出，不会被误判为零块。
+      if (cleaned !== '') {
+        blockCount += 1
+        yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } }
+      }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
-    if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
-      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+    // ⚠️ 判据收紧为 `trim() !== ''`：纯空白思考不得被算作「有 reasoning 产出」。
+    if (reasoningBlock !== undefined && reasoningBlock.text.trim() !== '') {
+      // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+      // **权威覆盖**（已由 `scripts/verify-blockend-override.ts` 实证）：
+      // 即便前面已 yield 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+      //
+      // ⚠️ 文本以 helper 为权威（`suppressor.text()`），**不用**
+      // `reasoningBlock.text` —— 两者累积口径若不一致，以 helper 为准才能
+      // 保证落块内容与 wire 一致。
+      const suppressedReasoning = suppressor.text()
+      const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
+        ? suppressedReasoning.slice(0, loopGuard.cutAt)
+        : suppressedReasoning
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
+      if (cleanedReasoning !== '') {
+        blockCount += 1
+        yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
+      }
     }
     // 三种"不完整"都必须报告 max-tokens 而非 tool-calls，否则 harness 会
     // 执行残缺调用、报 INVALID_ARGS，并把脏参数持久化进会话历史：
@@ -1375,14 +1634,32 @@ export class BuddyAdapter extends LlmAdapter {
     //   `missing required property "file_path"`，模型收到莫名其妙的参数错误
     //   并陷入重试循环。判定为截断后 dsh 丢弃残缺调用并重试，实测一次即恢复。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
-    const reason = finishReason === 'length'
-      || finishReason === undefined && toolOrder.length > 0
-      || argsTruncated
+    /**
+     * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
+     *
+     * 丢弃是对的（无名调用无法执行、留着会污染会话），但不能让它**静默地以
+     * `stop` 结束** —— 那正是 AGENTS.md 记录的「没有任何报错就中断」：
+     * 模型本意要调工具，harness 却认为它「正常答完了」。故报 max-tokens
+     * （不完整、可重试）。同批若还有可用调用，则照常报 tool-calls。
+     */
+    const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
+    const reason = loopDetected
+      // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
+      // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
       ? { kind: 'max-tokens' as const }
-      : finishReason === 'tool_calls' || toolOrder.length > 0
-        ? { kind: 'tool-calls' as const }
-        : { kind: 'stop' as const }
-    yield { type: 'finish', reason }
+      : finishReason === 'length'
+        || finishReason === undefined && toolOrder.length > 0
+        || argsTruncated
+        || droppedUnnamedCalls && toolOrder.length === 0
+        ? { kind: 'max-tokens' as const }
+        : finishReason === 'tool_calls' || toolOrder.length > 0
+          ? { kind: 'tool-calls' as const }
+          : { kind: 'stop' as const }
+    // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
+    // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
+    // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
+    // 无名 tool-call 等全部既存判据）；helper 只在 `kind === 'stop'` 时改写。
+    yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) }
   }
 }
 
@@ -1472,16 +1749,21 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
  * 在 ctx.llm 上注册 CodeBuddy 系产品的 provider 路由与适配器。
  *
  * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
- * CodeBuddy 得到 `buddy` / `llm-buddy`（与改造前完全一致），
- * WorkBuddy 得到 `workbuddy` / `llm-workbuddy`。
- * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
- * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
+ * CodeBuddy 得到 `buddy`，WorkBuddy 得到 `workbuddy`。
+ * `settingsNs` 经 `settingsNamespaceFor()` 解析：老契约（≤0.1.6）下是各产品的
+ * `llm-<id>` 命名空间；0.1.7-rc.1 起 settings 命名空间只能是 profile 条目 id，
+ * 故解析为本插件条目 id。
  */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? CODEBUDDY
   if (!options.skipConfigurableRegistration) {
     ctx.llm.registerConfigurableProviders([
-      { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+      {
+        provider: product.id,
+        displayName: product.displayName,
+        settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
+        settingsPath: [],
+      },
     ])
   }
   const adapter = new BuddyAdapter(options)

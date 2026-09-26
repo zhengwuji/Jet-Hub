@@ -101,10 +101,56 @@ export interface QoderInferRequest {
   body: string
 }
 
-/** 加密推理请求里，单条待发送消息。 */
+/**
+ * assistant 消息携带的一次工具调用（**OpenAI 风格**）。
+ *
+ * 形态取自客户端 `t2c()`：它把内部 `tool_use` 块转成
+ * `{id, type:'function', index, function:{name, arguments}}` 后挂到
+ * 消息的 `tool_calls` 上。
+ *
+ * ⚠️ **不要**用 Anthropic 风格的 `tool_use` / `input` —— 那是客户端给
+ * Anthropic BYOK 走的另一条分支（`input_schema` / `tool_use_id`），
+ * 加密端点 `agent_chat_generation` 不吃那套。
+ */
+export interface QoderInferToolCall {
+  id: string
+  type: 'function'
+  /** 同一 assistant 消息内多个调用的序号（客户端会给）。 */
+  index?: number
+  function: { name: string; arguments: string }
+}
+
+/**
+ * 加密推理请求里，单条待发送消息。
+ *
+ * - `content` 客户端**恒为字符串**（`udn(r, '')`）；工具调用消息的正文是 `''`。
+ * - `tool_calls` 只出现在 assistant 上。
+ * - `tool_call_id` 只出现在 `role: 'tool'` 上（客户端 `A2c()` 的 `tool_result` 分支）。
+ *
+ * ⚠️ 这三者缺一不可：只发工具结果而不发对应的 assistant `tool_calls`，
+ * 会让模型看不到自己调用过什么 —— 表现为反复重调同一工具或凭空编造结果。
+ */
 export interface QoderInferMessage {
   role: string
   content: string
+  tool_calls?: readonly QoderInferToolCall[]
+  tool_call_id?: string
+}
+
+/**
+ * 下发给模型的工具定义（**OpenAI 风格**）。
+ *
+ * 客户端 `$Hc(A)` 的产物：`{type:'function', function:{name, description?, parameters?}}`，
+ * 写入请求体**顶层** `tools`（源码：`tools: o?.tools ?? []`）。
+ * `description` / `parameters` 缺省时该键**不出现**。
+ */
+export interface QoderInferTool {
+  type: 'function'
+  function: {
+    name: string
+    description?: string
+    parameters?: Record<string, unknown>
+  }
 }
 
 /** 构造加密推理请求的入参。 */
@@ -164,6 +210,115 @@ export interface QoderInferAsk {
    * —— 服务端按 `business.type` 选路由池。
    */
   business?: Record<string, unknown>
+  /**
+   * 下发给模型的工具定义（OpenAI 风格）。
+   *
+   * ⚠️ **必须真的传**：加密端点认请求体**顶层** `tools`
+   * （客户端源码 `tools: o?.tools ?? []`）。早期实现把它硬编码为 `[]`，
+   * 模型拿不到任何函数 schema，只能用正文里的 XML 文本臆造工具调用
+   * （用户报障：「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」）。
+   *
+   * 省略等价于空数组（与客户端一致：键恒在，值为 `[]`）。
+   */
+  tools?: readonly QoderInferTool[]
+}
+
+/**
+ * 构造加密端点 `agent_chat_generation` 的**明文请求体**。
+ *
+ * 抽成纯函数有两个理由：
+ * 1. **可测**：加密端点的请求体经 WASM 加密后本地不可解（朴素 `JSON.parse`
+ *    会抛），把 payload 构造独立出来才能直接断言 `tools` / `messages`；
+ * 2. **单一来源**：`prepareInfer` 只负责「拿它去加密」，不再内联一份结构。
+ *
+ * ⚠️ 结构逐项复刻官方 `G4A()`，改动前请先读
+ * `docs/qoder-encryption-notes.md` 的 §3 与 §6：
+ * `chat_context` 不能传空对象、`business` 缺失会被路由到故障节点。
+ *
+ * @param ask - 上层适配器给出的请求参数。
+ * @param requestId - 请求 id（默认随机；测试可固定以求确定性）。
+ */
+export function buildQoderInferPayload(
+  ask: QoderInferAsk,
+  requestId: string = crypto.randomUUID(),
+): Record<string, unknown> {
+  const isReasoning = ask.isReasoning ?? false
+  const text = ask.userText
+
+  const parameters: Record<string, unknown> = {}
+  if (ask.maxTokens !== undefined) parameters.max_tokens = ask.maxTokens
+  if (ask.reasoningEffort !== undefined) {
+    parameters.reasoning_effort = ask.reasoningEffort
+    parameters.enable_thinking = ask.reasoningEffort !== 'none'
+  }
+  if (ask.contextWindow !== undefined) parameters.context_length = ask.contextWindow
+
+  const messages: QoderInferMessage[] = []
+  for (const m of ask.history ?? []) {
+    // 逐字段搬运而非整体展开：只保留协议认识的三个键，避免把调用方的
+    // 内部字段（如 DSH 的 `id` / `source`）原样发给上游。
+    messages.push({
+      role: m.role,
+      content: m.content,
+      ...(m.tool_calls === undefined ? {} : { tool_calls: m.tool_calls }),
+      ...(m.tool_call_id === undefined ? {} : { tool_call_id: m.tool_call_id }),
+    })
+  }
+  if (messages.length === 0) messages.push({ role: 'user', content: text })
+
+  return {
+    request_id: requestId,
+    request_set_id: requestId,
+    chat_record_id: requestId,
+    session_id: crypto.randomUUID(),
+    stream: true,
+    chat_task: 'FREE_INPUT',
+    chat_context: {
+      text,
+      features: [],
+      extra: {
+        context: [],
+        modelConfig: { key: ask.modelKey, is_reasoning: isReasoning },
+        originalContent: text,
+      },
+      chatPrompt: '',
+      imageUrls: null,
+    },
+    is_reply: true,
+    is_retry: false,
+    source: 1,
+    version: '3',
+    agent_id: 'agent_common',
+    task_id: 'common',
+    session_type: ask.sessionType ?? 'qodercli',
+    aliyun_user_type: '',
+    model_config: {
+      key: ask.modelKey,
+      // 官方 `Uyc()` 的 model_config 有 **10 个字段**，此处逐项对齐
+      // （早期只传 6 个）。
+      display_name: ask.displayName ?? '',
+      model: '',
+      format: ask.format ?? 'openai',
+      is_vl: ask.isVl ?? true,
+      is_reasoning: isReasoning,
+      api_key: '',
+      url: '',
+      source: ask.source ?? 'system',
+      max_input_tokens: ask.maxInputTokens ?? ask.contextWindow ?? 200_000,
+    },
+    custom_model: null,
+    system: ask.systemText ? [{ type: 'text', text: ask.systemText }] : [],
+    messages,
+    // ⚠️ **必须把调用方的工具定义真的发出去**：它是**顶层** `tools`
+    // （客户端源码 `tools: o?.tools ?? []`）。早期硬编码 `[]` 让模型拿不到
+    // 任何函数 schema，只能用正文里的 XML 文本臆造工具调用 ——
+    // 用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」。
+    // 无工具时是**空数组**而非缺字段（与客户端一致）。
+    tools: ask.tools ?? [],
+    parameters,
+    // `business` 决定服务端路由（`sec_scan` → 安全池，其余 → 默认池）。
+    ...(ask.business === undefined ? {} : { business: ask.business }),
+  }
 }
 
 /**
@@ -496,73 +651,7 @@ export class QoderEncryptedInfer {
    */
   prepareInfer(ask: QoderInferAsk): QoderInferRequest {
     const g = this.g
-    const isReasoning = ask.isReasoning ?? false
-    const text = ask.userText
-    const requestId = crypto.randomUUID()
-
-    // 复刻官方 `G4A()` 的请求体结构。`chat_context` 不是空对象 ——
-    // 它承载本次提问文本与模型配置；早期传空对象会得到
-    // `[FAIL]node:... msg:Execution failed`。
-    const parameters: Record<string, unknown> = {}
-    if (ask.maxTokens !== undefined) parameters.max_tokens = ask.maxTokens
-    if (ask.reasoningEffort !== undefined) {
-      parameters.reasoning_effort = ask.reasoningEffort
-      parameters.enable_thinking = ask.reasoningEffort !== 'none'
-    }
-    if (ask.contextWindow !== undefined) parameters.context_length = ask.contextWindow
-
-    const messages: QoderInferMessage[] = []
-    for (const m of ask.history ?? []) messages.push({ role: m.role, content: m.content })
-    if (messages.length === 0) messages.push({ role: 'user', content: text })
-
-    const payload = {
-      request_id: requestId,
-      request_set_id: requestId,
-      chat_record_id: requestId,
-      session_id: crypto.randomUUID(),
-      stream: true,
-      chat_task: 'FREE_INPUT',
-      chat_context: {
-        text,
-        features: [],
-        extra: {
-          context: [],
-          modelConfig: { key: ask.modelKey, is_reasoning: isReasoning },
-          originalContent: text,
-        },
-        chatPrompt: '',
-        imageUrls: null,
-      },
-      is_reply: true,
-      is_retry: false,
-      source: 1,
-      version: '3',
-      agent_id: 'agent_common',
-      task_id: 'common',
-      session_type: ask.sessionType ?? 'qodercli',
-      aliyun_user_type: '',
-      model_config: {
-        key: ask.modelKey,
-        // 官方 `Uyc()` 的 model_config 有 **10 个字段**，此处逐项对齐
-        // （早期只传 6 个）。
-        display_name: ask.displayName ?? '',
-        model: '',
-        format: ask.format ?? 'openai',
-        is_vl: ask.isVl ?? true,
-        is_reasoning: isReasoning,
-        api_key: '',
-        url: '',
-        source: ask.source ?? 'system',
-        max_input_tokens: ask.maxInputTokens ?? ask.contextWindow ?? 200_000,
-      },
-      custom_model: null,
-      system: ask.systemText ? [{ type: 'text', text: ask.systemText }] : [],
-      messages,
-      tools: [],
-      parameters,
-      // `business` 决定服务端路由（`sec_scan` → 安全池，其余 → 默认池）。
-      ...(ask.business === undefined ? {} : { business: ask.business }),
-    }
+    const payload = buildQoderInferPayload(ask)
 
     const result = g.callPointer((stack) => {
       const host = g.writeString(this.host); const hostLen = g.lastLength()

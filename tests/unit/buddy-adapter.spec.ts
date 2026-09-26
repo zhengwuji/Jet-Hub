@@ -576,8 +576,107 @@ describe('BuddyAdapter credential handling', () => {
     expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
   })
 
-  it('stream maps HTTP 429 to RATE_LIMIT and 5xx to SERVER', async () => {
-    for (const [status, code] of [[429, 'RATE_LIMIT'], [500, 'SERVER'], [400, 'INVALID_REQUEST']] as const) {
+  /**
+   * 账号池替身：只实现 401/403 换号路径用到的方法。
+   *
+   * `findAccountIdByCredential` 必须真实工作 —— 适配器靠它把当前凭据归属到
+   * 账号条目，归属不到（返回 `''`）时换号会先拿回刚失败的那个账号。
+   */
+  function makePool(accounts: Array<{ id: string; credential: BuddyCredential }>) {
+    return {
+      findAccountIdByCredential: async (_provider: string, token: string) =>
+        accounts.find(a => a.credential.access_token === token)?.id ?? '',
+      getAvailableAccount: async (
+        _provider: string,
+        _modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) => {
+        const entry = accounts.find(a => exclude === undefined || !exclude.has(a.id))
+        return entry === undefined ? null : { entry, credential: entry.credential }
+      },
+      updateModelRateLimit: async () => {},
+      disabledModelsFor: () => new Set<string>(),
+    }
+  }
+
+  it('401 时刷新失败也会换号重试（账号池完好时不得整轮失败）', async () => {
+    // 真实缺陷场景（2026-09-26，用户报障）：refresh 抛「未配置凭据，请先登录」
+    // （接线刷错了单凭据 ref），而账号池里第 2 个账号完全可用。
+    // 修复前：异常直接冒泡 → 整轮失败，且下一轮复现（自锁）。
+    const second = makeCredential({ access_token: 'AT2' })
+    const usedTokens: string[] = []
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      // 刷新「失败」：模拟刷错 ref 的旧接线（此时适配器必须仍能靠换号完成请求）。
+      refresh: async () => { throw new Error('未配置凭据，请先登录') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: second },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) => {
+        const token = init.headers.get('Authorization') ?? ''
+        usedTokens.push(token)
+        return token.includes('AT1')
+          ? new Response('unauthorized', { status: 401 })
+          : sseResponse('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    const chunks = await collectChunks(adapter, streamOptions)
+    expect(usedTokens.some(t => t.includes('AT2'))).toBe(true, '应换到池内第二个账号重试')
+    expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)
+  })
+
+  it('401 且池内所有账号都认证失败时报 AUTH（不再谎称未配置凭据）', async () => {
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('未配置凭据，请先登录') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => new Response('forbidden', { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).failure.code).toBe('AUTH')
+    // 文案必须指向真实原因（全部账号认证失败），而不是「请先登录」。
+    expect((error as LlmError).message).not.toContain('未配置凭据')
+  })
+
+  it('401 换号不会无限循环：每个账号最多试一次', async () => {
+    let calls = 0
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('未配置凭据，请先登录') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => { calls++; return new Response('unauthorized', { status: 401 }) },
+    })
+    await expect(collectChunks(adapter, streamOptions)).rejects.toBeInstanceOf(LlmError)
+    // AT1（首发）+ 刷新后重试（无新凭据则不发）+ AT1/AT2 各一次换号尝试
+    expect(calls).toBeLessThanOrEqual(4)
+  })
+
+  it('换号途中遇到非认证类错误时交给既有分类逻辑，而不是报 AUTH', async () => {
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('未配置凭据，请先登录') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async (_url: unknown, init: { headers: Headers }) =>
+        (init.headers.get('Authorization') ?? '').includes('AT1')
+          ? new Response('unauthorized', { status: 401 })
+          : new Response('{"error":{"message":"boom"}}', { status: 500 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('SERVER')
+  })
+
+  it('stream maps HTTP 429 to RATE_LIMIT and 5xx to SERVER', async () => {    for (const [status, code] of [[429, 'RATE_LIMIT'], [500, 'SERVER'], [400, 'INVALID_REQUEST']] as const) {
       const adapter = makeAdapter({ fetchImpl: async () => new Response(`{"error":{"message":"boom"}}`, { status }) })
       const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
       expect(error).toBeInstanceOf(LlmError)

@@ -103,10 +103,33 @@ export interface RpcListAccountsResponse {
 
 export interface RpcCreateAccountRequest {
   provider: string
+  /**
+   * 手机号（**仅 Loomy 需要**）。
+   *
+   * 其余 7 个 provider 是「返回 loginUrl 让用户在浏览器里授权」，
+   * 不需要手机号；Loomy 走**短信验证码**登录，故须由前端先收集。
+   */
+  phone?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string
+  /**
+   * 登录页地址。
+   *
+   * ⚠️ `loginMode === 'sms'` 时为**空串** —— 短信登录没有可打开的 URL，
+   * 前端必须据此渲染验证码表单而不是弹窗。
+   */
   loginUrl: string
+  /**
+   * 登录交互形态。
+   *
+   * - `'url'`（或缺省）：前端 `window.open(loginUrl)` 并轮询 `login.poll`。
+   * - `'sms'`：前端渲染手机号 + 验证码表单，走 `login.sendSms` / `login.submitSms`。
+   *
+   * ⚠️ **缺省必须视为 `'url'`**：既有 7 个 provider 不传该字段，
+   * 行为必须逐字节不变。
+   */
+  loginMode?: 'url' | 'sms'
 }
 
 export interface RpcPollLoginRequest {
@@ -160,6 +183,18 @@ export interface ProbeModelResult {
   ok: boolean
   /** 失败时的可读原因（限流文案 / HTTP 状态等）。 */
   message?: string
+  /**
+   * 探测发现「仍受限」时，上游给出的**新重置时刻**（epoch ms）。
+   *
+   * [patch-codearts-probe-ratelimit] 为什么必须带出来：限流是**滚动窗口**，
+   * 每次撞到都会把重置时间往后推。探针若只报「仍受限」而不回传该时刻，
+   * 存储里会一直留着**第一次**的旧时刻；旧时刻一旦过期，UI 的
+   * `modelRateLimits[v] > Date.now()` 就判为已过期而**不渲染「限额重置」**，
+   * 于是出现「重测弹窗说仍受限、账号卡片却一条都不显示」的矛盾，
+   * 且选号逻辑也会误以为该账号可用。实测偏差可达数小时
+   * （如存储 09-23 16:33 vs 上游 09-24 08:31）。
+   */
+  resetTimeMs?: number
 }
 
 /** 单个账号的重测结果。 */
@@ -265,6 +300,24 @@ export interface RpcCreditsBalancesRequest {
 }
 
 /**
+ * RPC: Loomy「锁定永久积分」开关的读写请求。
+ *
+ * ⚠️ 该开关是 **Loomy 全局**的（不分账号）：锁定后选号只允许消耗今日赠送额度，
+ * 永久积分不参与 —— 只剩永久积分的账号在锁定期间等同于不可用。
+ *
+ * `locked` 省略表示**只读查询**；给出布尔值表示写入。
+ */
+export interface RpcLoomyPermanentLockRequest {
+  locked?: boolean
+}
+
+/** RPC: Loomy「锁定永久积分」开关响应。 */
+export interface RpcLoomyPermanentLockResponse {
+  /** 当前是否已锁定。 */
+  locked: boolean
+}
+
+/**
  * 单个账号的积分余额。
  *
  * 与签到状态的设计取舍不同：余额**带回每个包的明细**而不只是总数 ——
@@ -284,6 +337,93 @@ export interface RpcCreditsBalanceAccount {
 /** RPC: 查询积分余额响应 */
 export interface RpcCreditsBalancesResponse {
   accounts: RpcCreditsBalanceAccount[]
+}
+
+/**
+ * ========================================
+ * 短信验证码登录（仅 Loomy）
+ * ========================================
+ *
+ * Loomy 是唯一**没有 loginUrl** 的 provider（短信登录），故不能复用
+ * `login.poll` 那套轮询流程，需要两个专用端点。
+ */
+
+/** RPC: 为某个待登录账号下发短信验证码（Loomy **备用**登录路径）。 */
+export interface RpcSendSmsRequest {
+  accountId: string
+  provider: string
+  /**
+   * 手机号。
+   *
+   * ⚠️ **由本请求自己携带**，不从 `account.create` 的中间态取 ——
+   * 主路径是**微信扫码**，`account.create` 不再收集手机号
+   * （那正是「新建账号失败：Loomy 短信登录需要手机号」那个**顺序死锁**
+   * 缺陷的成因：表单要等 `account.create` 返回才渲染，却要求它先有手机号）。
+   */
+  phone: string
+}
+/** RPC: 下发短信验证码的响应。 */
+export interface RpcSendSmsResponse {
+  /** 服务端返回的 msgid（服务端已缓存在占位条目上，前端只需知道已发出）。 */
+  msgid: string
+}
+
+/** RPC: 提交短信验证码完成登录。 */
+export interface RpcSubmitSmsRequest {
+  accountId: string
+  provider: string
+  code: string
+}
+/** RPC: 提交验证码的响应。 */
+export interface RpcSubmitSmsResponse {
+  /** 登录是否完成（凭据已写入）。 */
+  done: boolean
+  /** 失败原因（`done: false` 时给出）。 */
+  error?: string
+}
+
+/**
+ * ========================================
+ * 新手任务（仅 Loomy）
+ * ========================================
+ *
+ * ⚠️ 与 `credits.*`（每日签到）**语义独立**：新手任务是**一次性**的
+ * （每号只能领一次 10000 分），故有独立端点，不参与「一键签到」遍历。
+ */
+
+/** RPC: 查询某账号的新手任务状态。 */
+export interface RpcOnboardingStatusRequest {
+  provider: string
+  accountId: string
+}
+/** RPC: 新手任务状态响应。 */
+export interface RpcOnboardingStatusResponse {
+  /** 8 个 task key 的完成状态。 */
+  tasks: Record<string, boolean>
+  /** 本地现算的已领积分。 */
+  earned: number
+  /** 总分（10000）。 */
+  total: number
+  /** task key → 中文标题（供前端渲染清单）。 */
+  titles: Record<string, string>
+  /** task key → 积分。 */
+  points: Record<string, number>
+}
+
+/** RPC: 领取某账号的全部新手任务。 */
+export interface RpcOnboardingClaimRequest {
+  provider: string
+  accountId: string
+}
+/** RPC: 领取新手任务的响应。 */
+export interface RpcOnboardingClaimResponse {
+  /** 本次处理的任务（含幂等重放）。 */
+  claimed: { key: string; title: string; points: number }[]
+  /** 此前已完成、本次跳过的 key。 */
+  skipped: string[]
+  /** 领取后本地现算的累计已领。 */
+  earned: number
+  total: number
 }
 
 /**
@@ -328,6 +468,27 @@ export interface RpcModelSetDisabledResponse {
   provider: string
   disabledModels: Record<string, boolean>
 }
+
+/**
+ * RPC: 批量打开/关闭某 provider 的全部模型请求。
+ *
+ * 两个方向**刻意不对称**（见 `AccountPool.setModelsDisabled` /
+ * `clearDisabledModels`）：
+ * - `disabled: true` 关闭全部：按当前目录逐项加入黑名单，服务端需要读目录；
+ * - `disabled: false` 打开全部：直接清空该 provider 的黑名单，不读目录 ——
+ *   这样「曾被关闭、后来从服务端目录里下线」的历史遗留键才能被清掉。
+ *
+ * `disabled` **没有默认值**：缺失或非布尔一律拒绝。若默认成 `true`，一次字段名
+ * 写错的前端改动会静默关闭用户全部模型；默认成 `false` 则反向静默打开 ——
+ * 两个方向都是灾难性且难察觉的。
+ */
+export interface RpcModelSetAllDisabledRequest {
+  provider: string
+  disabled: boolean
+}
+
+/** RPC: 批量打开/关闭响应（回传写入后的完整黑名单，与单条端点同结构） */
+export type RpcModelSetAllDisabledResponse = RpcModelSetDisabledResponse
 
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
@@ -375,3 +536,98 @@ export interface LoginFlowOptions {
  * 定义与解析工具放在 buddy.ts（与 CodeBuddy 协议常量同处一处）。
  */
 export type { BuddyCredential } from './buddy.js'
+
+/**
+ * ========================================
+ * 账号备份（导出 / 导入）
+ * ========================================
+ */
+
+/** 备份文件格式标识（自包含，与 DSH 版本无关）。 */
+export const BACKUP_FORMAT = 'dsh-codearts-auth/backup'
+
+/** 备份格式版本：格式演进时递增并保留迁移逻辑。 */
+export const BACKUP_VERSION = 1
+
+/**
+ * 备份载荷（导出结果 / 导入输入）。
+ *
+ * 设计要点：
+ * - `credentials` 的值保存凭据 JSON **原文字符串**（与 `ctx.credentials`
+ *   存储形态一致），导入时 `set(ref, value)` 直接回写，不重新序列化，
+ *   避免字段丢失或变形；
+ * - `accounts` 是账号池索引（ProviderAccountEntry 原文），`disabledModels`
+ *   是模型黑名单 —— 两者与 `JetHubState` 同构，导入后整体替换；
+ * - 整个文件自包含且带 `format` / `version` 标记，因此与 DSH 版本无关：
+ *   换版本后导入时按**当前版本**的存储契约重建。
+ */
+export interface BackupPayload {
+  format: typeof BACKUP_FORMAT
+  version: typeof BACKUP_VERSION
+  /** 导出时间（ISO 8601），用于展示与可选的新旧校验。 */
+  exportedAt: string
+  /** credentialRef → 凭据 JSON 原文（字符串）。 */
+  credentials: Record<string, string>
+  /** 账号池索引（ProviderAccountEntry 原文）。 */
+  accounts: ProviderAccountEntry[]
+  /** 模型黑名单：provider id → 被关闭的模型 id → true。 */
+  disabledModels: Record<string, Record<string, boolean>>
+  /**
+   * Loomy「锁定永久积分」开关。
+   *
+   * ⚠️ **可选**：老备份文件里没有该字段，导入时保持当前值（不重置），
+   * 因此不需要提升 {@link BACKUP_VERSION}。
+   */
+  loomyPermanentLocked?: boolean
+}
+
+/** RPC: 导出备份响应。 */
+export interface RpcBackupExportResponse {
+  payload: BackupPayload
+  /** 未能读取凭据的账号 id（凭据缺失/损坏，不中断导出）。 */
+  warnings: string[]
+}
+
+/** RPC: 导入备份请求。 */
+export interface RpcBackupImportRequest {
+  /** 备份载荷（明文 JSON 解析后的对象；加密文件在浏览器侧解密后传入）。 */
+  payload: unknown
+}
+
+/** RPC: 导入备份响应。 */
+export interface RpcBackupImportResponse {
+  /** 写入的凭据条数。 */
+  credentialsImported: number
+  /** 写入的账号数。 */
+  accountsImported: number
+  /** 跳过的凭据 ref（非法 ref 等）。 */
+  skipped: string[]
+  /**
+   * 导入的账号中「凭据已过期」的条数（账号条目的 `expiresAt <= 当前时刻`）。
+   * 这类账号即使 refresh_token 尚有效也会在下一次请求时先静默续期；若
+   * refresh_token 也已失效（导出后搁置过久 / CodeArts 一次性轮换），则需
+   * 重新登录。前端据此提示用户。
+   */
+  expiredAccounts: number
+  /**
+   * 导入的账号中「凭据缺失」的条数：账号条目存在，但其 credentialRef 不在
+   * 备份的 credentials 字典里。这类账号导入后无凭据可用，对应 provider 的
+   * 模型目录会被门控隐藏（像未登录一样）。前端据此提示用户重新登录该账号。
+   */
+  missingCredentials: number
+}
+
+/**
+ * RPC: 查询当前账号池统计（导入前的覆盖提示用）。
+ *
+ * `withoutExpiry` 统计缺 `expiresAt` 的账号条目——这正是 DSH 版本切换后
+ * 自动恢复（`bootstrapFromCredentialRefs`）产生的条目特征：反推只按凭据
+ * ref 名重建，不读凭据值，故拿不到有效期。正常登录的账号基本都带
+ * `expiresAt`。该数字用于导入前提示「有 N 个自动恢复的账号将被覆盖」。
+ */
+export interface RpcBackupStatusResponse {
+  /** 当前账号池的账号总数。 */
+  accounts: number
+  /** 缺 `expiresAt` 的账号条目数（疑似自动恢复产物）。 */
+  withoutExpiry: number
+}

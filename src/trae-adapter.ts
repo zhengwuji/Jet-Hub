@@ -23,6 +23,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import { settingsNamespaceFor } from './settings-compat.js'
 import {
   TRAE_DEFAULT_MODEL,
   TRAE_MAX_CONTEXT_TOKENS,
@@ -40,11 +41,13 @@ import {
   transformToSOLOBody,
   type TraeCredential,
   type TraeSSEEvent,
+  type TraeReasoningConfig,
   type TraeRemoteModel,
 } from './trae.js'
 import { TRAE, type TraeFallbackModel, type TraeProduct } from './trae-product.js'
 import { classifyTraeError, recordsTraeRateLimit, shouldRotateTraeAccount } from './trae-errors.js'
-import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import { normalizeHarnessMessages } from './message-shape.js'
+import { createBlankReasoningSuppressor, createReasoningLoopDetector, hasUsableToolName, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
 
 /** 本适配器注册的 provider 路由名。 */
 export const PROVIDER = 'trae'
@@ -116,6 +119,47 @@ function strongestTraeEffort(options: readonly string[]): string | undefined {
     }
   }
   return best ?? options[options.length - 1]
+}
+
+/**
+ * 挑默认思考档：**上游 `default_level` 优先**，缺失或非法才退到 `fallback`。
+ *
+ * ## 为什么是「采信上游」而不是自己定规则
+ *
+ * 早期实现一律取最强档（用户当时的要求），但那会让每次请求都顶格思考 ——
+ * 思考 token **计入 `completion_tokens`**，与正文共享额度，于是正文更早撞
+ * `max_tokens`、首字更慢。改为采信上游后，实测（2026-09-26，`solo_agent` 可见集）：
+ *
+ * | 模型 | options | 上游 `default_level` | 旧默认 | 新默认 |
+ * |---|---|---|---|---|
+ * | `deepseek-v4.1-flash` | light,high,extra_high | `high` | extra_high | **high** |
+ * | `glm-5.2` | high,extra_high | `high` | extra_high | **high** |
+ * | `qwen3.8-max` | light,high,extra_high | `high` | extra_high | **high** |
+ * | `Doubao-Seed-2.1-Pro` | light,high | `high` | high | high |
+ * | `glm-5.3` | light,high,extra_high | `extra_high` | extra_high | extra_high |
+ * | `kimi-k3` | light,high,extra_high | `extra_high` | extra_high | extra_high |
+ *
+ * ⚠️ 注意后两行：上游**自己**在 `glm-5.3` / `kimi-k3` 上选了最高档。故不能改成
+ * 「固定取次高档」——那会把这两个上游认可的最高档无谓降下来。
+ *
+ * ⚠️ `default_level` 是**外部输入**，必须校验它真的在 `options` 里：DSH 会拿
+ * `defaultEffort` 直接发请求，给一个不存在的档位会抛 `UNSUPPORTED_REASONING_EFFORT`
+ * （见 `dsh-llm` 的 `resolveCallWithInfo`）。实测上游确实会下发
+ * `default_level: 'max'` 而 `options` 里没有 `max` —— 此时必须退到 `fallback`，
+ * **不能**照抄。
+ *
+ * @param config 远端档位配置（`options` / `defaultLevel`）。
+ * @param fallback `default_level` 不可用时的兜底档（通常是最强档）。
+ */
+function defaultTraeEffort(
+  config: TraeReasoningConfig,
+  fallback: string | undefined,
+): string | undefined {
+  const declared = config.defaultLevel
+  if (declared !== undefined && declared.length > 0 && config.options.includes(declared)) {
+    return declared
+  }
+  return fallback
 }
 
 /** SSE 空闲超时（分两阶段，环境变量可覆盖）。 */
@@ -306,9 +350,14 @@ function serializeTraeMessages(
   imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
+  // ⚠️ 先归一化 DSH 0.1.7 的消息形状（见 `message-shape.ts`）：0.1.7 把工具结果
+  // 改为一等 `role:'tool'` 消息，不再有 `tool-result` 块。若不归一化，下面的
+  // `type === 'tool-result'` 判据恒不命中 → 工具结果被当成普通 user 消息下发、
+  // `tool_call_id` 关联丢失，且 `resolveToolPairing` 会剔除全部 tool_calls。
+  const normalized = normalizeHarnessMessages(messages)
   // 剔除无法配对的工具调用/结果：SOLO 上游同样要求 tool_calls 与 tool 结果
   // 严格配对，孤儿条目会让整条会话被拒（与三个兄弟适配器同款防线）。
-  const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+  const { keepCallIds, keepResultIds } = resolveToolPairing(normalized)
 
   // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
   // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
@@ -323,9 +372,15 @@ function serializeTraeMessages(
     pendingToolImages = []
   }
 
-  for (const message of messages) {
+  for (const message of normalized) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -619,13 +674,17 @@ export class TraeAdapter extends LlmAdapter {
       id: ReasoningEffortId(option),
       name: TRAE_EFFORT_NAMES[option] ?? option,
     }))
-    // ⚠️ 默认档取**最强档**，不采信远端 `default_level`：上游那个是它自己的
-    // 保守默认（实测多为 `high`，而最高档常是 `extra_high`）。本插件按用户
-    // 要求一律默认最强，用户仍可在 DSH 里手动降档。
-    const strongest = strongestTraeEffort(config.options)
+    // ⚠️ 默认档**优先采信上游 `default_level`**（见 {@link defaultTraeEffort}）。
+    // 早期实现一律取最强档（用户当时要求「所有模型默认用 max」），代价是思考
+    // token 与正文共享 `completion_tokens`、正文更早撞上限。改为采信上游后：
+    // 实测 6 个模型里 4 个上游给的就是次高档 `high`，而 `glm-5.3` / `kimi-k3`
+    // 上游自己选的是 `extra_high` —— 机械取「次高档」会把后两者无谓降档，
+    // 故以**上游的判断**为准，而不是自己定一条规则。
+    const fallback = strongestTraeEffort(config.options)
+    const chosen = defaultTraeEffort(config, fallback)
     return {
       efforts,
-      ...strongest !== undefined ? { defaultEffort: ReasoningEffortId(strongest) } : {},
+      ...chosen !== undefined ? { defaultEffort: ReasoningEffortId(chosen) } : {},
     }
   }
 
@@ -1057,7 +1116,49 @@ export class TraeAdapter extends LlmAdapter {
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
-    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    /**
+     * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+     * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
+     *
+     * 与 buddy 同因：`reasoning_tokens` **计入** `completion_tokens`，思考陷入
+     * 病态重复就把输出额度烧光、正文零产出，而 `finish` 若是 `stop`，UI 上
+     * 完全看不出错误。
+     */
+    const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let loopDetected = false
+    /**
+     * **正文**死循环检测（**独立实例**，见 `createReasoningLoopDetector`）。
+     *
+     * 真实缺陷（用户报障，2026-09-25）：唯一活动 session 出现**正文**循环，
+     * 而旧实现只在 reasoning 分支调 `observe` → 正文循环完全看不见。
+     *
+     * ⚠️ 两个实例不可合并：判据看尾部 3000 字符窗口的行去重率，两条通道
+     * 混进同一窗口会互相稀释，使守卫双双失效。
+     *
+     * ⚠️ 语义差异：实测正文循环的工具调用在循环正文**之后**到达且有效，
+     * 故正文守卫**只截断文本**，绝不 `reader.cancel()`、绝不改 finish reason。
+     */
+    const proseLoopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let proseLoopDetected = false
+    /** `</think:hex>` 泄漏探测（跨帧，收尾再切分）。 */
+    let proseHasThinkTag = false
+    /**
+     * 纯空白思考抑制器（见 `createBlankReasoningSuppressor`）。与 `blocks` /
+     * `loopGuard` 同生命周期：**每个 `stream()` 调用建一个实例**。
+     *
+     * 为什么必须延后建块：`BlockAssembler` 在**没有 `block-end`** 时同样会用
+     * `partial.text` 组装出块，故只在出口过滤挡不住空 Think 块 —— 必须从一开始
+     * 就不发任何 chunk（与「空名字 tool_call」同型修法）。
+     */
+    const suppressor = createBlankReasoningSuppressor()
+    const toolCalls = new Map<number, {
+      index: number
+      text: string
+      callId?: string
+      name?: string
+      /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+      announced: boolean
+    }>()
     const toolOrder: number[] = []
     const toolIds = new Map<number, string>()
     let buffer = ''
@@ -1146,18 +1247,51 @@ export class TraeAdapter extends LlmAdapter {
                         blocks.push(block)
                         yield { type: 'block-start', index: block.index, blockType: 'text' }
                       }
-                      block.text += delta.content as string
-                      yield { type: 'text-delta', index: block.index, text: delta.content as string }
+                      // 正文死循环守卫（见 `proseLoopGuard` 注释）。命中后只停止
+                      // 累积与发射，绝不 `reader.cancel()`、绝不改 finish reason。
+                      if (proseLoopGuard !== undefined) {
+                        if (proseLoopGuard.observe(delta.content as string)) proseLoopDetected = true
+                      }
+                      // `</think:hex>` 泄漏探测（跨帧，收尾再切分）。
+                      if (!proseHasThinkTag && (delta.content as string).includes('think:')) proseHasThinkTag = true
+                      if (!proseLoopDetected) {
+                        block.text += delta.content as string
+                        yield { type: 'text-delta', index: block.index, text: delta.content as string }
+                      }
                     }
                     if (delta.reasoning_content !== undefined) {
-                      let block = blocks.find(c => c.kind === 'reasoning')
-                      if (block === undefined) {
-                        block = { index: nextIndex++, kind: 'reasoning', text: '' }
-                        blocks.push(block)
-                        yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                      // 死循环守卫：命中后不再累积、不再发射。
+                      //
+                      // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` +
+                      // `break`）在本 chunk 的行循环**全部处理完之后**、外层
+                      // `for (;;)` 末尾执行（见下方 ★ 止损块）—— 这样同一 chunk
+                      // 里已到达的 `token_usage` / `done` 仍会被处理。
+                      //
+                      // ⚠️ 也**不能用 `continue`**（Task 2 审查发现，已独立复现）：
+                      // 它会连带跳过本帧位于 reasoning 分支**之后**的处理。
+                      // 本 provider 的 `usage` 走**独立** `token_usage` 事件、
+                      // 不在此帧内，故被丢的是**同帧的 `tool_calls`**（一个
+                      // `output` 事件确实可能同时携带两者，实测复现）。故用
+                      // `if (!loopDetected)` 守卫分支体。
+                      if (loopGuard !== undefined) {
+                        if (loopGuard.observe(delta.reasoning_content as string)) loopDetected = true
                       }
-                      block.text += delta.reasoning_content as string
-                      yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content as string }
+                      if (!loopDetected) {
+                        // 纯空白思考：`emit === undefined` ⇒ 本片一个 chunk 都不发，
+                        // 于是既不建块、也不消耗 `nextIndex`（见 helper 注释）。
+                        const emit = suppressor.feed(delta.reasoning_content as string)
+                        if (emit !== undefined) {
+                          let block = blocks.find(c => c.kind === 'reasoning')
+                          if (block === undefined) {
+                            block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                            blocks.push(block)
+                            yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+                          }
+                          // ⚠️ **整块回写**（赋值，不是 `+=`）：helper 内部已累积全部文本。
+                          block.text = suppressor.text()
+                          yield { type: 'reasoning-delta', index: block.index, text: emit }
+                        }
+                      }
                     }
                     if (delta.tool_calls !== undefined) {
                       const calls = delta.tool_calls as Array<Record<string, unknown>>
@@ -1167,10 +1301,8 @@ export class TraeAdapter extends LlmAdapter {
                         const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
                         let block = toolCalls.get(wireIndex)
                         if (block === undefined) {
-                          block = { index: nextIndex++, text: '', callId }
+                          block = { index: nextIndex++, text: '', callId, announced: false }
                           toolCalls.set(wireIndex, block)
-                          toolOrder.push(block.index)
-                          yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
                         }
                         block.callId = callId
                         const callFn = call.function
@@ -1180,6 +1312,24 @@ export class TraeAdapter extends LlmAdapter {
                         }
                         const fragment = fn !== undefined && typeof fn.arguments === 'string' ? fn.arguments : ''
                         block.text += fragment
+                        // ⚠️ **名称为空前不发射任何 chunk**（与 `openai-compat.ts` /
+                        // `buddy-adapter.ts` 同因同修）。只跳过收尾的 `block-end`
+                        // 不够 —— `BlockAssembler` 会把没有 block-end 的 partial
+                        // 也组装成 `name:''`，污染会话后让下游端点以 400 拒绝请求。
+                        if (!block.announced) {
+                          if (!hasUsableToolName(block.name)) continue
+                          block.announced = true
+                          toolOrder.push(block.index)
+                          yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+                          yield {
+                            type: 'tool-call-delta',
+                            index: block.index,
+                            id: ToolCallId(callId),
+                            name: block.name!,
+                            argumentsDelta: block.text,
+                          }
+                          continue
+                        }
                         yield {
                           type: 'tool-call-delta',
                           index: block.index,
@@ -1240,6 +1390,23 @@ export class TraeAdapter extends LlmAdapter {
           }
           // 注释行（":"）或其他忽略
         }
+        // ★ 止损（终审 C1）：命中死循环后**中止上游**，否则 128000 token 照烧。
+        // 原实现只跳过下行累积/发射，`for (;;)` 仍把流读到底 —— 实测上游
+        // 200 帧被读 200 帧（守卫在 ~2304 字符即命中，99.5% 的额度仍被消耗）。
+        //
+        // ⚠️ 位置：内层行循环**之后**、外层 `for (;;)` 末尾 —— 同一 chunk 里已到达
+        // 的 `token_usage` / `done` 事件因此仍会被处理，但命中后**立即**退出，
+        // 不再读下一块。
+        //
+        // ⚠️ 只 cancel **reader**，绝不 abort `options.signal`：后者是调用方信号，
+        // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+        // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+        // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+        // 「正常止损」变成一次失败。
+        if (loopDetected) {
+          await reader.cancel().catch(() => {})
+          break
+        }
       }
     } finally {
       reader.releaseLock()
@@ -1260,37 +1427,118 @@ export class TraeAdapter extends LlmAdapter {
       )
     }
 
+    /**
+     * 本次响应**实际会发出的 `block-end` 数量**（＝真正落进 assistant 消息的块数）。
+     *
+     * ⚠️ **不能写成 `blocks.length`**：`blocks` 里可能留着**不会发出**的条目 ——
+     * 纯空白思考块（已被 `suppressor` 压制，连 `block-start` 都没发）、
+     * 或被清洗成空串的块。用 `blocks.length` 会把「零块响应」误判成「有块」，
+     * 于是静默结束的缺陷原样保留。
+     *
+     * 故此处**在每个 `block-end` 的发射点自增**，与下面三段发射逻辑逐条对齐。
+     *
+     * ⚠️ 上方 `!sawAnyUpstreamEvent` 的 TRANSPORT 抛错**先于**本判据：
+     * 「一个上游事件都没收到」是更具体的可重试信号，不该被泛化的零块判据
+     * （EMPTY_RESPONSE）覆盖 —— 与 `kind !== 'stop'` 不改写同一条道理。
+     */
+    let blockCount = 0
     // 按创建顺序关闭每个块
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
+      // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
+      if (!hasUsableToolName(block.name)) continue
+      blockCount += 1
       yield {
         type: 'block-end',
         index,
         block: {
           type: 'tool-call',
           id: ToolCallId(block.callId ?? ''),
-          name: block.name ?? '',
+          name: block.name!,
           arguments: isTruncatedArguments(block.text) ? block.text : normalizeToolArguments(block.text),
         },
       }
     }
     if (textBlock !== undefined) {
-      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+      // ── `</think:hex>` 泄漏归位（见 `splitThinkTaggedContent`）──
+      // 标签**前**的内心独白 → reasoning 块；标签**后**的真正文 → 本 text 块。
+      // 无标签时**逐字节不变**。
+      let textOut = textBlock.text
+      if (proseHasThinkTag) {
+        const split = splitThinkTaggedContent(textBlock.text)
+        if (split !== undefined) {
+          // ⚠️ **必须同时喂 `suppressor`**：收尾以 `suppressor.text()` 为
+          // reasoning 块的权威，只改 `blocks` 条目不生效。
+          if (split.reasoning !== '') {
+            const existing = blocks.find(candidate => candidate.kind === 'reasoning')
+            if (existing === undefined) {
+              blocks.push({ index: nextIndex++, kind: 'reasoning', text: split.reasoning })
+            } else {
+              existing.text += split.reasoning
+            }
+            suppressor.feed(split.reasoning)
+          }
+          textOut = split.text
+        }
+      }
+      // 正文死循环截断：只保留循环前的干净前缀。
+      // ⚠️ **不改 finish reason**：工具调用仍要被执行。
+      const truncated = proseLoopDetected && proseLoopGuard?.cutAt !== undefined
+        ? textOut.slice(0, proseLoopGuard.cutAt)
+        : textOut
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      const cleaned = stripCourseLeakIfEnabled(truncated)
+      // ⚠️ 归位后正文可能为空串 —— 空块会污染会话，且 DSH 的
+      // `EMPTY_RESPONSE` 契约禁止产出空内容块。思考段已归位，故仍有产出。
+      if (cleaned !== '') {
+        blockCount += 1
+        yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: cleaned } }
+      }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
-    if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
-      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+    // ⚠️ 判据收紧为 `trim() !== ''`：纯空白思考不得被算作「有 reasoning 产出」。
+    if (reasoningBlock !== undefined && reasoningBlock.text.trim() !== '') {
+      // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+      // **权威覆盖**（已由 `scripts/verify-blockend-override.ts` 实证）：
+      // 即便前面已 yield 了全部重复 delta，这里发截断后的 block 即可，无需撤回。
+      //
+      // ⚠️ 文本以 helper 为权威（`suppressor.text()`），**不用**
+      // `reasoningBlock.text` —— 两者累积口径若不一致，以 helper 为准才能
+      // 保证落块内容与 wire 一致。
+      const suppressedReasoning = suppressor.text()
+      const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
+        ? suppressedReasoning.slice(0, loopGuard.cutAt)
+        : suppressedReasoning
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
+      if (cleanedReasoning !== '') {
+        blockCount += 1
+        yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
+      }
     }
+    // 丢弃了无名 tool-call 且没有留下任何可用调用时，报 max-tokens 而非 stop ——
+    // 否则模型本意调工具、harness 却认为「正常答完了」（无报错中断）。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
-    const reason = finishReason === 'length'
-      || (finishReason === undefined && toolOrder.length > 0)
-      || argsTruncated
+    const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
+    const reason = loopDetected
+      // 思考死循环：截断并报可重试。**优先级最高** —— 循环中生成的工具调用
+      // 参数不可信；且若无可用调用，落到 `stop` 会让任务静默中断。
       ? { kind: 'max-tokens' as const }
-      : finishReason === 'tool_calls' || toolOrder.length > 0
-        ? { kind: 'tool-calls' as const }
-        : { kind: 'stop' as const }
-    yield { type: 'finish', reason }
+      : finishReason === 'length'
+        || (finishReason === undefined && toolOrder.length > 0)
+        || argsTruncated
+        || (droppedUnnamedCalls && toolOrder.length === 0)
+        ? { kind: 'max-tokens' as const }
+        : finishReason === 'tool_calls' || toolOrder.length > 0
+          ? { kind: 'tool-calls' as const }
+          : { kind: 'stop' as const }
+    // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
+    // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
+    // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /
+    // 无名 tool-call 等全部既存判据）；helper 只在 `kind === 'stop'` 时改写。
+    yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) }
   }
 }
 
@@ -1385,7 +1633,13 @@ function trimTraeHistory(
 export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): TraeAdapter {
   const product = options.product ?? TRAE
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    {
+      provider: product.id,
+      displayName: product.displayName,
+      // 0.1.7 起 settings 命名空间只能是 profile 条目 id（见 settingsNamespaceFor）。
+      settingsNs: settingsNamespaceFor(ctx, `llm-${product.id}`),
+      settingsPath: [],
+    },
   ])
   const adapter = new TraeAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

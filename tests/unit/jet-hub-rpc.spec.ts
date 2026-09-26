@@ -644,6 +644,9 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       {} as never,
       makeAuth('trae') as never,
       {} as never,
+      makeAuth('cline') as never,
+      {} as never,
+      {} as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -723,12 +726,11 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         }
       },
     }
-    // 参数顺序：ctx, pool, codearts, buddy, buddyIntl, workbuddy, workbuddyCn,
-    //           lobsterai, qoder, qoderCn, trae, traeIntl
     registerJetHubRpc(
       ctx as never, pool as never, auth as never,
       {} as never, {} as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never,
     )
     const response = await handler!(new Request('http://localhost/api/jet-hub', {
       method: 'POST',
@@ -779,11 +781,15 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       },
     }
     registerJetHubRpc(
+      // ⚠️ 同样的位置参数陷阱：`failingAuth` 必须落在 trae 的位置上。
       ctx as never, pool as never,
       {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
       {} as never, {} as never,
-      failingAuth as never,
-      {} as never,
+      failingAuth as never, // 9: trae
+      {} as never, // 10: traeIntl
+      {} as never, // 11: cline
+      {} as never, // 12: loomy
+      {} as never, // 13: raccoon
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -871,6 +877,8 @@ describe('model.list / model.setDisabled 端点', () => {
      * 省略时退化为「listModels + 裸 id 补回」的历史行为。
      */
     modelAdapters?: Record<string, { listAllModels(): readonly { id: string; name: string }[] }>
+    /** 让 `ctx.emit` 抛错，验证「广播失败不反噬已落盘的开关」。 */
+    emitThrows?: boolean
   }) {
     // settings 替身：内存里保存 namespace 的值，语义与真实服务一致的
     // 「整体 replace」。
@@ -879,6 +887,8 @@ describe('model.list / model.setDisabled 端点', () => {
       ...options.disabledModels !== undefined ? { disabledModels: options.disabledModels } : {},
     }
     let handler: Handler | undefined
+    /** 端点通过 `ctx.emit` 广播过的事件名（按顺序）。 */
+    const emitted: string[] = []
 
     const pool = new AccountPool({
       get: (key: string) => key === 'settings'
@@ -935,6 +945,15 @@ describe('model.list / model.setDisabled 端点', () => {
       // 始终可用），使端点注册行为与 Web profile 下完全一致。
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
+      // `model.setDisabled` / `model.setAllDisabled` 写完黑名单后必须广播
+      // `llm/adapters-updated`，否则客户端那份 `status === 'ready'` 即短路的
+      // 目录缓存永不失效 —— 表现为「关闭后选择器里仍看得到该模型，重启后才消失」。
+      // 替身必须真的实现 emit：若只声明不实现，生产代码的广播会以
+      // `ctx.emit is not a function` 被 try/catch 静默吞掉，用例便形同虚设。
+      emit: (event: string) => {
+        if (options.emitThrows === true) throw new Error('listener exploded')
+        emitted.push(event)
+      },
     }
 
     // 参数顺序：ctx, pool, codearts, buddy, buddyIntl, workbuddy, workbuddyCn,
@@ -942,7 +961,8 @@ describe('model.list / model.setDisabled 端点', () => {
     registerJetHubRpc(
       ctx as never, pool,
       {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never,
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -963,7 +983,7 @@ describe('model.list / model.setDisabled 端点', () => {
       return body.result
     }
 
-    return { call, pool, storedValue: () => stored }
+    return { call, pool, storedValue: () => stored, emitted }
   }
 
   const MODELS = [
@@ -1140,6 +1160,58 @@ describe('model.list / model.setDisabled 端点', () => {
     expect(result.error?.message).toContain('modelId')
   })
 
+  /**
+   * 回归：**开关必须广播目录变更事件**，否则界面要重启才更新（用户报障）。
+   *
+   * 真实缺陷：`dsh-client-ui-model-selection` 的 `ModelCatalogDirectory` 把
+   * `modelCatalog` 响应缓存在一个 `status === 'ready'` 即短路返回的 store 里，
+   * 只在三个转发事件上 `refresh()`。0.1.7 起黑名单落在插件自有文档
+   * （不再经 settings 文档），于是写开关**不触发任何**那些事件 → 选择器一直
+   * 显示旧目录，直到重启（`connection/reset`）才重拉。
+   *
+   * 适配器侧本来就是对的（每次实时读黑名单），所以这个用例锁的是**通知**：
+   * 少了它，落盘与界面就会长期不一致，且没有任何报错。
+   */
+  it('model.setDisabled 广播 llm/adapters-updated（否则界面要重启才更新）', async () => {
+    const { call, emitted } = registerEndpoints({ models: MODELS })
+
+    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+    // 关闭要广播
+    expect(emitted).toContain('llm/adapters-updated')
+
+    // 重新打开同样要广播：两个方向都会改变可见目录。
+    emitted.length = 0
+    await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: false })
+    expect(emitted).toContain('llm/adapters-updated')
+  })
+
+  it('校验失败时不广播（没有实际变更就不该惊动目录）', async () => {
+    const { call, emitted } = registerEndpoints({ models: MODELS })
+
+    const result = await call('model.setDisabled', { provider: 'buddy', modelId: '' })
+
+    expect(result.ok).toBe(false)
+    expect(emitted).toEqual([])
+  })
+
+  /**
+   * 广播失败**不能反噬已经落盘的开关**。
+   *
+   * 若让监听器的异常冒泡，用户会看到「切换失败」，而黑名单其实已经写入 ——
+   * 再点一次又因幂等而看似「无效」，比不提示更难排查。故生产代码把 emit
+   * 包在 try/catch 里，本用例锁住这一行为。
+   */
+  it('广播抛错时开关仍算成功（已落盘的不回滚）', async () => {
+    const { call, storedValue, emitted } = registerEndpoints({ models: MODELS, emitThrows: true })
+
+    const result = await call('model.setDisabled', { provider: 'buddy', modelId: 'hy3', disabled: true })
+
+    expect(result.ok).toBe(true)
+    expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+    // 抛错发生在 push 之前，故不会有记录 —— 但关键断言是上面的 ok/落盘。
+    expect(emitted).toEqual([])
+  })
+
   it('llm 服务不可用时 model.list 返回可读错误（账号面板不受影响）', async () => {
     const { call } = registerEndpoints({ models: MODELS, withoutLlm: true })
     const result = await call('model.list', { provider: 'buddy' })
@@ -1154,6 +1226,202 @@ describe('model.list / model.setDisabled 端点', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('令牌已过期')
+  })
+
+  /**
+   * 批量端点 `model.setAllDisabled`（Jet Hub 模型列表的「打开全部 / 关闭全部」）。
+   *
+   * 两个方向的语义**刻意不对称**，这是需求明确规定并写进
+   * `AccountPool.setModelsDisabled` / `clearDisabledModels` 的约定：
+   *
+   * - `disabled: true`（关闭全部）：按**当前目录**逐项加入黑名单，读目录因此是必需的；
+   * - `disabled: false`（打开全部）：直接清空该 provider 的黑名单，**不读目录** ——
+   *   否则「曾被关闭、后来从服务端目录里下线」的历史遗留键永远清不掉。
+   *
+   * 用一个带布尔的端点而不是两个端点：两者共享同一套校验、同一次广播、
+   * 同一份返回结构，唯一差异就是那个布尔。
+   */
+  describe('model.setAllDisabled（打开全部 / 关闭全部）', () => {
+    it('disabled:true 把目录里的模型全部写入黑名单', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+      // 落盘后 model.list 应显示全部关闭
+      const list = await call('model.list', { provider: 'buddy' })
+      const models = (list.value as { models: Array<{ disabled: boolean }> }).models
+      expect(models.every((m) => m.disabled)).toBe(true)
+    })
+
+    /**
+     * 目录来源必须是**未过滤**的全量目录。
+     *
+     * `listModels` 会按黑名单过滤，已关闭的模型不在其中。虽然它们本就在
+     * 黑名单里（合并语义让结果恰好正确），但目录少一项就意味着「批量关闭」
+     * 的集合不完整 —— 一旦将来有人把合并改成整体替换，漏掉的项会被静默打开。
+     */
+    it('disabled:true 以 listAllModels 的全量目录为准', async () => {
+      const catalog = [
+        { id: 'glm-5.2', name: 'GLM-5.2' },
+        { id: 'hy3', name: 'Hy3' },
+      ]
+      const { call, storedValue } = registerEndpoints({
+        models: catalog,
+        disabledModels: { buddy: { hy3: true } },
+        modelAdapters: { buddy: { listAllModels: () => catalog } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(storedValue().disabledModels).toEqual({ buddy: { 'glm-5.2': true, hy3: true } })
+    })
+
+    it('disabled:false 清空该 provider 的全部关闭项（含目录里没有的历史遗留键）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: {
+          buddy: { hy3: true, 'legacy-model': true },
+          workbuddy: { 'gpt-5.4': true },
+        },
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+
+      expect(result.ok).toBe(true)
+      // buddy 整体清空（含不在 MODELS 里的 legacy-model），workbuddy 不受影响
+      expect(storedValue().disabledModels).toEqual({ workbuddy: { 'gpt-5.4': true } })
+    })
+
+    /**
+     * 打开全部**不依赖目录**，因此 llm 服务不在时也必须成功。
+     *
+     * 这是两个方向最实质的差异：若图省事让打开也先读目录，那么在模型目录
+     * 读不出来（凭据过期 / 远端故障）时，用户会连「把开关全部打开」这件
+     * 纯本地的事都做不了。
+     */
+    it('disabled:false 不依赖 llm 服务', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+        withoutLlm: true,
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({})
+    })
+
+    it('disabled:true 在 llm 不可用时回可读错误，且不落盘', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+        withoutLlm: true,
+      })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('llm 服务不可用')
+      // 失败不得留下半套状态，也不该惊动目录
+      expect(storedValue().disabledModels).toEqual({ buddy: { hy3: true } })
+      expect(emitted).toEqual([])
+    })
+
+    /**
+     * 批量**只广播一次**。
+     *
+     * 若在前端循环调用单条端点，30 个模型会发 30 次请求、30 次
+     * `llm/adapters-updated`，客户端目录被反复刷新；批量端点的意义正在于此。
+     */
+    it('只广播一次 llm/adapters-updated（批量不等于逐条广播）', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+
+    it('打开全部同样广播（两个方向都改变可见目录）', async () => {
+      const { call, emitted } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { buddy: { hy3: true } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: false })
+
+      expect(emitted).toEqual(['llm/adapters-updated'])
+    })
+
+    it('provider 非字符串 → bad-request，不落盘也不广播', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { disabled: true })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('provider')
+      expect(storedValue().disabledModels).toBeUndefined()
+      expect(emitted).toEqual([])
+    })
+
+    /**
+     * `disabled` 必须显式给布尔，**不做默认值猜测**。
+     *
+     * 缺失时若默认成 `true`，一次字段名写错的前端改动会「静默关闭用户全部
+     * 模型」；默认成 `false` 则反向静默打开 —— 两个方向都是灾难性且难察觉的。
+     */
+    it('disabled 非布尔 → bad-request（不猜默认值）', async () => {
+      const { call, emitted } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy' })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.message).toContain('disabled')
+      expect(emitted).toEqual([])
+    })
+
+    it('返回写入后的完整黑名单（与 model.setDisabled 同结构）', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.value).toEqual({
+        provider: 'buddy',
+        disabledModels: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+    })
+
+    it('黑名单按 provider 隔离（不影响其它 provider）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        disabledModels: { workbuddy: { 'gpt-5.4': true } },
+      })
+
+      await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(storedValue().disabledModels).toEqual({
+        workbuddy: { 'gpt-5.4': true },
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+    })
+
+    /** 广播抛错不能反噬已落盘的批量开关（与单条端点同一约定）。 */
+    it('广播抛错时批量开关仍算成功', async () => {
+      const { call, storedValue, emitted } = registerEndpoints({ models: MODELS, emitThrows: true })
+
+      const result = await call('model.setAllDisabled', { provider: 'buddy', disabled: true })
+
+      expect(result.ok).toBe(true)
+      expect(storedValue().disabledModels).toEqual({
+        buddy: { 'glm-5.2': true, 'deepseek-v4-flash': true, hy3: true },
+      })
+      // 抛错发生在 push 之前，故不会有记录 —— 关键断言是上面的 ok/落盘。
+      expect(emitted).toEqual([])
+    })
   })
 })
 
@@ -1209,7 +1477,8 @@ describe('积分端点的 provider 能力边界', () => {
     registerJetHubRpc(
       ctx as never, pool as never,
       {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -1387,7 +1656,8 @@ describe('account.reorder 端点', () => {
     registerJetHubRpc(
       ctx as never, pool as never,
       {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
+      {} as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 

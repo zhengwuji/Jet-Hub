@@ -22,11 +22,17 @@
   走**加密推理端点**，模型池与客户端一致（含 Qwen3.8 系列）。
 - **trae（字节跳动 TRAE 国内版）** / **trae-intl（国际版）** — 见
   [TRAE provider](#trae-provider字节跳动-trae)。
+- **cline（Cline 桌面端 / API）** — 见 [Cline provider](#cline-provider)；
+  WorkOS 设备码登录，支持免费模型识别。
+- **loomy（讯飞 Loomy 办公助手）** — 见 [Loomy provider](#loomy-provider讯飞办公助手)；
+  支持微信扫码登录、积分余额、每日额度签到与新手任务 10000 积分。
+- **raccoon（商汤小浣熊 Raccoon Work）** — 见 [Raccoon provider](#raccoon-provider)；
+  支持扫码/短信登录、6 个商汤日日新模型、积分与一次性登录奖励。
 - **antigravity（Google Antigravity IDE）** — 见
   [Antigravity 渠道](#antigravity-渠道google-antigravity-ide)；
   走**本机凭据复用 / 本地私有通道**，不独立登录、不进账号池。
 
-> **国内版与国际版各占一个 provider**（共 11 个）。两侧端点与登录态
+> **国内版与国际版各占一个 provider**（共 14 个）。两侧端点与登录态
 > **互不相通**，因此凭据也各自独立保存，绝不串用 —— 在对应面板登录哪一侧的账号，
 > 就只走那一侧的端点。
 
@@ -34,7 +40,7 @@
 （华为云「每日签到得积分」活动，走 `SDK-HMAC-SHA256` 签名）——
 见 [CodeArts 积分](#codearts-积分华为云每日签到得积分)。
 
-五个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+八个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
@@ -388,12 +394,13 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册五个独立的 provider 路由：`buddy`（见
+除 `codearts` 外，插件另注册六个独立的 provider 路由：`buddy`（见
 [buddy provider](#buddy-provider)）、`workbuddy`（见
 [WorkBuddy provider](#workbuddy-provider)）、`lobsterai`（见
 [LobsterAI provider](#lobsterai-provider有道龙虾)）、`qoder`（见
-[Qoder provider](#qoder-provider)）与 `trae`（见
-[TRAE provider](#trae-provider字节跳动-trae)）。六者互不覆盖，可同时使用。
+[Qoder provider](#qoder-provider)）、`trae`（见
+[TRAE provider](#trae-provider字节跳动-trae)）与 `cline`（见
+[Cline provider](#cline-provider)）。七者互不覆盖，可同时使用。
 
 ## 凭证
 
@@ -1213,6 +1220,63 @@ wasm-bindgen 约定把它接起来**复用**（`src/qoder-wasm.ts`）。
 > **不入库**的内部文档 `docs/qoder-encryption-notes.md` 中 ——
 > 该文档含逆向分析，刻意不随仓库分发。
 
+### 工具调用（tools）
+
+加密端点认 **OpenAI 风格**的工具描述，落在请求体**顶层** `tools`：
+
+```jsonc
+"tools": [{ "type": "function",
+            "function": { "name": "read", "description": "…", "parameters": { … } } }]
+```
+
+assistant 的工具调用挂 `tool_calls`，工具结果用 `role:"tool"` + `tool_call_id`。
+
+⚠️ **真实缺陷**（用户报障）：「使用本插件的 qoder 的 qwen3.8-flash，
+执行任务出现任务调用 xml 泄露任务终止」。两处根因：
+
+1. 适配器**从不消费 `options.tools`**（其余四个 provider 都消费），且
+   `qoder-wasm.ts` 把请求体的 `tools` **硬编码为 `[]`** → 模型在 wire 上
+   拿不到任何函数 schema，只能用**正文里的 XML 文本**臆造工具调用，
+   harness 认不出 → 任务终止；
+2. history 过滤器写成「只留 `content` 为字符串的消息」，而 assistant 带工具
+   调用时 `content` 是 **`null`**（OpenAI 规范）→ 整条被丢，`role:"tool"` 的
+   `tool_call_id` 也被丢 → 模型看不到自己调用过什么，反复重调同一工具或
+   凭空编造结果（与 TRAE 那条同型缺陷一致）。
+
+⚠️ **别照抄 Anthropic 风格**：客户端另有 `tool_use` / `input_schema` /
+`tool_use_id` 一套，那是给 **Anthropic BYOK** 用的分支，本端点不吃。
+
+⚠️ **加密端点的请求体本地不可解**，无法靠抓包验证 —— 故 payload 构造抽成
+纯函数 `buildQoderInferPayload()`，由 `buildQoderTools()` /
+`buildQoderHistory()` 与端到端替身共同锁死（`tests/unit/qoder-tools.spec.ts`）。
+
+### 「没有任何报错就中断」已修
+
+症状：UI 上**看不到任何错误**，任务却停在了半路（`turn/end` 是 `completed`）。
+
+**根因**：`consumeOpenAiSse` 把「**没收到 `finish_reason`** 且**没有工具调用**」
+直接判成 `{kind:'stop'}` —— 而 `stop` 是「模型正常答完」的信号。于是**被掐断的
+连接伪装成正常结束**，harness 认为本轮已完成，任务就此中断。
+
+真实案例（2026-09-23，`qoder`/`qfmodel`）：某步的 chunk 流只有
+`block-start(text) → text → usage → block-end → finish{stop}`，**没有任何
+tool-call 分片**，而正文以冒号「：」结尾（模型正要调工具），`outputTokens=118`
+远未触上限；相邻的**正常步**则多出 `block-start(tool-call) → tool-call-chunks`。
+
+**修复**：判据改为「**连接结束的方式**」—— 既没有显式 `finish_reason`、
+也没有 `[DONE]`，就报 `max-tokens`（不完整、可重试），不再报 `stop`。
+
+同时修掉两个同族缺陷（都表现为「无报错中断」）：
+
+- **网关形态错误帧被整帧丢弃**：`{"stackTrace":[…],"message":"…","statusCodeValue":400}`
+  既没有 `code` 也没有 `error`、也没有 `choices`，早期解析器所有条件都不命中；
+- **响应根本不是 SSE**（网关直接回了一段 JSON，没有任何 `data:` 帧）：
+  早期静默空结束，现抛错并**带上原文片段**。
+
+> 排查这类问题用 `node scripts/inspect-session.mjs`（只读）——它能把会话日志
+> （zstd 压缩的 JSONL）里的**原始 chunk 流**还原出来。用法见 `AGENTS.md`。
+> 回归用例 `tests/unit/qoder-silent-stop.spec.ts`。
+
 ### 模型列表：17 个目录 key（**实测数据**）
 
 `listModels` 是**静态表**（不发网络请求）—— 远端目录需签名，运行时不做。
@@ -1438,3 +1502,378 @@ LobsterAI 都不同源。它也是唯一一个**请求与响应都要转换**的
 
 > 实现依据见 `docs/trae-integration-plan.md`（协议逆向自
 > [`trae2api`](https://github.com/Sliverkiss/traework2api) 及其衍生项目）。
+
+## Cline provider
+
+Cline（[cline.bot](https://cline.bot)）桌面端的账号与模型路由。协议全部由本机
+Cline 产物逆向 + 实测得出（2026-09-25），与其余六个 provider **都不同源**：
+
+| 维度 | 本 provider 的取值 |
+|------|-------------------|
+| 登录 | **WorkOS 设备码轮询**（`api.workos.com`，不起本地监听端口） |
+| 鉴权头 | `Authorization: Bearer workos:<jwt>` —— **前缀不可剥** |
+| 推理 | **标准 OpenAI 兼容**（`POST {apiBase}/api/v1/chat/completions`） |
+| 续期 | `POST {apiBase}/api/v1/auth/refresh`，body `{refreshToken, grantType}` |
+| 积分 | 余额有；**签到无**（后端没有签到接口） |
+
+### 登录（设备码轮询）
+
+Jet Hub 的 Cline 面板点「+ 新建账号」→ 浏览器打开授权页并显示用户码 →
+在浏览器完成授权 → 插件自动换取凭据。全程**不需要**本地回调端口。
+
+⚠️ **`authorization_pending` 不是错误**：它是「用户还没在浏览器里点授权」，
+插件会继续轮询（与 Qoder 的「404 表示尚未授权」同类语义）。`slow_down` 会
+**累积退避**后再轮询。
+
+### 免费模型
+
+Cline 的免费模型由远端 `GET /api/v1/ai/cline/recommended-models` 的 **`free`
+数组**动态下发，插件在模型列表里把它们的名字标成 `· 免费`，例如：
+
+```
+Space Bunny Alpha · 免费
+MiMo-V2.6-Flash · 免费
+DeepSeek V4.1 Flash · 免费
+Gemini 3.8 Flash · 免费
+Muse Spark 1.3 Contributor · 免费
+```
+
+⚠️ **免费与付费是两组不同的模型 id**，不是同一模型的两种档位：
+
+| 免费（`free` 数组下发） | 按量计费（同名前缀不同） |
+|---|---|
+| `cline-free/deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash` |
+
+插件的判定基于**完整 id**（远端 `free` 集合 ∪ `:free` 后缀 ∪ `cline-free/`
+前缀 ∪ 静态兜底），**不做名字模糊匹配** —— 否则会把付费条目误标为免费，
+用户按免费预期使用却被计费。
+
+⚠️ 免费资格是**服务端随时可撤销**的营销状态，故插件每次都从远端重新取，
+不在代码里硬编码任何免费模型名。
+
+### 思考强度
+
+模型选择器旁提供 `None / Low / Medium / High / Extra` 五档，与 Cline IDE 一致，
+默认 **High**。
+
+- `None` = 不思考（实测不传 `reasoning_effort` 时模型本就不思考）
+- `Extra` 对应上游的 `max` 档 —— 内嵌目录里的 `xhigh` 实测与 `high` 无可辨差异，
+  故跳过它，把真正的最高档留给 `Extra`
+
+⚠️ 档位数据来自 Cline 客户端内嵌的模型目录，**远端接口不下发**（`/api/v1/models`
+只有 `{id, object, created, owned_by}`，`recommended-models` 只有
+`{id, name, description, tags}`）。对不在该目录里的模型，五档是统一给的 ——
+上游不认识的档位会被**静默忽略**（不会导致请求失败，最坏是「开关无效」）。
+
+⚠️ 声明默认档位 High 意味着**默认会思考**：未手动选择时插件会带上
+`reasoning_effort: 'high'`，思考 token 计入 `completion_tokens`。想要完全不思考，
+在选择器里选 `None` 即可。
+
+### Gemini 系模型的两个 400（已修）
+
+`cline-free/gemini-3.8-flash` 曾「发消息即失败」。错误体里一次请求有**两个
+provider 尝试、两个不同的错误**，是两个独立根因：
+
+| provider | 错误 | 根因 |
+|---|---|---|
+| `vertex` | `maxOutputTokens 131072 超出 1..65537` | 兜底表数值填错，应为 **65536** |
+| `google` | `tools[..].properties[permission].enum[3]: cannot be empty` | 工具 schema 的 `enum` 含空串 |
+
+- **上限**：该模型不在客户端内嵌目录里，曾经照抄其它免费模型填了 `131072`；
+  实测上限是 **65536**。适配器的 `clampClineMaxTokens` 也会把越界值收敛。
+- **工具 schema**：harness 下发的工具集里某些 `enum` 带空字符串成员，Gemini 系
+  严格校验直接 400。插件从不自己造 enum（原样透传 `tool.parameters`），
+  但请求是我们发的，故由 `sanitizeClineToolParameters()` 递归清洗：
+  只删空串、保留数值枚举、全空则丢弃 `enum` 键、递归下钻嵌套层。
+
+⚠️ 故障**不是必现的** —— 上游会依次 fallback 多个 provider，命中哪个就暴露哪个
+错误。别因为「重发一次就通了」而误判为偶发故障。
+
+### 「API 密钥无效」不一定是真的凭据问题
+
+部分模型（实测 `cline-free/muse-spark-1.3-contributor`）在该地区不可用，Cline 返回：
+
+```
+403 {"error":"access forbidden: … is not available in your region","success":false}
+```
+
+⚠️ 这条 403 与凭据无关，但 DSH 客户端对 `AUTH` 错误码一律显示「API 密钥无效」，
+真实原因会被完全掩盖。
+
+插件已按响应体文案识别地域限制（不能只看状态码 —— 同一批 403 里也有真凭据问题），
+命中时**跳过无意义的续期**，并以 `PERMISSION_DENIED` 抛出真实原因，例如：
+
+```
+cline: access forbidden: cline-free/muse-spark-1.3-contributor is not available in your region
+```
+
+这类模型无法在本地区使用，可在 Jet Hub 的「显示列表」里关掉，换用其它免费模型。
+
+### 积分余额
+
+Jet Hub 的 Cline 账号卡片会显示账户余额（`GET /api/v1/users/{accountId}/balance`）。
+**没有「一键领取积分」按钮** —— Cline 后端没有签到接口（对 sidecar 做全量字符串
+扫描，`checkin` / `campaign` 等均无业务端点命中）。
+
+### 适用范围
+
+- 需要**已登录 Cline 账号**（Jet Hub 面板登录，或用免费账号）；
+- 模型列表**全部列出**（含付费模型），免费的带 `· 免费` 标记；
+  可在 Jet Hub 的「显示列表」里逐个关闭不需要的；
+- 图片输入按模型判定（内嵌目录 `capabilities` 含 `images`）。
+
+### 图标
+
+面板图标是**从本机 Cline 安装目录提取的官方图标**（`icons\app\macos\classic.png`，
+品牌紫底），不是手绘的 —— 早期版本曾按印象画了个「C 形弧线」，与真实标志不符。
+
+需要重新提取（例如 Cline 换了图标，或想换主题）时：
+
+```bash
+node scripts/extract-cline-icon.mjs                    # classic（默认），48×48
+node scripts/extract-cline-icon.mjs --theme=midnight   # 换主题
+node scripts/extract-cline-icon.mjs --dry-run          # 只报告不改文件
+pnpm build:client                                      # 改完必须重建
+```
+
+官方提供 `classic` / `chip` / `hologram` / `midnight` 四套主题，脚本默认取
+`classic`：`midnight`（exe 内嵌的默认主题）是近黑底，与 Qoder 图标在 20×20 下
+难以区分；`chip` 的电路板纹理缩小后退化成噪点；`hologram` 在白底容器里对比度不足。
+
+### e2e 探针
+
+```
+pnpm test:e2e:cline        # 只读：凭据/前缀证据/余额/免费集合，零 token 消耗
+pnpm test:e2e:cline-chat   # ⚠️ 发一次推理：默认只发 cline-free/deepseek-v4.1-flash
+```
+
+⚠️ 推理探针**默认只请求一个免费模型**。其余免费模型需显式设置
+`DSH_CLINE_CHAT_E2E_ALL_FREE=1` 才遍历；**付费模型一律被拒绝**（避免免费资格
+被撤销后按付费价刷 token）。详见 `tests/e2e/README.md`。
+
+### 排查脚本（只读）
+
+`scripts/probe-cline-endpoints.mjs`（按关键词提取 sidecar 二进制字符串窗口）、
+`probe-cline-models.mjs`、`probe-cline-recommended.mjs`、
+`probe-cline-balance.mjs`、`probe-cline-chat.mjs`。
+## Loomy provider（讯飞办公助手）
+
+`loomy` 是本插件第 8 个、也是**与其余七者都不同源**的 provider。生产环境：
+
+| 用途 | base URL |
+|---|---|
+| 推理 / 模型列表 / 积分 / 新手任务 | `https://loomyad.xunfei.cn/api/v1` |
+| 讯飞账号（CAccount） | `https://account.xfinfr.com` |
+
+⚠️ 这两个域名是**生产**地址，不要改用测试环境。
+
+### ⚠️ 五个与其余 provider 不同的地方
+
+1. **登录是短信验证码**（唯一一个）。其余 7 个都是「返回 `loginUrl` →
+   前端 `window.open` → 轮询 `login.poll`」；短信登录没有 URL 可打开，
+   故 `account.create` 返回 `loginMode: 'sms'`（缺省视为 `'url'`，
+   既有 provider 行为不变），前端渲染验证码表单，
+   走 `login.sendSms` / `login.submitSms` 两个端点。
+
+2. **不能续期**（唯一一个）。Loomy **没有任何 refresh 端点** ——
+   `session` 是登录时向服务端声明 `expire: 1209600`（14 天）得来的。
+   故 `isLoomyRefreshable()` 恒 `false`，`refresh()` /
+   `refreshAccountCredential()` 只做**有效性探测**（失效即提示重新登录），
+   `refreshAll()` 只探测**已过期**的账号。这是**诚实标记**，
+   不是遗漏 —— 账号卡片会如实显示「凭证过期，请重新登录」。
+   `scheduleRefresh()` / `stop()` 因此是**有意为之的空实现**。
+
+3. **两套认证头**。`/chat/completions` **只认** `Authorization: Bearer <session>`，
+   而 `/models`、`/points/*`、`/onboarding/*` **只认** `token: <session>`。
+   带错的那个会得到 HTTP 200 + `{"code":"100002","desc":"缺少 token"}`。
+   `loomyChatHeaders()` 两个都发（官方客户端也如此）。
+   实测交叉矩阵（`pnpm test:e2e:loomy` 会现场验证）：
+
+   ```
+   GET /points/records  + token  → code=000000
+   GET /points/records  + Bearer → code=100002 (缺少 token)
+   ```
+
+4. **新手任务是纯 API 直领**，不需要模拟真实用户行为。
+   实测服务端**不校验任何前置行为**：直接对 8 个任务发
+   `POST /api/v1/onboarding/tasks/complete`（body 只有 `{"key":...}`）即可拿满
+   **10000 积分**，一个模型 token 都不花。
+   ⚠️ 这与 WorkBuddy 相反（后者需要发对话、建定时任务、上报埋点事件链）。
+   若将来服务端加了校验，降级路径是「用 `qwen3.8-flash`（x0.8，全表最便宜）
+   模拟真实动作」。
+
+5. **积分是两个池、分开计算**：
+   - **永久积分**（`balance`）：注册奖励 5000 + 新手任务 10000
+   - **每日赠送池**（`dailyBalance`）：每天 5000，**消耗后不回补**
+
+   「一键签到」= `POST /api/v1/points/first-login`（官方在登录后立即调用它），
+   语义是**触发每日额度重置**，**不是**「+5000 积分」。
+   幂等判据是响应体的 `alreadyProcessed`，故已初始化时映射成
+   `already-claimed` 而非虚报 `claimed`。
+   余额查询走 `GET /api/v1/points/records`（**只读**，无副作用）——
+   刻意不用 `first-login`，否则「打开面板」会悄悄触发签到。
+
+### 模型与倍率
+
+远端 `GET /api/v1/models` 返回 11 条，按 `type === 'chat'` 过滤得 **8 条**。
+⚠️ 过滤判据必须是 `type`，**不能**看 `input_modalities` —— 实测 5 个 chat
+模型的输入模态含 `image`（能看图），那不是生图模型。
+
+⚠️ **倍率在 `name` 字符串里**，没有独立字段（实测搜 `credit`/`multiplier`/
+`price`/`factor`/`rate` 全部 0 命中），且三种括号风格混用，故由
+`loomyDisplayName()` 规范化为 `MiniMax M3 · x4.0` 形态。
+
+| 模型 | 倍率 | 上下文 |
+|---|---|---|
+| `deepseek-v4-flash-0731` | x3.0 | 1048576 |
+| `MiniMax-M3` | x4.0 | 1048576 |
+| `Kimi-k2.6` | x6.5 | 262144 |
+| `qwen-3.8-max` | x12.0 | 1000000 |
+| `GLM-5.3-Flash` | x0.8 | 1048576 |
+| `qwen3.8-flash` | x0.8 | 1000000 |
+| `spark-x` | x0.1 | 1048576 |
+| `mimo-v2.5` | x3.3 | 1048576 |
+
+⚠️ **`spark-x` 的上下文有已知分歧**：远端声明 `1048576`，而 Loomy 客户端用
+本地表 `MODEL_CONTEXT_OVERRIDES = { 'spark-x': 262144 }` 强制降到 262144。
+本插件**先采信远端**；若实测长上下文被拒，改兜底表的该值为 262144。
+
+### 能力矩阵
+
+```js
+loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
+```
+
+`onboardingTasks` 是**第三项能力位**，与 `dailyCheckin` **语义独立**：
+前者**一次性**（每号只能领一次 10000 分），后者**每天**有收益。
+故新手任务有独立按钮与独立端点（`onboarding.status` / `onboarding.claim`），
+**不参与**页头「一键签到」遍历 —— 否则每天会对已领完的账号
+发 8 个必然 `alreadyCompleted` 的请求。
+
+### 多账号负载均衡（按余额优先选号）
+
+⚠️ Loomy **不会因积分耗尽而报错** —— 实测今日赠送额度（每天 5000）用完后，
+服务端**继续扣永久积分且照常返回**（静默降级）。因此本插件既有的
+「限流 → 自动换号」机制对它**无效**：会一直消耗同一个号。
+
+故 Loomy 有一层**独立的选号策略**（在「未停用 + 该模型未受限」的候选内）：
+
+| 优先级 | 判据 | 理由 |
+|---|---|---|
+| 1 | `dailyBalance > 0` | 今日额度**每天刷新、不用会浪费**，优先消耗它 |
+| 2 | `permanentBalance > 0` | 只剩永久积分（不会过期，可继续用） |
+| 3 | 其余（含**查询失败**） | 无可用余额 |
+
+- **同档内保持你在 Jet Hub 拖拽的手动顺序**（不按余额大小重排）
+- 余额查询**带 60 秒缓存**，避免每轮对话重复查所有账号
+- 查询失败的账号归入**最后一档**（宁可先用能确认余额的号）
+
+### 锁定永久积分
+
+面板上的「锁定永久积分」按钮可**保住永久积分**（设置持久化，重启后仍生效）：
+
+| 状态 | 行为 |
+|---|---|
+| 解锁（默认） | 今日额度用尽后**继续用永久积分** |
+| **锁定** | **只消耗今日额度**；今日额度用尽的账号视为不可用 |
+
+锁定后若所有账号的今日额度都用尽，请求会报**明确错误**提示你解锁或等明日
+刷新 —— 而不是偷偷用掉永久积分。
+
+### ⚠️ 为什么 Loomy 没有「重测 / 重置」按钮
+
+那组按钮用于清除**模型限流标记**，而 Loomy **不返回限流错误**（积分耗尽时
+静默降级为扣永久积分），重测永远测不出限流、还会白烧积分，故对它隐藏。
+
+### 账号卡片
+
+两个积分池**分开显示**（用户要求）：`永久 15000 · 每日 4992`。
+其余 provider 的多个同类资源包仍显示「N/M 个资源包有效」，两种形态互斥。
+
+### e2e 探针
+
+```
+pnpm test:e2e:loomy        # 只读：凭据/两套头交叉验证/模型目录/任务/两池余额，零消耗
+pnpm test:e2e:loomy-chat   # ⚠️ 发一次推理：默认 qwen3.8-flash（x0.8，最便宜）
+```
+
+⚠️ 对话探针的闸门是 `DSH_LOOMY_CHAT_E2E=1` **且**
+`DSH_LOOMY_CHAT_E2E_CONFIRM=yes`，`max_tokens` 压到 16（单次约 1 积分）。
+
+---
+
+## Raccoon Work provider（商汤小浣熊）
+
+`raccoon` 是本插件第 9 个 provider。生产环境：
+
+### ⚠️ 与其余 provider 不同的地方
+
+1. **登录：微信扫码 + 短信双路径，由本地页承载**（与 Loomy 同型）。
+
+2. **短信登录需要阿里云滑块验证码**。手机号必须 **AES-128-CFB** 加密
+
+3. **每日 300 积分没有端点**。实测「每日积分发放」是**服务端按日自动发放**的
+   （账单 `biz_type: 'daily_grant'`，该账号 13:30 注册、13:31 即到账），
+   **不存在可调用的签到接口**。故能力矩阵**不登记 `dailyCheckin`** ——
+   登记了会让按钮每次点击都必然失败（与 CodeArts 早期「对不支持的 provider
+   无条件发请求」是同一类缺陷）。
+
+4. **一次性登录奖励是独立来源**：`POST /api/web/desktop/v1/login/points/grant`
+   给 3000 分，**幂等一次性**（已领过返回 `granted:false`，
+   且账单里能看到上一次记录）。语义与 Loomy 的新手任务同构，
+   故登记为 `onboardingTasks`，复用同一套 `onboarding.status` / `onboarding.claim`
+   端点与 UI。⚠️ 该端点**需要** `X-Client-Platform` 头
+   （`desktop-windows` / `desktop-macos` / `desktop-linux`），猜错会被拒。
+
+5. **`Raccoon-Auto` 不暴露**。它是客户端 i18n 条目（`modelPicker.auto`）渲染的
+   **「自动选模」入口**，倍率写死为 `1 倍`，**不在远端 `model_catalog` 里** ——
+   直接发给 `chat/completions` 会 404。其语义（按消息内容正则打标后从候选池
+   选模型）与 DSH「模型选择是会话级固定」的模型相冲，且选出的模型不可预测、
+   难排查。用户可直接选 `sn-deepseek-v4-1-flash`（`ability_level: 3`、
+   带 `auto` 标签，即自动选模在复杂任务下最可能选中的那个）。
+
+### 模型目录（6 个 `visible:true`）
+
+倍率取 `billing_effective_multiplier`（**当前生效价**，已含促销），
+展示为 ` · x倍率` / ` · 免费` / ` · x原价→x折后价`：
+
+| 模型 | 原价 | 生效价 | 展示 |
+|---|---|---|---|
+| `sn-sensenova-6-8-flash` | 0.5 | **0** | `SenseNova-6.8-Flash · 免费` |
+| `sn-sensenova-6-8-flash-lite` | 0.5 | **0** | `SenseNova-6.8-Flash-Lite · 免费` |
+| `sn-glm-5-3` | 0.75 | 0.75 | `GLM-5-3 · x0.75` |
+| `sn-kimi-k3` | 1 | 1 | `Kimi-K3 · x1` |
+| `sn-glm-5-3-flash` | 0.2 | **0.1** | `GLM-5-3-Flash · x0.2→x0.1` |
+| `sn-deepseek-v4-1-flash` | 0.25 | 0.25 | `DeepSeek-V4.1-Flash · x0.25` |
+
+另有 3 个 `visible:false` 的 `raccoon-*` 内部模型（自动选模的候选池），
+**不在模型选择器中暴露**。
+
+### ⚠️ 零客户端依赖（硬约束）
+
+本 provider **运行时完全不读客户端数据** —— 不读
+`%APPDATA%\office-raccoon\Local Storage\leveldb`、不读
+`~/.box-agent/config/auth.json`、不解客户端 sqlite/leveldb。
+
+### 能力矩阵
+
+```js
+raccoon: { balance: true, onboardingTasks: true }
+```
+
+⚠️ **没有 `dailyCheckin`**，理由见上文第 3 条。
+
+### e2e 探针
+
+```
+pnpm test:e2e:raccoon        # 只读：凭据/模型目录/倍率/积分余额/账单，零消耗
+pnpm test:e2e:raccoon-chat   # ⚠️ 发推理：验证标准 OpenAI SSE 与 reasoning_content
+pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：验证 **tools 被端点接受**（返回结构化 tool_calls）
+```
+
+⚠️ 后两个的闸门是 `DSH_RACCOON_{CHAT,TOOLS}_E2E=1` **且**
+`..._CONFIRM=yes`，`max_tokens` 压到 64–256（单次消耗很小）。
+
+⚠️ **`raccoon-tools` 的判据是「响应里有结构化 `tool_calls`」**，
+不是「模型在正文里说它想调用工具」—— 后者正是 Qoder / TRAE 踩过的缺陷形态
+（插件没把 `tools` 发出去，模型只能用正文 XML 臆造，harness 认不出 → 任务终止）。

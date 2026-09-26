@@ -32,7 +32,7 @@
 本项目是 DeepSeek Harness 的插件（`dsh-codearts-auth`），提供华为云 CodeArts
 浏览器登录与凭据管理，并作为多服务商统一接入网关。
 
-**11 个 provider**，分属 5 套互不相同的协议族：
+**14 个 provider**，分属 8 套互不相同的协议族：
 
 | 协议族 | provider | 特点 |
 |---|---|---|
@@ -42,6 +42,9 @@
 | 字节 TRAE | `trae` / `trae-intl` | ExchangeToken 轮换 + 载荷双向转换（OpenAI ↔ SOLO） |
 | 华为 CodeArts | `codearts` | `SDK-HMAC-SHA256` 签名 |
 | Google Antigravity | `antigravity` | 本机凭据复用，**不进账号池** |
+| Cline | `cline` | WorkOS 设备码轮询 + 免费模型识别 + 5 档思考强度 |
+| 讯飞 Loomy | `loomy` | 微信扫码 + 手机号/短信登录 + 智能余额选号 |
+| 商汤小浣熊 | `raccoon` | 二维码扫码/手机验证码 + AES-128 加密 + 积分签到 |
 
 ⚠️ **区域版各占一个 provider**：CodeBuddy `buddy`(国内)/`buddy-intl`(国际)、
 WorkBuddy `workbuddy-cn`(国内)/`workbuddy`(国际)、Qoder `qoder`(国际)/`qoder-cn`(国内)、

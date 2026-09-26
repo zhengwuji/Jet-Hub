@@ -1,6 +1,23 @@
 import * as React from 'react';
-import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
+import {
+  supportsCreditBalance,
+  supportsDailyCheckin,
+  supportsOnboardingTasks,
+  supportsRateLimit,
+  supportsPermanentLock,
+  checkinProviders,
+} from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
+import {
+  allModelsDisabled,
+  disablingLeavesNoEnabledAccount,
+} from './account-model-link.js';
+import { bulkButtonState } from './model-bulk.js';
+import {
+  filterModels,
+  isFilterActive,
+} from './model-filter.js';
+import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
 
@@ -70,6 +87,66 @@ const QODER_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My
  */
 const TRAE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjM4IDM4IDQzNSA0MzUiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCI+PHBhdGggZmlsbD0iIzMyRjA4QyIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNTggMTE2aDM5NXYyNzlIMTE1di01NUg1OHpNMTE1IDE3MmgyODF2MTY4SDExNXoiLz48cGF0aCBmaWxsPSIjMzJGMDhDIiBkPSJNMjE1LjUgMjE1LjVsMzkgMzktMzkgMzktMzktMzl6TTMyOSAyMTUuNWwzOSAzOS0zOSAzOS0zOS0zOXoiLz48L3N2Zz4='
 
+/**
+ * Cline 面板图标（内联 base64 PNG，**取自官方安装目录**）。
+ *
+ * ## ⚠️ 不要手工臆造这个图标
+ *
+ * **真实缺陷**（用户报障）：「我们用的图标和 cline 的好像不一样」。
+ * 初版按印象画了一个「C 形弧线」的 SVG，与 Cline 的真实标志完全不符 ——
+ * 真实标志是**顶部带凸起的圆角方块 + 中间两条竖线 + 左右两侧尖角**。
+ *
+ * 教训：品牌图标**必须从官方资源提取**，不能凭印象重绘。
+ * 提取脚本：`scripts/extract-cline-icon.mjs`（可复现，无第三方依赖）。
+ *
+ * ## 来源与主题
+ *
+ * 源文件 `%LOCALAPPDATA%\Cline\icons\app\macos\classic.png`（官方 1024×1024，
+ * 32bpp ARGB 带透明圆角），脚本面积平均缩放至 **48×48** 后内联
+ * （容器实际显示 20×20，48 可覆盖 2.4× DPI）。
+ *
+ * 官方提供四套主题，这里选 **classic（品牌紫 `#7271E5` + 白色标记）**：
+ *
+ * | 主题 | 为什么不用 |
+ * |---|---|
+ * | `midnight`（近黑底，**exe 内嵌的默认图标**） | 与 Qoder 图标的深蓝黑 `#1f2a3f` 在 20×20 下几乎无法区分，列表里会混淆 |
+ * | `chip`（绿色电路板） | 20×20 下电路板纹理退化成噪点 |
+ * | `hologram`（浅色全息） | 白底容器里对比度不足 |
+ *
+ * 另：紫色在当前 7 个 provider 图标里未被占用，白底容器中辨识度最高。
+ *
+ * ⚠️ 与 LobsterAI / Qoder / TRAE 的**内联 SVG**不同源，但与
+ * CodeArts / CodeBuddy / WorkBuddy 的**内联 base64 PNG** 做法一致
+ * —— 本项目两种形态并存，都是「预先算好的 base64 字面量」，
+ * 不用 `btoa()` 运行时拼接（该 bundle 由 esbuild 打包，目标环境未必提供 `btoa`）。
+ */
+const CLINE_ICON = 'data:image/png;base64,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'
+
+/**
+ * Loomy（讯飞）面板图标：内联 SVG data URL（蓝底白字 L）。
+ *
+ * 与 LobsterAI / Qoder / TRAE 的 SVG 做法一致（体积小、无色差、
+ * 在白底容器 `.dim-jh-providerIcon` 里显示清晰）。
+ */
+const LOOMY_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%23007aff"/%3E%3Ctext x="12" y="17.5" font-size="15" font-family="sans-serif" font-weight="700" fill="white" text-anchor="middle"%3EL%3C/text%3E%3C/svg%3E';
+
+/**
+ * Raccoon Work（商汤小浣熊）面板图标：内联 base64 PNG。
+ *
+ * ⚠️ **从官方安装目录提取，不凭印象重绘**（与 Cline 那次的教训一致：
+ * 早期手绘的图标与官方标志不符，用户报障「我们用的图标和 cline 的好像不一样」）。
+ *
+ * 来源：`C:\Program Files\raccoon-ai\resources\assets\icon.png`（1024×1024 官方图标）。
+ * ⚠️ **不用 exe 内嵌图标**：实测只有 32×32（`ExtractAssociatedIcon` 与
+ * `new Icon(exe, 64, 64)` 都拿不到更大尺寸），缩到 20×20 会糊。
+ *
+ * 提取脚本：`scripts/extract-raccoon-icon.mjs`（可复现，无第三方依赖，
+ * 复用 `extract-cline-icon.mjs` 的 PNG 解码/缩放）。
+ * 品牌主色 `#8E6BF2`（见客户端 `resources/config/branding.json` 的 primaryColor），
+ * 在白底容器 `.dim-jh-providerIcon` 中显示清晰。
+ */
+const RACCOON_ICON = 'data:image/png;base64,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';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (国内版)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -85,6 +162,11 @@ const PROVIDERS = Object.freeze([
   // 登录态互不相通，故各占一个面板。
   { id: 'trae', label: 'TRAE (国内版)', icon: TRAE_ICON, logoClass: 'trae' },
   { id: 'trae-intl', label: 'TRAE (国际版)', icon: TRAE_ICON, logoClass: 'trae' },
+  { id: 'cline', label: 'Cline', icon: CLINE_ICON, logoClass: 'cline' },
+  { id: 'loomy', label: 'Loomy (讯飞)', icon: LOOMY_ICON, logoClass: 'loomy' },
+  // ⚠️ 用『Raccoon (商汤)』而非『Raccoon Work (商汤)』—— 后者在 provider 列表里
+  // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致。
+  { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
   { id: 'antigravity', label: 'Antigravity (Google)', icon: ANTIGRAVITY_ICON, logoClass: 'antigravity', reuse: true },
 ]);
 
@@ -212,6 +294,14 @@ function CreditBalanceRow({ balance, error, loading }) {
   const detail = (balance.packages || []).map(formatPackageLine).join('\n');
   const all = balance.packages || [];
   const activeCount = all.filter(p => p.active).length;
+  /**
+   * Loomy 的两个积分池必须**分开显示**（用户明确要求）。
+   *
+   * 判据是「恰好两个包且名字为已知池名」—— 其余 provider 的 packages 是
+   * 多个同类资源包（如 5 个 Bonus Pack），不适用这种展示。
+   */
+  const isLoomyTwoPools = all.length === 2
+    && all[0].name === '永久积分' && all[1].name === '每日赠送';
   return React.createElement('div', { className: 'dim-jh-metaRow' },
     React.createElement('dt', null, '积分'),
     React.createElement('dd', {
@@ -219,7 +309,11 @@ function CreditBalanceRow({ balance, error, loading }) {
       title: detail || undefined,
     },
     React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
-    all.length > 1
+    isLoomyTwoPools
+      ? React.createElement('span', { className: 'dim-jh-creditPools' },
+          `永久 ${formatCredits(all[0].remaining) ?? '0'} · 每日 ${formatCredits(all[1].remaining) ?? '0'}`)
+      : null,
+    !isLoomyTwoPools && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
@@ -230,7 +324,7 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, busy, credits, creditsLoading, showCredits, drag }) {
+function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showRateLimitActions, drag }) {
   // Antigravity 走「复用本机凭据」模式：卡片不显示有效期/续期，改显示进程生命周期。
   // 判据同时看适配器下发的 `isLocalReuse` 与历史 id，兼容两种来源。
   const isLocalReuse = Boolean(account.isLocalReuse || account.id === 'antigravity-local');
@@ -321,20 +415,54 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
             style: { fontSize: '12px', color: 'var(--dim-text-muted, #888)', lineHeight: '24px' }
           }, '本地私有通道 · 自动生效无需操作')
         : [
-            React.createElement('button', {
-              key: 'retest',
-              className: 'dim-jh-btn',
-              title: RETEST_HELP,
-              disabled: busy || !hasAnyLimit,
-              onClick: () => onRetest(account.id),
-            }, '重测'),
-            React.createElement('button', {
-              key: 'reset',
-              className: 'dim-jh-btn',
-              title: RESET_HELP,
-              disabled: busy || !hasAnyLimit,
-              onClick: () => onReset(account.id),
-            }, '重置'),
+            // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
+            onClaimOnboarding
+              ? React.createElement('button', {
+                  key: 'onboarding',
+                  className: 'dim-jh-btn dim-jh-iconBtn',
+                  title: '领取新手任务（合计 10000 积分，每个账号仅能领取一次）',
+                  'aria-label': '领取新手任务',
+                  disabled: busy || onboardingBusy,
+                  onClick: () => onClaimOnboarding(account.id),
+                }, onboardingBusy
+                  ? '领取中…'
+                  : React.createElement('svg', {
+                      width: 14,
+                      height: 14,
+                      viewBox: '0 0 24 24',
+                      fill: 'none',
+                      stroke: 'currentColor',
+                      strokeWidth: 2,
+                      strokeLinecap: 'round',
+                      strokeLinejoin: 'round',
+                      'aria-hidden': 'true',
+                      focusable: 'false',
+                    },
+                    React.createElement('rect', { x: 3, y: 8, width: 18, height: 4, rx: 1 }),
+                    React.createElement('path', { d: 'M12 8v13' }),
+                    React.createElement('path', { d: 'M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7' }),
+                    React.createElement('path', { d: 'M7.5 8a2.5 2.5 0 0 1 0-5A4.8 4.8 0 0 1 12 8a4.8 4.8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5' })))
+              : null,
+            // 卡片级「重测 / 重置」同样只对会限流的 provider 有意义
+            // （Loomy 不返回限流错误，故这两个按钮对它永远禁用 —— 直接不渲染）。
+            showRateLimitActions
+              ? React.createElement('button', {
+                  key: 'retest',
+                  className: 'dim-jh-btn',
+                  title: RETEST_HELP,
+                  disabled: busy || !hasAnyLimit,
+                  onClick: () => onRetest(account.id),
+                }, '重测')
+              : null,
+            showRateLimitActions
+              ? React.createElement('button', {
+                  key: 'reset',
+                  className: 'dim-jh-btn',
+                  title: RESET_HELP,
+                  disabled: busy || !hasAnyLimit,
+                  onClick: () => onReset(account.id),
+                }, '重置')
+              : null,
             React.createElement('button', {
               key: 'toggle',
               className: 'dim-jh-btn',
@@ -355,6 +483,12 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
  * 刻意不做本地乐观更新：模型列表与黑名单都以 Host 为准（可能是远端拉取的
  * 结果），本地猜测状态容易与真实持久化结果分叉。这里等 RPC 返回后再翻状态，
  * 期间禁用开关，保证界面上看到的就是服务端已接受的。
+ *
+ * ⚠️ **根元素是 `<label>`，且内部只能有这 1 个 checkbox。**
+ * 整行是 label，故点行内任意位置（含模型名）都会切换这个开关 —— 这是既有交互。
+ * 一旦再插入第二个 checkbox（如曾经加过的多选勾选框），浏览器会把点击激活到
+ * **第一个**可标记控件，「点模型名」就变成切换那个新控件、可见性开关纹丝不动
+ * （实测确认的行为倒退）。若将来确需多选，必须先把行容器改成 `<div>`。
  */
 function ModelToggle({ model, busy, onToggle }) {
   return React.createElement('label', {
@@ -395,6 +529,30 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const [toggleError, setToggleError] = React.useState(null);
   // 正在提交的模型 id 集合：只禁用被点的那一行，避免整表锁死。
   const [busyIds, setBusyIds] = React.useState(() => new Set());
+  /**
+   * 批量开关（打开全部 / 关闭全部）是否正在提交。
+   *
+   * 与 `busyIds` 分开：批量期间要禁用**全部**单条开关与两个批量按钮 ——
+   * 黑名单是整体写入，并发提交必然互相覆盖（后写的那次会丢掉先写的改动）。
+   */
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  /**
+   * 搜索词与状态筛选。
+   *
+   * Cline 的远端目录实测约 478 条，搜索与筛选确实有用。这两个状态只影响
+   * **渲染**，不改变 `models` 本身，故清空筛选即恢复全量。
+   *
+   * ⚠️ **刻意不做多选勾选框**（曾引入真实的行为倒退，已回退）：
+   * `ModelToggle` 的根元素是 `<label>`，原先 label 内只有 1 个 checkbox，
+   * 点行内任意位置（如模型名）都会切换**可见性开关**。一旦插入第二个 checkbox，
+   * 浏览器把点击激活到**第一个**可标记控件 —— 「点模型名」会变成切换勾选、
+   * 可见性开关纹丝不动。若将来确需多选，必须先把行容器从 `<label>` 改成 `<div>`。
+   *
+   * ⚠️ **也刻意不做渲染上限**：改动前 478 条就是一次性全渲染、工作正常，
+   * 加「显示更多」凭空多一次点击，属于功能收缩。
+   */
+  const [query, setQuery] = React.useState('');
+  const [statusFilter, setStatusFilter] = React.useState('all');
   const mounted = React.useRef(true);
 
   const load = React.useCallback(async () => {
@@ -453,9 +611,63 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const all = models || [];
   const hiddenCount = all.filter(m => m.disabled).length;
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
+  // 「已经是目标状态」时对应按钮必须禁用，否则点了看不到任何变化、像是坏了。
+  const bulk = bulkButtonState(models, bulkBusy);
+
+  /**
+   * 筛选后的列表。`filterModels` 是纯函数（见 model-filter.js）：这里只负责
+   * 把当前搜索词与状态筛选项传进去。
+   *
+   * **不做渲染上限**：改动前 478 条就是一次性全渲染、工作正常；加「显示更多」
+   * 只会凭空多一次点击（属于功能收缩），故这里直接渲染全部筛选结果。
+   */
+  const filtered = filterModels(all, { query, status: statusFilter });
+  /** 是否有生效中的筛选。决定是否渲染「清空筛选」按钮。 */
+  const filtering = isFilterActive({ query, status: statusFilter });
+
+  /** 清空搜索与筛选。 */
+  const resetFilters = () => {
+    setQuery('');
+    setStatusFilter('all');
+  };
+
+  /**
+   * 批量打开/关闭全部模型。
+   *
+   * 走**批量端点**而不是循环调用 `model.setDisabled`：后者会发 N 次请求、写 N 次
+   * 完整文档、广播 N 次 `llm/adapters-updated`，且中途失败会留下「关了一半」的
+   * 黑名单。批量端点只落盘一次、只广播一次。
+   *
+   * 「关闭全部」先二次确认：一次误点会关掉该 provider 的全部模型。反之
+   * 「打开全部」是恢复性操作，不弹确认（弹窗只会碍事）。
+   *
+   * 成功后**就地更新**列表状态（不等重新拉取）：端点返回的是权威黑名单，
+   * 但列表里还有展示名等字段，只能按 id 就地翻 `disabled`。
+   */
+  const setAllDisabled = async (disabled) => {
+    if (disabled && !confirm(`确认关闭全部 ${all.length} 个模型？关闭后它们不再出现在对话框的模型选择里。`)) {
+      return;
+    }
+    setBulkBusy(true);
+    setToggleError(null);
+    try {
+      await rpcCall('model.setAllDisabled', { provider, disabled });
+      if (!mounted.current) return;
+      setModels(prev => (prev || []).map(m => ({ ...m, disabled })));
+    } catch (caught) {
+      console.error('[jet-hub] bulk toggle failed:', caught);
+      if (!mounted.current) return;
+      // 与单条切换同一约定：失败只提示、保留列表，绝不把整张表换成错误页。
+      setToggleError(caught?.message || `批量${disabled ? '关闭' : '打开'}模型失败`);
+    } finally {
+      if (mounted.current) setBulkBusy(false);
+    }
+  };
 
   const dialog = React.createElement('div', {
-    className: 'dim-jh-modalOverlay',
+    // `--top`：顶部锚定。列表长度随搜索变化，若垂直居中会让弹窗整体上下跳动
+    //（见 jet-hub-styles.js 中该修饰类的说明）。
+    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
     // 点击遮罩关闭；点击弹窗内部不关闭（stopPropagation 由内层容器负责）。
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
@@ -471,7 +683,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           React.createElement('span', { className: 'dim-jh-modalSubtitle' }, providerLabel),
           phase === 'ready'
             ? React.createElement('span', { className: 'dim-jh-modelPanelCount' },
-                `${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`)
+                filtering
+                  ? `${filtered.length} / ${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`
+                  : `${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`)
             : null),
         React.createElement('div', { className: 'dim-jh-modelPanelActions' },
           React.createElement('button', {
@@ -486,6 +700,51 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      // 搜索 + 状态筛选：Cline 的目录实测近 500 条，没有它就只能一页页翻。
+      // 只在列表可用时渲染（载入中/出错时没有可筛的内容）。
+      phase === 'ready' && all.length > 0
+        ? React.createElement('div', { className: 'dim-jh-modelFilterBar' },
+            React.createElement('input', {
+              type: 'search',
+              className: 'dim-jh-input dim-jh-modelSearch',
+              placeholder: '搜索模型名或 id…',
+              value: query,
+              'aria-label': '搜索模型',
+              onChange: (event) => setQuery(event.target.value),
+            }),
+            React.createElement('div', { className: 'dim-jh-modelStatusFilter', role: 'group', 'aria-label': '按状态筛选' },
+              [['all', '全部'], ['enabled', '已打开'], ['disabled', '已关闭']].map(([value, label]) =>
+                React.createElement('button', {
+                  key: value,
+                  className: 'dim-jh-btn',
+                  'data-active': statusFilter === value ? 'true' : 'false',
+                  'aria-pressed': statusFilter === value ? 'true' : 'false',
+                  onClick: () => setStatusFilter(value),
+                }, label))),
+            filtering
+              ? React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  title: '清空搜索词与状态筛选，恢复完整列表。',
+                  onClick: resetFilters,
+                }, '清空筛选')
+              : null)
+        : null,
+      // 批量工具条：只在列表可用时渲染。计数从标题挪到这里，避免与标题争宽。
+      phase === 'ready' && all.length > 0
+        ? React.createElement('div', { className: 'dim-jh-modelBulkBar' },
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '打开该 Provider 的全部模型开关（含此前被关闭的）。',
+              disabled: bulk.openAllDisabled,
+              onClick: () => void setAllDisabled(false),
+            }, bulkBusy ? '处理中…' : '打开全部'),
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: '关闭该 Provider 的全部模型开关，关闭后它们不再出现在对话框的模型选择里。',
+              disabled: bulk.closeAllDisabled,
+              onClick: () => void setAllDisabled(true),
+            }, bulkBusy ? '处理中…' : '关闭全部'))
+        : null,
       toggleError
         ? React.createElement('div', {
             className: 'dim-jh-probeNotice',
@@ -505,14 +764,25 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
             ? React.createElement('div', { className: 'dim-jh-modalBody' },
                 React.createElement('div', { className: 'dim-jh-empty' },
                   React.createElement('p', null, '该 Provider 当前没有可用的模型。')))
-            : React.createElement('div', { className: 'dim-jh-modalBody' },
-                React.createElement('div', { className: 'dim-jh-modelList' },
-                  all.map(model => React.createElement(ModelToggle, {
-                    key: model.id,
-                    model,
-                    busy: busyIds.has(model.id),
-                    onToggle: (id, disabled) => void toggleModel(id, disabled),
-                  }))))));
+            // 筛选后无结果：必须与「该 Provider 没有模型」区分开，否则用户会
+            // 以为模型全丢了，而实际上只是搜索词没命中。
+            : filtered.length === 0
+              ? React.createElement('div', { className: 'dim-jh-modalBody' },
+                  React.createElement('div', { className: 'dim-jh-empty' },
+                    React.createElement('p', null, '没有符合当前搜索与筛选条件的模型。'),
+                    React.createElement('button', { className: 'dim-jh-btn', onClick: resetFilters }, '清空筛选')))
+              : React.createElement('div', { className: 'dim-jh-modalBody' },
+                  React.createElement('div', { className: 'dim-jh-modelList' },
+                    // 直接渲染全部筛选结果（**无渲染上限**）：改动前 478 条就是
+                    // 一次性全渲染、工作正常。
+                    filtered.map(model => React.createElement(ModelToggle, {
+                      key: model.id,
+                      model,
+                      // 批量提交期间一并禁用单条开关：黑名单是整体写入，
+                      // 并发提交必然互相覆盖（后写的会丢掉先写的改动）。
+                      busy: busyIds.has(model.id) || bulkBusy,
+                      onToggle: (id, disabled) => void toggleModel(id, disabled),
+                    }))))));
 
   // 与登录弹窗（.dim-jh-loginOverlay）同款做法：直接渲染在组件树内，靠
   // position: fixed 覆盖全屏。**刻意不用 createPortal** —— 客户端模块表由
@@ -732,6 +1002,106 @@ function ProviderPanel({ provider, rpcCall }) {
             : null))
     : null;
 
+  // 新手任务（一次性，仅 Loomy）：与每日签到**完全独立**的操作。
+  const [onboarding, setOnboarding] = React.useState(null);
+  const [onboardingLoading, setOnboardingLoading] = React.useState(false);
+  const [onboardingNotice, setOnboardingNotice] = React.useState(null);
+  const canClaimOnboarding = supportsOnboardingTasks(provider);
+
+  /**
+   * Loomy「锁定永久积分」（全局开关，持久化在宿主侧）。
+   *
+   * 锁定后选号**只允许消耗今日赠送额度**；永久积分不参与，故只剩永久积分的
+   * 账号在锁定期间等同于不可用（用户语义：「锁定后没有临时积分后找可用账号
+   * 就是没有可用账号」）。
+   */
+  const canLockPermanent = supportsPermanentLock(provider);
+  const [permanentLocked, setPermanentLocked] = React.useState(false);
+  const [lockBusy, setLockBusy] = React.useState(false);
+  const [lockNotice, setLockNotice] = React.useState(null);
+
+  /**
+   * 读取锁定状态（面板挂载时一次）。
+   *
+   * ⚠️ 只在支持该能力的 provider 上发请求：对不支持的 provider 发会拿到
+   * `bad-request`，并在控制台留下必然失败的报错（与积分能力矩阵同一教训）。
+   */
+  React.useEffect(() => {
+    if (!canLockPermanent) return undefined;
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await rpcCall('loomy.permanentLock', {});
+        if (alive) setPermanentLocked(res?.locked === true);
+      } catch (caught) {
+        // 读失败不阻塞面板：保持「解锁」这一保守默认值（与后端缺省一致）。
+        console.error('[jet-hub] load permanent lock failed:', caught);
+      }
+    })();
+    return () => { alive = false; };
+  }, [canLockPermanent, provider]);
+
+  /** 切换锁定状态（持久化）。 */
+  const togglePermanentLock = async () => {
+    if (!canLockPermanent) return;
+    const next = !permanentLocked;
+    setLockBusy(true);
+    setLockNotice(null);
+    try {
+      const res = await rpcCall('loomy.permanentLock', { locked: next });
+      if (!mounted.current) return;
+      setPermanentLocked(res?.locked === true);
+      setLockNotice({
+        tone: 'ok',
+        text: next
+          ? '已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将无可用账号。'
+          : '已解锁永久积分：今日额度用尽后会继续使用永久积分。',
+      });
+    } catch (caught) {
+      console.error('[jet-hub] toggle permanent lock failed:', caught);
+      if (!mounted.current) return;
+      setLockNotice({ tone: 'error', text: `操作失败：${caught?.message || '未知错误'}` });
+    } finally {
+      if (mounted.current) setLockBusy(false);
+    }
+  };
+
+  /**
+   * 领取指定账号的全部新手任务（补差额，最多 10000 分）。
+   *
+   * ⚠️ 与「一键领取积分」（每日签到）**完全不同的操作**：新手任务是
+   * **一次性**的（每号只能领一次），故独立按钮、独立端点
+   * （`onboarding.claim`），**不参与**页头的「一键签到」遍历 ——
+   * 否则每天会对已领完的账号发 8 个必然 `alreadyCompleted` 的请求。
+   */
+  const claimOnboarding = async (accountId) => {
+    if (!canClaimOnboarding) return;
+    setOnboardingLoading(true);
+    setOnboardingNotice(null);
+    try {
+      const res = await rpcCall('onboarding.claim', { provider, accountId });
+      const parts = [];
+      if (res.claimed.length > 0) {
+        const gained = res.claimed.reduce((sum, item) => sum + item.points, 0);
+        parts.push(`本次领取 ${res.claimed.length} 个任务（+${gained} 积分）`);
+      }
+      if (res.skipped.length > 0) parts.push(`${res.skipped.length} 个此前已完成`);
+      setOnboardingNotice({
+        tone: 'ok',
+        text: parts.length > 0 ? parts.join('，') : '没有可领取的任务',
+        details: [
+          `累计已领 ${res.earned} / ${res.total}`,
+          ...res.claimed.map((item) => `${item.title} +${item.points}`),
+        ],
+      });
+      setOnboarding({ earned: res.earned, total: res.total, skipped: res.skipped });
+      if (canLoadCredits) await loadCredits();
+    } catch (caught) {
+      setOnboardingNotice({ tone: 'error', text: caught?.message || '领取新手任务失败' });
+    } finally {
+      if (mounted.current) setOnboardingLoading(false);
+    }
+  };
   // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
   // 每次进入面板都白白发一次 model.list 请求。
   const [showModels, setShowModels] = React.useState(false);
@@ -805,6 +1175,14 @@ function ProviderPanel({ provider, rpcCall }) {
       console.log('[jet-hub] account.create response =', res);
       accountId = res.accountId;
       loginUrl = res.loginUrl;
+      // ⚠️ Loomy 也走这条**统一的「弹窗 + 轮询」路径**：它的 `loginUrl`
+      // 指向**本地服务器**上的微信扫码页（内联二维码 + 首次绑手机号表单），
+      // 与 codearts / lobsterai / qoder / trae / cline 的体验一致。
+      //
+      // ⚠️ **真实缺陷**（用户报障「新建账号失败：Loomy 短信登录需要手机号」）：
+      // 早期这里为 Loomy 分出一个「短信表单」分支，而表单要等 `account.create`
+      // 返回才渲染、`account.create` 又要求先有手机号 —— **顺序死锁**，
+      // 表单永远出不来。改用微信扫码后该分支已删除。
       if (loginUrl) {
         // 登录页在**新窗口**中打开。这里必须能成功弹出：
         // 后端对全部 provider 都是「先返回 loginUrl、后台再等回调」的两步式，
@@ -851,10 +1229,98 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 停用 / 启用账号。
+   *
+   * ## 与模型可见性的联动（用户明确要求）
+   *
+   * 门控判据刻意**不看 `enabled`**（「停用只应影响自动选号，与是否已登录无关」，
+   * 见 `AccountPool.hasLoggedInAccount`）—— 这是整体设计，此处不改它。
+   *
+   * 但用户停用某 provider 的**最后一个**启用账号后，它的模型仍留在对话框的模型
+   * 选择器里（凭据还在，目录门控判为可见），只能再去「显示列表」里逐个关。
+   * 于是这里把它变成**一次显式选择**：
+   *
+   * - 停用后该 provider 不再有任何启用账号 → 问一句「是否同时关闭它的全部模型」；
+   * - 反过来，启用一个此前无启用账号的 provider、且它的模型恰好全关时 →
+   *   问一句「是否同时打开」（很可能是上次停用时连带关掉的）。
+   *
+   * 两个方向都**由用户决定**，不做静默联动：静默关闭会让「停用账号」这个看似
+   * 与模型无关的操作产生意外副作用；静默打开则可能把用户特意关掉的模型放出来。
+   *
+   * 判定逻辑在 `./account-model-link.js`（纯函数，可单测）。
+   */
   const toggleAccount = async (accountId, enabled) => {
     try {
+      // 必须在提交**之前**判定：提交后列表已刷新，「是否还有启用账号」的答案
+      // 就是变更后的状态了。
+      const isLastEnabled = !enabled
+        && disablingLeavesNoEnabledAccount(accountsRef.current, accountId, provider);
+      const isFirstEnabled = enabled
+        && !accountsRef.current.some(a => a.provider === provider && a.id !== accountId && a.enabled !== false);
       await rpcCall('account.update', { accountId, patch: { enabled } });
       await loadAccounts();
+
+      // 停用方向：提示是否连带关闭模型。
+      if (isLastEnabled) {
+        const closeModels = confirm(
+          `该 Provider 已没有启用账号，它的模型不会再被使用。\n\n`
+          + `是否同时关闭它的全部模型（从对话框的模型选择里移除）？\n`
+          + `选择「取消」则只停用账号，模型保持现状。`,
+        );
+        if (closeModels) {
+          try {
+            await rpcCall('model.setAllDisabled', { provider, disabled: true });
+          } catch (caught) {
+            // 账号已经停用成功，联动失败不能回滚它 —— 只提示，让用户可去
+            // 「显示列表」手动处理。
+            console.error('[jet-hub] cascade disable models failed:', caught);
+            if (mounted.current) {
+              setProbeNotice({
+                tone: 'warn',
+                text: `账号已停用，但关闭模型失败：${caught?.message || '未知错误'}。可在「显示列表」中手动关闭。`,
+                details: [],
+              });
+            }
+          }
+        }
+        return;
+      }
+
+      // 启用方向：只在「此前一个启用账号都没有」时才查模型目录（避免每次启用
+      // 都多发一次 RPC），且全关时才提示打开。
+      if (isFirstEnabled) {
+        let models;
+        try {
+          const res = await rpcCall('model.list', { provider });
+          models = res.models || [];
+        } catch (caught) {
+          // 目录读不出来就静默跳过联动：账号启用本身已经成功，不该因目录故障
+          // 而报错。用户仍可去「显示列表」手动打开。
+          console.error('[jet-hub] read models for cascade enable failed:', caught);
+          models = null;
+        }
+        if (models !== null && allModelsDisabled(models)) {
+          const openModels = confirm(
+            `该 Provider 的 ${models.length} 个模型当前全部处于关闭状态。\n\n`
+            + `是否同时打开它们（让模型重新出现在对话框的模型选择里）？`,
+          );
+          if (openModels) {
+            try {
+              await rpcCall('model.setAllDisabled', { provider, disabled: false });
+            } catch (caught) {
+              console.error('[jet-hub] cascade enable models failed:', caught);
+              if (mounted.current) {
+                setProbeNotice({
+                  tone: 'warn',
+                  text: `账号已启用，但打开模型失败：${caught?.message || '未知错误'}。可在「显示列表」中手动打开。`,
+                  details: [],
+                });
+              }
+            }
+          }
+        }
+      }
     } catch (caught) {
       console.error('[jet-hub] toggle failed:', caught);
     }
@@ -1024,25 +1490,45 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: () => void claimCredits(),
             }, claiming ? '领取中…' : '一键领取')
           : null,
-        !reuseMode ? React.createElement('button', {
-          className: 'dim-jh-btn',
-          title: RETEST_ALL_HELP,
-          disabled: probeBusy !== null || accounts.length === 0,
-          onClick: () => void runLimitAction('retestAll'),
-        }, probeBusy === 'all' ? '重测中…' : '重测所有') : null,
-        !reuseMode ? React.createElement('button', {
-          className: 'dim-jh-btn',
-          title: RESET_ALL_HELP,
-          disabled: probeBusy !== null || accounts.length === 0,
-          onClick: () => void runLimitAction('resetAll'),
-        }, '重置所有') : null,
-        !reuseMode ? React.createElement('button', {
-          className: 'dim-jh-btn',
-          'data-kind': 'primary',
-          title: '通过登录添加一个新的账号到账号池。',
-          onClick: () => void createAccount(),
-          disabled: creating,
-        }, creating ? '正在登录…' : '+ 新建账号') : null)),
+        !reuseMode && supportsRateLimit(provider)
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: RETEST_ALL_HELP,
+              disabled: probeBusy !== null || accounts.length === 0,
+              onClick: () => void runLimitAction('retestAll'),
+            }, probeBusy === 'all' ? '重测中…' : '重测所有')
+          : null,
+        !reuseMode && supportsRateLimit(provider)
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              title: RESET_ALL_HELP,
+              disabled: probeBusy !== null || accounts.length === 0,
+              onClick: () => void runLimitAction('resetAll'),
+            }, '重置所有')
+          : null,
+        // 锁定永久积分（仅 Loomy）：只消耗每日赠送额度，保住永久积分。
+        canLockPermanent
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              'data-kind': permanentLocked ? 'primary' : undefined,
+              title: permanentLocked
+                ? '当前已锁定永久积分：只消耗每日赠送额度。今日额度用尽后将没有可用账号。点此解锁。'
+                : '锁定永久积分后只消耗每日赠送额度（今日额度用尽即无可用账号），可保住永久积分。点此锁定。',
+              disabled: lockBusy,
+              onClick: () => void togglePermanentLock(),
+            }, lockBusy
+              ? '处理中…'
+              : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
+          : null,
+        !reuseMode
+          ? React.createElement('button', {
+              className: 'dim-jh-btn',
+              'data-kind': 'primary',
+              title: '通过登录添加一个新的账号到账号池。',
+              onClick: () => void createAccount(),
+              disabled: creating,
+            }, creating ? '正在登录…' : '+ 新建账号')
+          : null)),
     reuseNotice,
     channelCard,
     probeNotice
@@ -1057,6 +1543,13 @@ function ProviderPanel({ provider, rpcCall }) {
               probeNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
           : null)
       : null,
+    lockNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': lockNotice.tone,
+          role: lockNotice.tone === 'error' ? 'alert' : 'status',
+        }, lockNotice.text)
+      : null,
     claimNotice
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
@@ -1069,6 +1562,20 @@ function ProviderPanel({ provider, rpcCall }) {
         (claimNotice.details || []).length > 0
           ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
               claimNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
+          : null)
+      : null,
+    // 新手任务结果（仅 Loomy，一次性领取）。
+    onboardingNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': onboardingNotice.tone,
+          role: onboardingNotice.tone === 'error' ? 'alert' : 'status',
+        },
+        React.createElement('div', null, onboardingNotice.text),
+        (onboardingNotice.details || []).length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              onboardingNotice.details.map((line, index) =>
+                React.createElement('li', { key: index }, line)))
           : null)
       : null,
     // 弹窗被拦截：给出可点击的登录链接。不劫持当前页面（见 createAccount 的说明）。
@@ -1120,10 +1627,18 @@ function ProviderPanel({ provider, rpcCall }) {
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
+                // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
+                showRateLimitActions: supportsRateLimit(provider),
                 onToggle: toggleAccount,
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
+                // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮。
+                onClaimOnboarding: canClaimOnboarding
+                  ? (id) => void claimOnboarding(id)
+                  : undefined,
+                onboardingBusy: onboardingLoading,
                 // 提交顺序期间禁用拖拽，避免并发提交互相覆盖。
                 drag: reordering ? { enabled: false } : dragPropsFor(account, index),
               }))),
@@ -1138,12 +1653,478 @@ function ProviderPanel({ provider, rpcCall }) {
       : null);
 }
 
+/**
+ * 账号备份（导出 / 恢复）。
+ *
+ * 放在 Jet Hub 页面头部（关闭按钮旁），面向「更换 DSH 版本」的迁移场景：
+ * 导出把全部账号的密钥/凭据与模型黑名单打包成一个自包含 JSON，导入整体
+ * 还原。加密在浏览器侧完成（PBKDF2 + AES-GCM，见 backup-crypto.js）——
+ * 明文 JSON 不经过 RPC / 日志，加密与否由用户在导出弹窗里选择（默认加密）。
+ *
+ * 弹窗被拦截 / 口令错误等失败只提示、不清空已选文件，用户可以修正后重试。
+ */
+function BackupPanel({ rpcCall, onImported }) {
+  // 当前打开的弹窗：null | 'export' | 'import'
+  const [dialog, setDialog] = React.useState(null);
+  // 导出弹窗：是否加密 + 两次口令
+  const [encrypt, setEncrypt] = React.useState(true);
+  const [pass1, setPass1] = React.useState('');
+  const [pass2, setPass2] = React.useState('');
+  // 导入弹窗：已选文件（解析后的对象 + 是否加密容器）
+  const [importFile, setImportFile] = React.useState(null);
+  const [importPass, setImportPass] = React.useState('');
+  // 当前账号池统计（backup.status）：缺 expiresAt 的条目疑似版本切换自动恢复
+  // 的产物，导入会整体覆盖它们——用于确认文案里显式提示。
+  const [backupStatus, setBackupStatus] = React.useState(null);
+  // 导入两步式：false = 口令/提示页，true = 确认页（应用内二次确认，替代 confirm()）
+  const [confirmStep, setConfirmStep] = React.useState(false);
+  // 解密后的备份载荷（确认页展示账号数 & 导入时使用）
+  const [decryptedPayload, setDecryptedPayload] = React.useState(null);
+  // 正在提交（导出/解密/导入进行中，禁用按钮）
+  const [busy, setBusy] = React.useState(false);
+  // 弹窗内提示（成功 / 失败 / 口令不一致等）
+  const [notice, setNotice] = React.useState(null);
+  const fileRef = React.useRef(null);
+  const mounted = React.useRef(true);
+
+  React.useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  const closeDialog = () => {
+    if (!mounted.current) return;
+    setDialog(null);
+    setNotice(null);
+    setBusy(false);
+    setEncrypt(true);
+    setPass1('');
+    setPass2('');
+    setImportFile(null);
+    setImportPass('');
+    setBackupStatus(null);
+    setConfirmStep(false);
+    setDecryptedPayload(null);
+  };
+
+  const safeNotice = (next) => { if (mounted.current) setNotice(next); };
+
+  /** 导出：RPC 取载荷 → （可选）加密 → 浏览器下载。 */
+  const doExport = async () => {
+    if (encrypt && pass1.length === 0) {
+      safeNotice({ tone: 'warn', text: '请设置备份口令' });
+      return;
+    }
+    if (encrypt && pass1 !== pass2) {
+      safeNotice({ tone: 'warn', text: '两次输入的口令不一致' });
+      return;
+    }
+    setBusy(true);
+    setNotice(null);
+    try {
+      // 必须传空对象而非省略 payload：callManagementRpc 会把 payload 序列化进
+      // 请求体，后端校验要求 payload 键存在；传 undefined 会被 JSON 序列化丢弃，
+      // 导致后端报 "Invalid Jet Hub management request."
+      const res = await rpcCall('backup.export', {});
+      const payload = res.payload;
+      const warnings = res.warnings || [];
+      const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      let data = payload;
+      let filename = `dsh-codearts-backup-${stamp}.json`;
+      if (encrypt) {
+        data = await encryptBackup(payload, pass1);
+        filename = `dsh-codearts-backup-${stamp}.enc.json`;
+      }
+      downloadJson(filename, data);
+      const extra = warnings.length > 0 ? `，${warnings.length} 个账号凭据缺失（已跳过）` : '';
+      // 不自动关闭：让用户看到成功结果（含跳过提示），再手动关闭
+      safeNotice({ tone: 'ok', text: `已导出 ${payload.accounts.length} 个账号${encrypt ? '（已加密）' : '（明文）'}${extra}` });
+    } catch (caught) {
+      console.error('[jet-hub] backup export failed:', caught);
+      safeNotice({ tone: 'error', text: `导出失败：${caught?.message || '未知错误'}` });
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  /** 选择文件：读取并解析；加密容器留在弹窗里等口令。 */
+  const onFileSelected = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    safeNotice(null);
+    try {
+      const text = await readFileAsText(file);
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        safeNotice({ tone: 'error', text: `${file.name} 不是有效的 JSON 备份文件` });
+        return;
+      }
+      if (!mounted.current) return;
+      setImportFile({ name: file.name, encrypted: isEncryptedBackup(parsed), parsed });
+      setDialog('import');
+      setImportPass('');
+      // 拉取当前账号池统计：确认导入前提示「有 N 个自动恢复账号将被覆盖」。
+      // 失败不阻断导入——提示只是辅助信息，拿不到就静默跳过。
+      try {
+        const status = await rpcCall('backup.status', {});
+        if (mounted.current) setBackupStatus(status || null);
+      } catch (caught) {
+        console.warn('[jet-hub] backup.status failed:', caught);
+      }
+    } catch (caught) {
+      console.error('[jet-hub] read backup file failed:', caught);
+      safeNotice({ tone: 'error', text: `读取文件失败：${caught?.message || '未知错误'}` });
+    }
+  };
+
+  /** 导入第一步：解密（如需）→ 进入应用内确认页。整体替换，不是合并。 */
+  const stepImport = async () => {
+    if (!importFile) return;
+    if (importFile.encrypted) {
+      if (importPass.length === 0) {
+        safeNotice({ tone: 'warn', text: '请输入备份口令' });
+        return;
+      }
+      setBusy(true);
+      setNotice(null);
+      try {
+        const payload = await decryptBackup(importFile.parsed, importPass);
+        if (!mounted.current) return;
+        setDecryptedPayload(payload);
+      } catch (caught) {
+        console.error('[jet-hub] backup decrypt failed:', caught);
+        safeNotice({ tone: 'error', text: '解密失败：口令错误或备份文件已被篡改' });
+        setBusy(false);
+        return;
+      }
+      setBusy(false);
+    } else {
+      setDecryptedPayload(importFile.parsed);
+    }
+    // 进入确认页（应用内二次确认，替代浏览器 confirm()）
+    setConfirmStep(true);
+    setNotice(null);
+  };
+
+  /** 导入第二步：确认后执行导入 RPC。 */
+  const confirmImport = async () => {
+    const payload = decryptedPayload;
+    if (!payload) return;
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await rpcCall('backup.import', { payload });
+      const parts = [`已导入 ${res.accountsImported} 个账号`, `${res.credentialsImported} 条凭据`];
+      if (res.skipped.length > 0) parts.push(`${res.skipped.length} 条凭据跳过`);
+      // 已过期的账号：refresh_token 仍有效时会自动静默续期；若也已失效则需重新登录
+      if (res.expiredAccounts > 0) {
+        parts.push(`${res.expiredAccounts} 个凭据已过期（失效账号需重新登录）`);
+      }
+      // 凭据缺失的账号：对应 provider 目录会被隐藏（像未登录一样），需重新登录
+      if (res.missingCredentials > 0) {
+        parts.push(`${res.missingCredentials} 个账号凭据缺失（需重新登录）`);
+      }
+      // 账号已整体替换：通知 JetHubPage 重新挂载 ProviderPanel 刷新列表；
+      // 不自动关闭弹窗，让用户看到导入结果。
+      onImported?.();
+      safeNotice({ tone: 'ok', text: parts.join('，') });
+    } catch (caught) {
+      console.error('[jet-hub] backup import failed:', caught);
+      safeNotice({ tone: 'error', text: `导入失败：${caught?.message || '未知错误'}` });
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  // 弹窗通用结构：遮罩 + 对话框。点击遮罩关闭（与 ModelListPanel 同款）。
+  const renderDialog = () => {
+    const isExport = dialog === 'export';
+    const title = isExport ? '导出备份' : '导入备份';
+    const subtitle = isExport
+      ? '全部 provider 的账号密钥与凭据'
+      : importFile?.name || '';
+    const body = isExport ? (
+      React.createElement(React.Fragment, null,
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '备份文件包含全部账号的密钥与 refresh_token，请',
+          React.createElement('strong', { className: 'dim-jh-emph-warn' }, '妥善保管'),
+          '。'),
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '备份是导出时刻的凭据快照：refresh_token 会随续期轮换或过期，建议导出后尽快迁移，导入后失效的账号需重新登录。'),
+        React.createElement('label', { className: 'dim-jh-checkRow' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: encrypt,
+            onChange: (event) => setEncrypt(event.target.checked),
+          }),
+          '加密备份文件（推荐）'),
+        encrypt
+          ? React.createElement('div', { className: 'dim-jh-formRows' },
+              React.createElement('input', {
+                className: 'dim-jh-input',
+                type: 'password',
+                placeholder: '备份口令（用于解密，请牢记）',
+                value: pass1,
+                onChange: (event) => setPass1(event.target.value),
+              }),
+              React.createElement('input', {
+                className: 'dim-jh-input',
+                type: 'password',
+                placeholder: '再次输入口令',
+                value: pass2,
+                onChange: (event) => setPass2(event.target.value),
+              }))
+          : null)
+    ) : !isExport && confirmStep ? (
+      // 导入确认页（应用内二次确认）：展示覆盖警告与提示
+      React.createElement(React.Fragment, null,
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '导入将',
+          React.createElement('strong', { className: 'dim-jh-emph-danger' }, '覆盖'),
+          '当前全部账号与模型开关（共 ',
+          React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${decryptedPayload?.accounts?.length ?? 0}`),
+          ' 个账号），且',
+          React.createElement('strong', { className: 'dim-jh-emph-danger' }, '不可撤销'),
+          '。'),
+        backupStatus?.withoutExpiry > 0
+          ? React.createElement('p', { className: 'dim-jh-modalHint' },
+              '当前有 ',
+              React.createElement('strong', { className: 'dim-jh-emph-warn' }, `${backupStatus.withoutExpiry}`),
+              ' 个账号缺少有效期信息（可能是版本切换后自动恢复的），导入将',
+              React.createElement('strong', { className: 'dim-jh-emph-warn' }, '整体覆盖'),
+              '它们。')
+          : null)
+    ) : importFile?.encrypted ? (
+      React.createElement(React.Fragment, null,
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '该备份已加密，请输入导出时设置的口令。'),
+        React.createElement('input', {
+          className: 'dim-jh-input',
+          type: 'password',
+          placeholder: '备份口令',
+          value: importPass,
+          onChange: (event) => setImportPass(event.target.value),
+        }))
+    ) : (
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        '该备份为明文文件，导入将覆盖当前全部账号与模型开关。')
+    );
+
+    return React.createElement('div', {
+      className: 'dim-jh-modalOverlay',
+      onClick: (event) => { if (event.target === event.currentTarget) closeDialog(); },
+    },
+      React.createElement('div', {
+        className: 'dim-jh-modal',
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': title,
+      },
+        React.createElement('div', { className: 'dim-jh-modalHead' },
+          React.createElement('div', { className: 'dim-jh-modalTitle' },
+            React.createElement('strong', null, title),
+            subtitle.length > 0
+              ? React.createElement('span', { className: 'dim-jh-modalSubtitle' }, subtitle)
+              : null),
+          React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              onClick: closeDialog,
+            }, '关闭'))),
+        React.createElement('div', { className: 'dim-jh-modalBody' },
+          body,
+          notice
+            ? React.createElement('div', {
+                className: 'dim-jh-probeNotice',
+                'data-tone': notice.tone,
+                role: notice.tone === 'error' ? 'alert' : 'status',
+              }, React.createElement('div', null, notice.text))
+            : null,
+          React.createElement('div', { className: 'dim-jh-modalActions' },
+            isExport
+              ? React.createElement('button', {
+                  className: 'dim-jh-btn',
+                  'data-kind': 'primary',
+                  disabled: busy,
+                  onClick: () => void doExport(),
+                }, busy ? '生成中…' : '生成备份文件')
+              : confirmStep
+                ? React.createElement(React.Fragment, null,
+                    React.createElement('button', {
+                      className: 'dim-jh-btn',
+                      disabled: busy,
+                      onClick: () => { setConfirmStep(false); setNotice(null); },
+                    }, '返回'),
+                    React.createElement('button', {
+                      className: 'dim-jh-btn',
+                      'data-kind': 'primary',
+                      disabled: busy,
+                      onClick: () => void confirmImport(),
+                    }, busy ? '导入中…' : '确认导入'))
+                : React.createElement('button', {
+                    className: 'dim-jh-btn',
+                    'data-kind': 'primary',
+                    disabled: busy,
+                    onClick: () => void stepImport(),
+                  }, busy ? '处理中…' : '下一步')))));
+  };
+
+  return React.createElement(React.Fragment, null,
+    React.createElement('button', {
+      className: 'dim-jh-btn',
+      title: '导出全部账号的密钥与凭据，便于更换 DSH 版本后导入恢复。',
+      onClick: () => {
+        setDialog('export');
+        setNotice(null);
+      },
+    }, '备份'),
+    React.createElement('button', {
+      className: 'dim-jh-btn',
+      title: '从备份文件恢复账号与凭据（会覆盖当前全部账号）。',
+      onClick: () => fileRef.current?.click(),
+    }, '恢复'),
+    React.createElement('input', {
+      ref: fileRef,
+      type: 'file',
+      accept: '.json,application/json',
+      style: { display: 'none' },
+      onChange: onFileSelected,
+    }),
+    dialog !== null ? renderDialog() : null);
+}
+
+/** 触发浏览器下载一个 JSON 文件。 */
+function downloadJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** 读取文件为文本。 */
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+}
+
 export function JetHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   const [version, setVersion] = React.useState(0);
+  // 一键签到：busy 防重复点击，notice 显示上一次结果摘要。
+  const [checkinBusy, setCheckinBusy] = React.useState(false);
+  const [checkinNotice, setCheckinNotice] = React.useState(null);
+  const mounted = React.useRef(true);
+  React.useEffect(() => () => { mounted.current = false; }, []);
 
   const selectProvider = (id) => {
     setSelected(id);
+    setVersion(v => v + 1);
+  };
+
+  /**
+   * 一键签到**所有支持签到的渠道**。
+   *
+   * 逐个渠道 `await` 现有 `credits.claimAll`（不新增后端端点）。
+   *
+   * ⚠️ **必须串行**，不能 `Promise.all`：单渠道内部已是「逐账号顺序执行
+   * （并发易触发风控）」（见 `src/jet-hub-rpc.ts`），而这是**真实领积分**的
+   * 写操作，跨渠道并发会同时发出多路领取请求，触发风控的代价是用户当天领不到。
+   *
+   * 渠道集合由能力表推导（`checkinProviders()`）—— workbuddy / cline 后端
+   * 没有签到接口，**绝不能**出现在请求列表里（那会产生必然失败的请求，
+   * 正是 CodeArts 历史缺陷的形态）。
+   *
+   * 单渠道失败只计入 failed，**不中断后续渠道**（与后端「单账号失败不中断
+   * 整体」同型）。但后端对**无账号**的渠道本就是零请求，故不额外预查账号。
+   */
+  const checkinAll = async () => {
+    setCheckinBusy(true);
+    setCheckinNotice(null);
+    const parts = [];
+    // 需要用户操作的提示（如「该账号尚未开通，请先用官方客户端登录一次」）。
+    // 单独收集、单独渲染：混进计数行会被读漏，而这类提示的价值就在于被看到。
+    const notes = [];
+    let totalCredit = 0;
+    let failed = 0;
+    for (const provider of checkinProviders()) {
+      const label = PROVIDERS.find(p => p.id === provider)?.label || provider;
+      try {
+        const res = await rpcCall('credits.claimAll', { provider });
+        const s = res?.summary || {};
+        // ⚠️ **每个非零计数都必须出现在提示里**。
+        //
+        // 早期只判 `claimed` / `alreadyClaimed` / `failed` 三个分支，于是
+        // 「活动未开启」（`inactive > 0`）的渠道会**整条从提示里消失** ——
+        // 用户看到的是「一键签到：A 今日已领，B 今日已领」，完全不知道 C 渠道
+        // 执行过、更不知道它为什么没结果。
+        //
+        // 同理，一个渠道可能**同时**有成功与失败（多账号），逐个列出而不
+        // 用 else-if 短路，否则后者的信息被前者的分支吞掉。
+        const bits = [];
+        if (s.claimed > 0) {
+          totalCredit += s.totalCredit;
+          bits.push(`+${s.totalCredit}`);
+        }
+        if (s.alreadyClaimed > 0) bits.push(`${s.alreadyClaimed} 个今日已领`);
+        if (s.inactive > 0) bits.push(`${s.inactive} 个暂无活动`);
+        if (s.failed > 0) {
+          failed += s.failed;
+          // 附上第一条失败原因：只给计数会让用户与排查者都无从下手
+          const reason = (res?.results || [])
+            .map(item => item?.outcome?.message)
+            .find(msg => typeof msg === 'string' && msg.length > 0);
+          bits.push(`${s.failed} 个失败${reason ? `（${reason}）` : ''}`);
+        }
+        parts.push(`${label} ${bits.length > 0 ? bits.join('，') : '无账号'}`);
+
+        // ⚠️ **需要用户操作的提示必须单独列出，不能只留在计数里**。
+        //
+        // 真实缺陷（用户报障 2026-09-26）：用本插件 GitHub 授权**新注册**的
+        // Qoder 账号尚未在 Qoder 侧开通每日领取，后端已返回可操作文案
+        // （「请先用 Qoder 官方客户端登录一次该账号」），但汇总行只显示
+        // 「N 个暂无活动」—— 用户看不到该怎么办，只能来问。
+        //
+        // 判据用后端的**显式字段** `outcome.actionRequired`，
+        // **不要**改成「message 非空就展示」或去匹配文案内容：
+        // 前者会把所有 inactive 都单列（含「今天活动暂未开始」这类无需操作的），
+        // 后者会在文案改措辞时静默失效。语义定义见 `src/credits.ts`。
+        for (const item of res?.results || []) {
+          const outcome = item?.outcome || {};
+          if (outcome.actionRequired !== true) continue;
+          const msg = outcome.message;
+          if (typeof msg !== 'string' || msg.length === 0) continue;
+          // 去重：多个账号同因未开通时只提示一次，避免刷屏
+          if (!notes.includes(msg)) notes.push(msg);
+        }
+      } catch (caught) {
+        failed += 1;
+        parts.push(`${label} 失败（${caught?.message || '未知原因'}）`);
+      }
+      if (!mounted.current) return;
+    }
+    if (!mounted.current) return;
+    setCheckinNotice({
+      // 有待用户处理的提示时用 warn 色调，让那条提示更显眼
+      tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
+      text: parts.length > 0
+        ? `一键签到：${parts.join('，')}${totalCredit > 0 ? `（共 +${totalCredit} 积分）` : ''}`
+        : '一键签到：没有可领取的渠道',
+      notes,
+    });
+    setCheckinBusy(false);
+    // 领取会改变余额；递增版号让当前面板重新挂载并刷新账号与积分
     setVersion(v => v + 1);
   };
 
@@ -1152,10 +2133,44 @@ export function JetHubPage({ close, rpcCall }) {
       React.createElement('div', { className: 'dim-jh-brand' },
         React.createElement('strong', { className: 'dim-jh-brandName' }, 'Jet Hub'),
         React.createElement('p', { className: 'dim-jh-brandDesc' }, 'Provider 凭据管理与多账号支持')),
-      close ? React.createElement('button', {
-        className: 'dim-jh-btn',
-        onClick: close,
-      }, '关闭') : null),
+      React.createElement('div', { className: 'dim-jh-headerActions' },
+        // 一键签到在备份/恢复**左侧**（需求指定位置）
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          title: '依次签到全部支持签到的渠道（CodeBuddy / LobsterAI / CodeArts / Qoder / TRAE）。'
+            + '串行执行以避免触发风控。',
+          disabled: checkinBusy,
+          onClick: () => void checkinAll(),
+        }, checkinBusy ? '签到中…' : '一键签到'),
+        React.createElement(BackupPanel, {
+          rpcCall,
+          // 导入成功会整体替换账号，ProviderPanel 只在挂载时拉列表；
+          // 递增版号强制重新挂载，让账号列表与模型目录立即反映新状态。
+          onImported: () => setVersion(v => v + 1),
+        }),
+        close ? React.createElement('button', {
+          className: 'dim-jh-btn',
+          onClick: close,
+        }, '关闭') : null)),
+    // 签到结果放在页头下方横跨整宽：页头是 flex 且不换行，塞进去会挤压按钮。
+    // `flex: none` 是必需的 —— `dim-jh-page` 是 column flex 且 `dim-jh-layout`
+    // 带 `flex: 1`，不锁住的话提示条会被压扁（与 modal 内同款做法）。
+    checkinNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': checkinNotice.tone,
+          role: checkinNotice.tone === 'error' ? 'alert' : 'status',
+          style: { flex: 'none', margin: '12px 24px 0' },
+        },
+        React.createElement('div', null, checkinNotice.text),
+        // 需要用户操作的提示单列成列表（如「请先用 Qoder 官方客户端登录一次」）。
+        // 复用既有的 `dim-jh-probeDetails` 样式，不引入新样式。
+        (checkinNotice.notes || []).length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              checkinNotice.notes.map((note, index) =>
+                React.createElement('li', { key: index }, note)))
+          : null)
+      : null,
     React.createElement('div', { className: 'dim-jh-layout' },
       React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         PROVIDERS.map(p => React.createElement('button', {

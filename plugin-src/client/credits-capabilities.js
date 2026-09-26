@@ -26,6 +26,8 @@
  * | `workbuddy` | ✓                   | ✗ 国际版后端无签到接口        |
  * | `lobsterai` | ✓                   | ✓ `client-activities` 三步流程 |
  * | `qoder`     | ✓ `sash/api/v2/me/usage` | ✗ 未见签到接口            |
+ * | `trae`      | ✓                   | ✓ `checkin_credits/*`        |
+ * | `cline`     | ✓ `/api/v1/users/{id}/balance` | ✗ 后端无签到接口  |
  *
  * - `balance`：CodeBuddy 系用 `POST /v2/billing/meter/get-user-resource`
  *   （CodeBuddy 与 WorkBuddy 国际版**通用**，仅 baseURL 随 `product.endpoint`
@@ -84,7 +86,57 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // PROVIDERS 同步（漏登记会静默失去能力，多登记则是死配置），且显式 false
   // 让「这个 provider 确实不支持」这件事在代码里可见，而不是看起来像忘了写。
   antigravity: Object.freeze({ balance: false, dailyCheckin: false }),
+  // Cline：**只有余额**，没有签到。
+  cline: Object.freeze({ balance: true, dailyCheckin: false }),
+  // Loomy（讯飞）：三项能力齐全，且是**唯一**有第三项（新手任务）的渠道。
+  loomy: Object.freeze({ balance: true, dailyCheckin: true, onboardingTasks: true }),
+  // Raccoon Work（商汤小浣熊）：余额 + **一次性**登录奖励。
+  raccoon: Object.freeze({ balance: true, onboardingTasks: true }),
 });
+
+/**
+ * 各 provider 是否具备「**模型限流**」这一机制（即服务端会因限流而拒绝请求）。
+ *
+ * ## 为什么需要它（真实发现）
+ *
+ * Loomy **不会返回限流错误**：实测今日赠送额度（每天 5000）用完后，服务端
+ * 继续扣永久积分且照常返回（静默降级）。因此「重测 / 重置」这组按钮对它
+ * **毫无意义** —— 重测永远测不出限流，重置也没有标记可清。
+ * 用户报障：「这个 provider 好像没发现模型限流，把重置所有按钮删掉」。
+ *
+ * ## 为什么「未登记 = 视为有限流」（与上面的积分能力约定**相反**）
+ *
+ * 积分能力的约定是「默认关闭」（未登记就不发请求，避免必然失败的请求）。
+ * 但限流按钮**是既有 UI**：若这里也默认关闭，将来新增 provider 时忘记登记，
+ * 会让老用户**凭空失去**「重测 / 重置」按钮 —— 那是可见的功能回退。
+ * 故这里默认**开启**，只有明确知道「该渠道不会限流」时才显式登记 `false`。
+ */
+export const RATE_LIMIT_CAPABILITIES = Object.freeze({
+  // Loomy（讯飞）：**不返回限流错误** —— 积分耗尽时静默降级为扣永久积分，
+  // 故「重测 / 重置」这组按钮对它无意义（重测还会白烧积分）。
+  loomy: Object.freeze({ rateLimit: false }),
+});
+
+/**
+ * 该 provider 的请求是否会因**模型限流**被拒（决定是否渲染「重测 / 重置」）。
+ *
+ * ⚠️ 默认 `true`（未登记即视为有限流），理由见 {@link RATE_LIMIT_CAPABILITIES}。
+ */
+export function supportsRateLimit(provider) {
+  return RATE_LIMIT_CAPABILITIES[provider]?.rateLimit !== false;
+}
+
+/**
+ * 该 provider 是否支持「锁定永久积分」（只允许消耗每日赠送额度）。
+ *
+ * ⚠️ 目前只有 Loomy 具备：它有两个独立的积分池（永久 / 每日赠送），
+ * 而其他渠道的积分模型不同（无「永久 vs 每日」的区分）。
+ *
+ * 为 false 时面板**不得**渲染该按钮，也不得发起 `loomy.permanentLock`。
+ */
+export function supportsPermanentLock(provider) {
+  return provider === 'loomy';
+}
 
 /**
  * 该 provider 是否能查询积分余额。
@@ -103,4 +155,46 @@ export function supportsCreditBalance(provider) {
  */
 export function supportsDailyCheckin(provider) {
   return CREDITS_CAPABILITIES[provider]?.dailyCheckin === true;
+}
+
+/**
+ * 全部**支持每日签到**的渠道 id 列表，顺序固定（= 本表声明顺序）。
+ *
+ * 供 Jet Hub 页头的「一键签到」遍历使用。
+ *
+ * ⚠️ **必须从本表推导，不要另写一份渠道字面量**：
+ * 本表已是能力判定的唯一真相源，且 `credits-capabilities.spec.ts` 守着它与
+ * `PROVIDERS` 同步。硬编码 `['codearts','buddy',…]` 会在将来某渠道开放或
+ * 下线签到时**静默漂移** —— 表现为「新渠道永远不被签到」或
+ * 「对已下线渠道发必然失败的请求」（后者正是 CodeArts 历史缺陷的形态）。
+ *
+ * 顺序即执行顺序（调用方串行执行），故它同时决定了请求的先后；
+ * 保持本表声明顺序即可，不额外排序。
+ */
+export function checkinProviders() {
+  return Object.keys(CREDITS_CAPABILITIES).filter(supportsDailyCheckin);
+}
+
+/**
+ * 该 provider 是否支持「新手任务」一次性领取。
+ *
+ * ⚠️ 与 {@link supportsDailyCheckin} **语义独立，不能互相推断**：
+ * - `dailyCheckin`：**每天**有收益（每日额度刷新）
+ * - `onboardingTasks`：**一次性**（每号只能领一次固定总额）
+ *
+ * 目前只有 Loomy 具备后者。为 false 时面板**不得**渲染「领取新手任务」按钮，
+ * 也不得发起 `onboarding.status` / `onboarding.claim`。
+ */
+export function supportsOnboardingTasks(provider) {
+  return CREDITS_CAPABILITIES[provider]?.onboardingTasks === true;
+}
+
+/**
+ * 全部**支持新手任务**的渠道 id 列表。
+ *
+ * 供「一键领取全部渠道新手任务」之类的批量入口使用（当前未实现，
+ * 保留以便扩展）。**必须从能力表推导**，理由同 {@link checkinProviders}。
+ */
+export function onboardingTaskProviders() {
+  return Object.keys(CREDITS_CAPABILITIES).filter(supportsOnboardingTasks);
 }

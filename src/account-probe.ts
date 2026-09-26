@@ -33,11 +33,13 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { createUserMessage, LlmError } from '@deepseek-ai/dsh-llm'
 import { BuddyAdapter } from './buddy-adapter.js'
 import { LobsteraiAdapter } from './lobsterai-adapter.js'
-import { CodeArtsAdapter, isRateLimited } from './llm-adapter.js'
+import { TraeAdapter } from './trae-adapter.js'
+import { CodeArtsAdapter, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { productById } from './product.js'
 import { lobsteraiProductById } from './lobsterai-product.js'
 import type { BuddyCredential } from './buddy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
+import type { TraeCredential } from './trae.js'
 import type {
   CodeArtsCredential,
   ProbeAccountResult,
@@ -47,8 +49,57 @@ import type {
   RpcRetestResponse,
 } from './types.js'
 
+/**
+ * TRAE 的 provider id。
+ *
+ * 单独提为常量而不是内联字面量：本文件已有两处「新增 provider 漏加分派」的
+ * 缺陷（workbuddy、trae），把它写成具名常量便于检索与统一改动。
+ */
+const TRAE_PROVIDER_ID = 'trae'
+
+/**
+ * 探测可能涉及的凭据联合类型。
+ *
+ * 提为具名别名而非在各处重复四元联合：新增 provider 时只需改这一处，
+ * 避免签名与实现漂移（本文件已两次因「分派表没跟上新增 provider」出缺陷）。
+ */
+type ProbeCredential = CodeArtsCredential | BuddyCredential | LobsteraiCredential | TraeCredential
+
 /** 探测请求的提示语（与 e2e 探针保持一致，最大化可比性）。 */
 const PROBE_PROMPT = '只回答两个字：收到'
+
+/**
+ * 探测请求的 system 提示。
+ *
+ * ⚠️ **不可省略，也刻意不随产品切换**（真实缺陷，用户报障）。
+ *
+ * WorkBuddy 国际版网关（`www.workbuddy.ai`）**强制要求 `messages[0]` 是
+ * `role:'system'`**，否则返回 HTTP 400 + `code 11128`
+ * `"first message is not system prompt"`，且 `displayMsg` 把它**伪装成安全
+ * 策略拦截**（「请求被安全策略拦截，请稍后重试或联系支持」）—— 与真实的限流/
+ * 可用性毫无关系。
+ *
+ * 早期 `probeWithAdapter` 只传 `messages`、不传 `options.system`，而适配器仅在
+ * `options.system` 非空时才 `unshift` system（见 `buddy-adapter.ts`），于是
+ * wire 上首条就是 user。后果：WorkBuddy 面板的「重测 / 重测所有」**恒不可用**
+ * ——既拿不到「已恢复」也拿不到「仍受限」，只有一句误导性的安全策略报错。
+ *
+ * 实测（2026-09-25，同一凭据各发一次最小请求）：
+ *
+ * | 端点 | 无 system | 有 system |
+ * |---|---|---|
+ * | `www.workbuddy.ai`（WorkBuddy） | **400 + 11128** | 200 正常 |
+ * | `copilot.tencent.com`（CodeBuddy） | 200 正常 | 200 正常 |
+ *
+ * 即**只有 WorkBuddy 网关**有此硬性要求，但这里**无条件**给所有 provider 都带
+ * 上：① 判据不该依赖「另一个产品碰巧不校验」这种易变的外部事实；② 探测本身
+ * 与 system 内容无关，带上它对结论无影响；③ 分支特判会让将来新增的 provider
+ * 再次踩同一个坑。
+ *
+ * 内容取最小可用值（对齐 `tests/e2e/buddy-pool-probe.e2e.spec.ts` 与
+ * `scripts/verify-max-tokens.mjs` 里已被验证可用的同一句）。
+ */
+const PROBE_SYSTEM = 'You are a helpful assistant.'
 
 /**
  * 单次探测的超时（毫秒）。
@@ -72,9 +123,16 @@ export interface ProbePool {
   /** 列出某 provider 的全部账号（含已停用）。 */
   listAccountsByProvider(provider: string): ProviderAccountEntry[]
   /** 按 id 解析凭据（不检查 enabled）。 */
-  resolveCredentialForAccount(id: string): Promise<CodeArtsCredential | BuddyCredential | LobsteraiCredential | undefined>
+  resolveCredentialForAccount(id: string): Promise<ProbeCredential | undefined>
   /** 清除限流标记；modelIds 省略时清除全部。返回清除条数。 */
   clearModelRateLimits(accountId: string, modelIds?: readonly string[]): Promise<number>
+  /**
+   * 写入/更新某账号某模型的限流重置时刻。
+   *
+   * [patch-codearts-probe-ratelimit] 重测发现「仍受限」时需要它把上游给的
+   * **新**时刻写回，否则存储停在旧值、UI 不再显示限流。
+   */
+  updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number): Promise<void>
 }
 
 /** 探测依赖注入点（测试可覆盖）。 */
@@ -105,7 +163,7 @@ function isRateLimitFailure(error: unknown): boolean {
 /** 用真实适配器对指定账号的指定模型发一次最小请求。 */
 async function probeWithAdapter(
   entry: ProviderAccountEntry,
-  credential: CodeArtsCredential | BuddyCredential | LobsteraiCredential,
+  credential: ProbeCredential,
   modelId: string,
   timeoutMs: number,
 ): Promise<ProbeModelResult> {
@@ -119,18 +177,27 @@ async function probeWithAdapter(
   // refresh 设为 no-op：探测不应触发全局续期流程（那会影响其他账号与
   // 其他并发会话），凭据真的过期就让它以 AUTH 失败并如实上报。
   //
-  // **三个产品线各自选适配器**，顺序不能颠倒也不能只判前两个：
+  // **四条产品线各自选适配器**，顺序不能颠倒也不能漏判：
   // - CodeBuddy 系（buddy / workbuddy）→ BuddyAdapter，按各自 product 发请求；
   // - LobsterAI → LobsteraiAdapter（自己的端点与头族）；
+  // - TRAE → TraeAdapter（SOLO 格式请求体 + Cloud-IDE-JWT 头族）；
   // - 其余（codearts）→ CodeArtsAdapter（华为云 HMAC 签名）。
   //
-  // 历史上这里只判断 `provider === 'buddy'`，导致 workbuddy 落入 else 分支、
-  // 用华为云 HMAC 签名去发 WorkBuddy 凭据而必然失败（见下方 productById 的
-  // 原注释）；现在 lobsterai 若不加分支会重蹈覆辙 —— 它的协议与两者都不同，
-  // 用 CodeArtsAdapter 会以完全错误的签名与端点发请求。
+  // ⚠️ **这个分派表已两次因「新增 provider 没同步」而出缺陷**，改它前先读完：
+  //
+  // 1. 初版只判断 `provider === 'buddy'` → workbuddy 落入 else，用华为云
+  //    HMAC 签名去发 WorkBuddy 凭据而必然失败；
+  // 2. 加了 lobsterai 分支后**仍漏掉 trae** → TRAE 账号同样落入 else，
+  //    用 CodeArts 签名发 TRAE 请求而必然失败（2026-09-25 排查 workbuddy
+  //    缺陷时发现，实测 `productById('trae')` 与 `lobsteraiProductById('trae')`
+  //    均为 undefined）。
+  //
+  // 判据是「**该 provider 会不会写 `modelRateLimits`**」—— 写了才会有重测
+  // 按钮，才需要在这里分派。新增 provider 时务必同步本分支，
+  // 并补 `tests/unit/account-probe-adapter.spec.ts` 的对应用例。
   const buddyProduct = productById(entry.provider)
   const lobsteraiProduct = lobsteraiProductById(entry.provider)
-  let adapter: BuddyAdapter | LobsteraiAdapter | CodeArtsAdapter
+  let adapter: BuddyAdapter | LobsteraiAdapter | TraeAdapter | CodeArtsAdapter
   if (buddyProduct !== undefined) {
     adapter = new BuddyAdapter({
       credentialRef: ref,
@@ -144,6 +211,14 @@ async function probeWithAdapter(
       resolveCredential: async () => credential as LobsteraiCredential,
       refresh: async () => {},
       product: lobsteraiProduct,
+    })
+  } else if (entry.provider === TRAE_PROVIDER_ID) {
+    // TRAE 只有一个产品（`TRAE` 常量），没有 productById 式的查表，
+    // 故直接按 provider id 判定。不传 product → TraeAdapter 内部默认用 TRAE。
+    adapter = new TraeAdapter({
+      credentialRef: ref,
+      resolveCredential: async () => credential as TraeCredential,
+      refresh: async () => {},
     })
   } else {
     adapter = new CodeArtsAdapter({
@@ -161,6 +236,10 @@ async function probeWithAdapter(
         content: [{ type: 'text', text: PROBE_PROMPT }],
         source: { kind: 'user' },
       })],
+      // ⚠️ **必须传 system**，否则 WorkBuddy 网关返回 400 + code 11128
+      // 「first message is not system prompt」（伪装成安全策略拦截），
+      // 使重测恒不可用。详见 PROBE_SYSTEM 的注释。
+      system: PROBE_SYSTEM,
       signal,
     })) {
       // 消费整个流即可：能正常结束就说明服务端接受并完成了这次请求
@@ -170,7 +249,17 @@ async function probeWithAdapter(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (isRateLimitFailure(error)) {
-      return { modelId, ok: false, message: `仍受限：${message}` }
+      // [patch-codearts-probe-ratelimit] 上游的重置时刻是**滚动**的：每次撞限流都会
+      // 把它往后推。这里必须把它解析出来一并回传，否则调用方只能保留存储里的旧值，
+      // 旧值过期后 UI 就不再渲染「限额重置」（表现为"重测说仍受限、卡片却没有"）。
+      // 解析失败（文案无时间）时不带该字段，调用方按「无法确认」处理、保留原标记。
+      const parsed = parseRateLimitError(message, modelId)
+      return {
+        modelId,
+        ok: false,
+        message: `仍受限：${message}`,
+        ...(parsed !== null ? { resetTimeMs: parsed.resetTimeMs } : {}),
+      }
     }
     return { modelId, ok: false, message: `无法确认：${message}` }
   }
@@ -221,6 +310,14 @@ export async function retestAccount(
   // 只有实测通过的模型才清除标记；仍受限/无法确认的一律保留。
   if (result.cleared.length > 0) {
     await pool.clearModelRateLimits(accountId, result.cleared)
+  }
+  // [patch-codearts-probe-ratelimit] 对「仍受限且上游给出了新重置时刻」的模型，
+  // 把**新时刻**写回存储。不写回的话，存储会一直停在第一次撞限流的旧时刻；
+  // 旧时刻过期后 UI 不再渲染「限额重置」（卡片空白），而账号实际仍在受限，
+  // 选号逻辑也会误判为可用。上游时刻是滚动的，每次重测都可能往后推。
+  for (const outcome of result.stillLimited) {
+    if (outcome.resetTimeMs === undefined) continue
+    await pool.updateModelRateLimit(accountId, outcome.modelId, outcome.resetTimeMs)
   }
   return result
 }

@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   claimQoderCampaign,
@@ -5,9 +8,9 @@ import {
   fetchQoderCheckinStatus,
   parseQoderCampaigns,
 } from '../../src/qoder-credits.js'
+import { resetQoderMachineIdentityCache } from '../../src/qoder-machine.js'
 import { QODER } from '../../src/qoder-product.js'
 import type { QoderCredential } from '../../src/qoder.js'
-
 /**
  * 2026-09-21 由抓包（keylog 解密）解出的真实响应。
  *
@@ -48,7 +51,13 @@ const CLAIMED_REPLAY = {
   grantedAt: '2026-09-18T15:14:28.866351Z',
 }
 
-/** 抓包里的活动列表（含一个可领、一个仅详情）。 */
+/**
+ * 抓包里的活动列表（含一个可领、一个仅详情）。
+ *
+ * ⚠️ 这是 2026-09-21 `qoder积分.pcapng` 解密后**逐字节复刻**的真实响应
+ * （领取动作发生**之前**那一刻）。判据的可靠性正来自它与下面
+ * {@link CAMPAIGNS_AFTER_CLAIM} 的**前后对照**。
+ */
 const CAMPAIGNS_BODY = {
   uid: '01a0b514-ad7c-7dca-ae92-70181beb532e',
   showCampaign: true,
@@ -71,12 +80,84 @@ const CAMPAIGNS_BODY = {
   ],
 }
 
-/** 今天已领后的真实响应（列表被清空）。 */
+/**
+ * **领取之后**的真实响应（同一抓包的后续帧，逐字节复刻）。
+ *
+ * ⚠️ 这条是判据的关键实证：领取成功后服务端**并没有**清空列表，而是把那条
+ * `CLAIM_BENEFIT` 的 `claimStatus` 从 `CLAIMABLE` 改成 `CLAIMED`、
+ * 顶层 `claimable` 从 `true` 改成 `false`。**列表依然非空**。
+ *
+ * 这就是「空列表 ⇒ 今天已领」这一旧判据错误的原因：真正「已领」的形态
+ * 是「有 CLAIM_BENEFIT 且 CLAIMED」，而不是「列表为空」。
+ */
+const CAMPAIGNS_AFTER_CLAIM = {
+  uid: '01a0b514-ad7c-7dca-ae92-70181beb532e',
+  showCampaign: true,
+  claimable: false,
+  campaignUrl: 'https://openapi.qoder.sh/growth-page/activity-iframe',
+  campaigns: [
+    {
+      campaignId: '01a0bf8d-0c44-7352-96c5-3baa11cb2da2',
+      campaignKey: 'act-20260921-308',
+      actionType: 'CLAIM_BENEFIT',
+      claimStatus: 'CLAIMED',
+      benefit: { kind: 'CREDITS', amount: 100, validity: { mode: 'RELATIVE_DAYS', days: 30 } },
+    },
+    {
+      campaignId: '01a05bce-e800-7494-a002-806e4438f483',
+      campaignKey: 'act-20260901-493',
+      actionType: 'VIEW_DETAILS',
+      claimStatus: 'CLAIMED',
+    },
+  ],
+}
+
+/**
+ * 列表为空。
+ *
+ * ⚠️ **这个形态不代表「今天已领」**（旧实现正是这么误判的）。实测它出现的
+ * 场景是**请求头不完整**（缺 `Cosy-MachineToken`/`Cosy-MachineType`）——
+ * 此时服务端对 `Cosy-ClientType: '5'` 或头不全的请求回空列表。
+ * 真正的「已领」形态见 {@link CAMPAIGNS_AFTER_CLAIM}。
+ */
 const CAMPAIGNS_EMPTY = { uid: 'u', showCampaign: false, claimable: false, campaignUrl: '', campaigns: [] }
 
 const cred = {} as QoderCredential
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+
+/**
+ * 在「machine 身份受控」的环境下跑一段断言。
+ *
+ * ⚠️ **必须同时把 `QODER_RUNTIME_INFO` 指到不存在的路径**。
+ *
+ * machine 身份有两条来源：① 实时 spawn `runtime-info.exe`（真实身份）；
+ * ② 磁盘 `machine_token.json`（退路）。若只设文件路径而不禁用 exe，
+ * 每次调用都会**真的去 spawn 开发机上的可执行文件**（实测约 0.8~3.8 秒），
+ * 且拿到的是**实时身份**而非下面的 fixture —— 用例于是既慢又与断言不符。
+ *
+ * 禁用后即可精确断言「插件确实把身份透传到了请求头里」这件事本身。
+ */
+async function withControlledMachineIdentity(body: () => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-claim-mach-'))
+  const file = join(dir, 'machine_token.json')
+  writeFileSync(file, JSON.stringify({ token: 'tok-abc', type: 'type-xyz' }))
+  const prevFile = process.env.QODER_MACHINE_TOKEN_PATH
+  const prevExe = process.env.QODER_RUNTIME_INFO
+  process.env.QODER_MACHINE_TOKEN_PATH = file
+  process.env.QODER_RUNTIME_INFO = join(dir, 'no-such-runtime-info')
+  resetQoderMachineIdentityCache()
+  try {
+    await body()
+  } finally {
+    if (prevFile === undefined) delete process.env.QODER_MACHINE_TOKEN_PATH
+    else process.env.QODER_MACHINE_TOKEN_PATH = prevFile
+    if (prevExe === undefined) delete process.env.QODER_RUNTIME_INFO
+    else process.env.QODER_RUNTIME_INFO = prevExe
+    resetQoderMachineIdentityCache()
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
 
 describe('Qoder 活动列表解析', () => {
   it('提取 campaignId / actionType / claimStatus / amount', () => {
@@ -88,6 +169,68 @@ describe('Qoder 活动列表解析', () => {
       actionType: 'CLAIM_BENEFIT',
       claimStatus: 'CLAIMABLE',
       amount: 100,
+    })
+  })
+
+  /**
+   * ⚠️ **真实缺陷回归（2026-09-25，用户报障）**：插件必须用**桌面 app 身份**
+   * （`Cosy-ClientType: 10`）请求活动端点。
+   *
+   * 服务端按该头进入活动下发分支 —— 用 CLI 身份（`'5'`）时响应恒为
+   * `{"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}`，
+   * 插件随后筛出 0 个可领活动并**误报「今日已领取」**。
+   *
+   * ⚠️ **`'10'` 是必要但不充分条件**：它只让服务端回 1 条 `VIEW_DETAILS`；
+   * 要拿到 `CLAIM_BENEFIT/CLAIMABLE` 还必须带 `Cosy-MachineToken` +
+   * `Cosy-MachineType`（见下方 machine 头用例与 `src/qoder-machine.ts`）。
+   *
+   * 本用例锁死该取值，防止回退到 `clientMetadata.client_type`（CLI 身份）。
+   */
+  it('活动端点必须带桌面 app 身份（Cosy-ClientType=10）—— 回归锁', async () => {
+    const fetcher = vi.fn(async () => json(CAMPAIGNS_BODY))
+    await fetchQoderCheckinStatus(cred, QODER, fetcher as never)
+    const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers['Cosy-ClientType']).toBe('10')
+    // 明确不等于推理用的 CLI 身份，避免将来两处被"顺手"合并。
+    expect(init.headers['Cosy-ClientType']).not.toBe(QODER.clientMetadata.client_type)
+  })
+
+  it('领取端点同样带 app 身份（Cosy-ClientType=10）—— 回归锁', async () => {
+    const fetcher = vi.fn(async () => json(CLAIMED_OK))
+    await claimQoderCampaign(cred, QODER, 'c1', fetcher as never)
+    const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
+    expect(init.headers['Cosy-ClientType']).toBe('10')
+  })
+
+  /**
+   * ⚠️ **本次缺陷的真正根因（2026-09-25，抓包 + 消融实证）**：
+   * 活动请求必须带上**成对的** `Cosy-MachineToken` + `Cosy-MachineType`。
+   *
+   * 只用 `Cosy-ClientType: 10` 时，服务端只回 1 条 `VIEW_DETAILS` 且
+   * `claimable:false` —— 插件据此误判「今天已领」，而 IDE 里可领。
+   * 补上这两个头后才回 `CLAIM_BENEFIT/CLAIMABLE/amount:100`。
+   *
+   * 证据：`qoder积分.pcapng`（`SSLKEYLOGFILE` 解密）显示 native 带完整
+   * machine 头族；逐项消融确认这两个头**缺一即失效**。
+   */
+  it('活动端点必须带成对的 machine 头（Token + Type）—— 回归锁', async () => {
+    await withControlledMachineIdentity(async () => {
+      const fetcher = vi.fn(async () => json(CAMPAIGNS_BODY))
+      await fetchQoderCheckinStatus(cred, QODER, fetcher as never)
+      const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
+      expect(init.headers['Cosy-MachineToken']).toBe('tok-abc')
+      expect(init.headers['Cosy-MachineType']).toBe('type-xyz')
+    })
+  })
+
+  /** 领取端点同样要带（claim 也走 `/sash/`）。 */
+  it('领取端点必须带成对的 machine 头 —— 回归锁', async () => {
+    await withControlledMachineIdentity(async () => {
+      const fetcher = vi.fn(async () => json(CLAIMED_OK))
+      await claimQoderCampaign(cred, QODER, 'c1', fetcher as never)
+      const init = fetcher.mock.calls[0]![1] as { headers: Record<string, string> }
+      expect(init.headers['Cosy-MachineToken']).toBe('tok-abc')
+      expect(init.headers['Cosy-MachineType']).toBe('type-xyz')
     })
   })
 
@@ -113,13 +256,40 @@ describe('Qoder 签到状态', () => {
   })
 
   /**
-   * ⚠️ 真实缺陷回归：服务端在「今天已领」时把 `campaigns` 清空并回
-   * `showCampaign:false`。若按「列表非空」判 `active`，调用方会先命中
-   * 「活动未开启」分支 —— 用户看到的是「签到活动未开启」而不是「今天已领」。
+   * ⚠️ **真实缺陷回归（2026-09-25，用户报障「没领过就显示已领取」）**。
+   *
+   * 旧判据是 `todayCheckedIn = (可领活动数 === 0)`，于是**列表为空**（请求头
+   * 不完整导致的空态）也被判成「今天已领」—— 而 IDE 里明明可领。
+   *
+   * 抓包实证指出真正的「已领」形态（见 {@link CAMPAIGNS_AFTER_CLAIM}）：
+   * 列表**非空**、那条 `CLAIM_BENEFIT` 变 `CLAIMED`、顶层 `claimable:false`。
+   * 故「列表为空」应判**未领**。
    */
-  it('列表被清空（今天已领）→ active 仍为 true、todayCheckedIn=true', async () => {
+  it('列表为空 → active 仍为 true（不误判为「活动未开启」）且 todayCheckedIn=false', async () => {
     const status = await fetchQoderCheckinStatus(cred, QODER, vi.fn(async () => json(CAMPAIGNS_EMPTY)) as never)
+    // active 恒 true：若判 false，调用方会先命中「活动未开启」分支。
+    expect(status).toMatchObject({ active: true, todayCheckedIn: false })
+  })
+
+  /**
+   * ⚠️ **核心判据（抓包前后对照）**：领取成功后列表**不清空**，
+   * 而是那条 `CLAIM_BENEFIT` 的 `claimStatus` 变为 `CLAIMED`。
+   * 这才是「今天已领」。
+   */
+  it('领取后的真实形态（CLAIM_BENEFIT 变 CLAIMED）→ todayCheckedIn=true', async () => {
+    const status = await fetchQoderCheckinStatus(
+      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never,
+    )
     expect(status).toMatchObject({ active: true, todayCheckedIn: true })
+  })
+
+  it('仅 VIEW_DETAILS 活动（无领分类）→ todayCheckedIn=false（它不是领取类）', async () => {
+    const onlyViewDetails = {
+      uid: 'u', showCampaign: true, claimable: false,
+      campaigns: [{ campaignId: 'c1', actionType: 'VIEW_DETAILS', claimStatus: 'CLAIMED' }],
+    }
+    const status = await fetchQoderCheckinStatus(cred, QODER, vi.fn(async () => json(onlyViewDetails)) as never)
+    expect(status).toMatchObject({ todayCheckedIn: false })
   })
 
   it('网络失败 / 非 2xx → null（与「无活动」严格区分）', async () => {
@@ -176,8 +346,24 @@ describe('Qoder 领取单个活动', () => {
 })
 
 describe('Qoder 领取全部可领活动', () => {
-  it('无可领活动 → already-claimed（今天已领）', async () => {
+  /**
+   * ⚠️ **真实缺陷回归（用户报障「没领过就显示已经领取」）**：旧实现在
+   * 「无可领活动」时直接返回 `already-claimed`，于是只要服务端没下发可领项
+   * （含**请求头不完整**、未到刷新时间、本就无活动），界面就显示「今天已领取」。
+   *
+   * 「没东西可领」（inactive）与「领过了」（already-claimed）必须分开。
+   */
+  it('列表为空（未下发可领项）→ inactive（**不是** already-claimed）', async () => {
     const outcome = await claimQoderDailyCheckin(cred, QODER, vi.fn(async () => json(CAMPAIGNS_EMPTY)) as never)
+    expect(outcome.kind).toBe('inactive')
+    expect(outcome).toMatchObject({ message: expect.stringContaining('没有可领取') })
+  })
+
+  /** 抓包实证的「真已领」形态 → already-claimed。 */
+  it('领取后的真实形态 → already-claimed（真的领过了）', async () => {
+    const outcome = await claimQoderDailyCheckin(
+      cred, QODER, vi.fn(async () => json(CAMPAIGNS_AFTER_CLAIM)) as never,
+    )
     expect(outcome.kind).toBe('already-claimed')
   })
 

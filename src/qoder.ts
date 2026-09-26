@@ -259,8 +259,7 @@ export function buildQoderCredential(
 
 /** 凭据的访问令牌过期时间（毫秒）；未知时 undefined。 */
 export function qoderCredentialExpiresAtMs(credential: QoderCredential): number | undefined {
-  return credential.expire_time
-}
+  return credential.expire_time}
 
 /**
  * 是否可静默续期。
@@ -339,4 +338,74 @@ export function applyQoderRefresh(
     next.uid = credential.uid
   }
   return next
+}
+
+/**
+ * 取用户的展示名（`GET /api/v1/userinfo` 的 `name`）。
+ *
+ * ## 为什么需要它（真实缺陷，用户报障 2026-09-26）
+ *
+ * > 另外授权登录后的名字都是 `qoder-xxxx`，无法识别是哪个号，
+ * > 应该显示授权的名字
+ *
+ * 根因：**设备码轮询响应里没有 `user_name`**。`parseQoderTokenPayload` 会读
+ * `user_name` / `userName`，`buildQoderCredential` 也会回退到它 —— 但两者都
+ * 拿不到值，于是凭据永不带 `nickname`，Jet Hub 便退回显示账号 id
+ * （`qoder-c2472fa6` 这类），多账号时无法区分。
+ *
+ * 实测（2026-09-26）：4 个账号的凭据 `nickname` **全部缺失**，而 userinfo
+ * 稳定给出真实名字：
+ *
+ * | 账号 id | 凭据 nickname | userinfo `name` |
+ * |---|---|---|
+
+ *
+ * 故**登录成功后必须补一次 userinfo** 才能拿到名字（这是唯一可靠来源）。
+ *
+ * ⚠️ 失败时返回 `undefined` 而**不抛错**：昵称只是展示信息，拿不到不应让
+ * 登录整体失败（与 `toLoginFlowResult` 对过期时间的处理同原则）。
+ * 调用方应退回账号 id。
+ *
+ * @param fetcher 可注入（单测用）
+ */
+export async function fetchQoderUserNickname(
+  credential: QoderCredential,
+  product: QoderProduct,
+  fetcher: typeof fetch = fetch,
+): Promise<string | undefined> {
+  try {
+    const response = await fetcher(`${product.openApiBase}${QODER_USERINFO_PATH}`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${credential.security_oauth_token || credential.access_token}`,
+      },
+    })
+    if (!response.ok) return undefined
+    const body = await response.json()
+    if (typeof body !== 'object' || body === null) return undefined
+    const name = (body as Record<string, unknown>).name
+    if (typeof name !== 'string') return undefined
+    const trimmed = name.trim()
+    return trimmed.length > 0 ? trimmed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 把昵称写进凭据（返回新对象，不改原凭据）。
+ *
+ * 昵称**写回凭据**而不只写账号条目：账号条目会随 Jet Hub 的账号操作整体
+ * 重写，而凭据里存一份才能在续期后（`applyQoderRefresh` 会保留它）
+ * 与其它面板（积分、模型）都稳定拿到。
+ *
+ * 空串与 undefined 均视为「没有昵称」，此时原样返回（不写入空字段）。
+ */
+export function withQoderNickname(
+  credential: QoderCredential,
+  nickname: string | undefined,
+): QoderCredential {
+  if (nickname === undefined || nickname.length === 0) return credential
+  return { ...credential, nickname }
 }

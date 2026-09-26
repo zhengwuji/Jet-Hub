@@ -84,13 +84,41 @@ export interface CheckinStatus {
   themeName: string
   /** 活动结束时间 */
   endTime: string
+  /**
+   * 该账号**需要用户先去别处操作**才能参与签到（如未开通活动）。
+   *
+   * 与 {@link ClaimOutcome} 的同名字段同义 —— 见那里的详细说明。
+   */
+  actionRequired?: boolean
 }
 
-/** 一次领取的结果。 */
+/**
+ * 一次领取的结果。
+ *
+ * ## `actionRequired`：把「需要用户操作」变成**显式语义**，而不是藏在文案里
+ *
+ * **真实缺陷（用户报障，2026-09-26）**：用本插件经 GitHub 授权**新注册**的
+ * Qoder 账号尚未在 Qoder 侧开通每日领取，一键签到只说「当前没有可领取的活动」，
+ * 用户不知道该怎么办。后端其实已给出可操作文案，但汇总行只显示计数
+ * 「N 个活动未开启」，**用户看不到那条提示**。
+ *
+ * 修法不仅是在 UI 里多显示一句 message —— 那会让「这条 inactive 需要用户操作」
+ * 这一语义**只存在于中文文案里**，前端（纯 JS，无类型检查）只能靠
+ * 「有没有 message」去猜。故补一个**显式可选字段**：
+ *
+ * - 置 `true` 时，调用方应在结果里**单独、醒目地**展示该 message
+ *   （它是给用户的行动指引，混在计数行里会被读漏）；
+ * - 不置或 `false` 时按普通 `inactive` 处理（如「今天活动暂未开始」）；
+ * - **可选**字段，故另外五个 provider（与所有既有调用方）无需改动，
+ *   与 `src/trae-credits.ts` 用 `ClaimOutcome & { … }` 追加字段的先例同型。
+ *
+ * ⚠️ 与 `checkin-all.js`/`jet-hub.js` 的约定：前端判 `actionRequired === true`
+ * **而不是**判 message 是否非空、更不是判文案内容 —— 后者会随措辞变化而失效。
+ */
 export type ClaimOutcome =
   | { kind: 'claimed'; credit: number; streakDays: number; isStreakDay: boolean; delayedMessage?: string }
   | { kind: 'already-claimed'; message: string }
-  | { kind: 'inactive'; message: string }
+  | { kind: 'inactive'; message: string; actionRequired?: boolean }
   | { kind: 'failed'; code: number; message: string }
 
 /**

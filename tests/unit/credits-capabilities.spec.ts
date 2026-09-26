@@ -6,6 +6,7 @@ import {
   CREDITS_CAPABILITIES,
   supportsCreditBalance,
   supportsDailyCheckin,
+  supportsOnboardingTasks,
 } from '../../plugin-src/client/credits-capabilities.js'
 
 /**
@@ -63,6 +64,32 @@ describe('积分能力矩阵', () => {
     expect(CREDITS_CAPABILITIES.qoder).toEqual({ balance: true, dailyCheckin: true })
     expect(supportsCreditBalance('qoder')).toBe(true)
     expect(supportsDailyCheckin('qoder')).toBe(true)
+  })
+
+  it('Loomy 三项能力：余额 + 每日签到 + 新手任务', () => {
+    expect(CREDITS_CAPABILITIES.loomy)
+      .toEqual({ balance: true, dailyCheckin: true, onboardingTasks: true })
+    expect(supportsCreditBalance('loomy')).toBe(true)
+    expect(supportsDailyCheckin('loomy')).toBe(true)
+    expect(supportsOnboardingTasks('loomy')).toBe(true)
+  })
+
+  /**
+   * ⚠️ `onboardingTasks` 与 `dailyCheckin` **语义独立**，不能互相推断：
+   * - `dailyCheckin` = 每日额度刷新（每天有收益）
+   * - `onboardingTasks` = 新手任务 10000 分（**一次性**，每号只能领一次）
+   * 故只有 Loomy 同时具备两者，其余 provider 的 onboardingTasks 必须为 false。
+   */
+  it('onboardingTasks 只对 Loomy 为 true（新手任务是一次性的）', () => {
+    for (const id of ['codearts', 'buddy', 'workbuddy', 'lobsterai', 'qoder', 'trae', 'cline']) {
+      expect(supportsOnboardingTasks(id), `${id} 不应支持新手任务`).toBe(false)
+    }
+  })
+
+  it('未登记的 provider 的 onboardingTasks 默认关闭', () => {
+    for (const unknown of ['', 'newprovider', '__proto__']) {
+      expect(supportsOnboardingTasks(unknown), unknown).toBe(false)
+    }
   })
 
   it('未登记的 provider 默认不支持任何积分能力（默认关闭）', () => {

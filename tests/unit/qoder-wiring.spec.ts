@@ -43,7 +43,7 @@ describe('Qoder 宿主侧接线（src/index.ts）', () => {
     // ⚠️ 两个区域实例（qoder / qoderCn）都必须传：国内版与国际版端点、
     // 登录态、账号池各自独立，漏传会让国内版面板完全没有后端。
     expect(index).toMatch(
-      /registerJetHubRpc\(\s*ctx,\s*pool,\s*service,\s*buddy,\s*buddyIntl,\s*workbuddy,\s*workbuddyCn,\s*lobsterai,\s*qoder,\s*qoderCn,\s*trae,\s*traeIntl,\s*modelAdapters,?\s*\)/,
+      /registerJetHubRpc\(\s*ctx,\s*pool,\s*service,[\s\S]*?qoder,\s*qoderCn,[\s\S]*?modelAdapters,?\s*\)/,
     )
     expect(index, 'qoder 适配器须登记进映射').toContain('qoder: qoderAdapter')
     expect(index, 'qoder-cn 适配器须登记进映射').toContain("'qoder-cn': qoderCnAdapter")

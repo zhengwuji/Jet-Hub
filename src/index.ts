@@ -10,21 +10,35 @@ import { registerTraeLlm } from './trae-adapter.js'
 // ⚠️ 刻意**不放进 ALL_PRODUCTS**，也不接入账号池，原因见下方注册处注释。
 import { registerAntigravityLocalLlm, getRegisteredAntigravityAdapter, ANTIGRAVITY_PROVIDER } from './antigravity-local-adapter.js'
 import { readAntigravityCredential } from './antigravity.js'
+import { registerClineLlm } from './cline-adapter.js'
+import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
+import { registerRaccoonLlm } from './raccoon-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
-import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
+import { BUDDY_CREDENTIAL_REF, BuddyAuth, createPoolRefresh } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
+import { ClineAuth } from './cline-auth.js'
+import { LoomyAuth } from './loomy-auth.js'
+import { RaccoonAuth } from './raccoon-auth.js'
+import { LOOMY } from './loomy-product.js'
+import { LoomyBalanceSelector } from './loomy-balance-selector.js'
+import { RACCOON } from './raccoon-product.js'
 import { AccountPool } from './account-pool.js'
-import { registerJetHubRpc } from './jet-hub-rpc.js'
+import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
+import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { ALL_PRODUCTS, CODEBUDDY, CODEBUDDY_INTL, WORKBUDDY, WORKBUDDY_CN } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { TRAE, TRAE_INTL } from './trae-product.js'
+import { CLINE } from './cline-product.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
+import type { ClineCredential } from './cline.js'
+import type { LoomyCredential } from './loomy.js'
+import type { RaccoonCredential } from './raccoon.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -37,40 +51,45 @@ export const name = 'codearts-auth'
 export const inject = ['credentials', 'commands', 'llm']
 
 /**
- * Provider 配置 namespace 的 schema。
+ * 插件 Config schema。
  *
- * `registerConfigurableProviders` 声明的 `settingsNs` 必须真实存在于
- * settings 服务中，否则模型设置页读到 undefined 的 namespace，
- * 在 `refFor → deriveKeyRef(provider)` 处会以
- * `provider.toUpperCase is not a function` 崩溃。
- * 两者都只需承接一个可选的 `providers` 映射，故共用同一宽松 schema。
+ * ⚠️ **DSH 0.1.7-rc.1 起，settings 表单的命名空间就是 profile 条目 id**
+ * （本插件的条目 id 是 `codearts-auth`），且只投影本条目 Config 中标记了
+ * `.volatile()` 的字段。因此这里保留一个 `providers` 映射：
+ * - 它是六个 provider 各自 `registerConfigurableProviders({ settingsNs })` 的
+ *   落地位置（0.1.7 下 `settingsNs` = 本条目 id），模型设置页据此把 provider
+ *   判定为「已配置」（判据见 `dsh-client-ui-settings-models` 的 `configured`）；
+ * - 本插件的凭据与账号管理**不**走这里（那是 Jet Hub 的账号池 +
+ *   `ctx.credentials`），故该字段只承接一个宽松映射，不参与业务读取。
  *
- * 注意：`settings.register()` 要求 schemastery schema —— `describe()` 会对每个
- * 注册项无条件调用 `schema.toJSON()` 与 `redactSecrets(schema, value)`。
- * 传入裸函数（`(value) => ...`）会让 `describe()` 抛
- * `TypeError: registration.schema.toJSON is not a function`，进而使所有
- * 依赖 settings 的界面（模型设置页、主题、sidebar 的 settings.get/shell.get）
- * 全部失败。因此这里必须用 `Schema.object({...})` 构造。
+ * 必须是 schemastery schema：`SettingsForms.describe()` 会对每个注册项调用
+ * `schema.toJSON()`，传入裸函数（`(value) => ...`）会让它抛
+ * `TypeError: ... .toJSON is not a function`，进而使所有依赖 settings 的界面
+ * （模型设置页、sidebar 的 settings.get/shell.get）全部失败。
  */
-const providerSettingsSchema = Schema.object({
-  providers: Schema.dict(Schema.any()).default({}),
+export const Config = Schema.object({
+  providers: Schema.dict(Schema.any()).default({}).volatile(),
 })
 
-/** 注册 provider 配置 namespace（已存在时忽略重复注册错误）。 */
+/**
+ * 注册 provider 配置 namespace（**仅老契约需要**）。
+ *
+ * - **≤0.1.6**：`ctx.settings` 允许插件注册任意 namespace，六个 provider 各占
+ *   一个（`llm-buddy` / `llm-workbuddy` / ...）。注册缺失会让模型设置页在
+ *   `refFor → deriveKeyRef(provider)` 处以
+ *   `provider.toUpperCase is not a function` 崩溃，故注册后回读 `describe()` 自检。
+ * - **0.1.7-rc.1**：settings 换成 `SettingsForms`，**没有 `register`**，命名
+ *   空间只能是 profile 条目 id —— 此时不再（也无法）注册；各 provider 的
+ *   `settingsNs` 由 `settingsNamespaceFor()` 指向本插件条目 id，模型设置页照常
+ *   工作。这里刻意**静默跳过**：旧实现在这条分支上会打一条误导性的
+ *   「settings 服务不可用」告警（启动日志实证）。
+ */
 function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
-  const settings = ctx.get('settings') as
-    | {
-      register: (ns: string, schema: unknown) => unknown
-      describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns: string }>
-    }
-    | undefined
-  if (!settings || typeof settings.register !== 'function') {
-    ctx.logger.warn('[codearts-auth] settings 服务不可用，provider namespace 未注册')
-    return
-  }
+  const settings = settingsOf(ctx)
+  if (!hasLegacyNamespaceRegistration(settings) || settings?.register === undefined) return
   for (const ns of namespaces) {
     try {
-      settings.register(ns, providerSettingsSchema)
+      settings.register(ns, Config)
     } catch (error) {
       ctx.logger.warn(`[codearts-auth] settings namespace "${ns}" 注册失败: ${String(error)}`)
     }
@@ -123,20 +142,17 @@ export function makeReadImage(ctx: Context) {
 
 /** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
 export function apply(ctx: Context): void {
-  // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
-  // 七个 namespace 分别对应：codearts 路由、CodeBuddy（buddy）路由、
-  // WorkBuddy（workbuddy）路由、LobsterAI（lobsterai）路由、Qoder（qoder）路由、
-  // TRAE（trae）路由、Antigravity 路由 —— 前六者由 registerBuddyLlm /
-  // registerLobsteraiLlm / registerQoderLlm / registerTraeLlm 以
-  // `llm-${product.id}` 派生，漏注册会让模型设置页在
-  // `refFor → deriveKeyRef(provider)` 处以
-  // `provider.toUpperCase is not a function` 崩溃。
-  // antigravity 复用本机 IDE 凭据，同样需要自己的 namespace。
+  // 本插件自带 Jet Hub 设置页，关闭 0.1.7 起由 Config schema 反渲染的自动表单
+  // （老契约没有 configure()，静默跳过）。
+  suppressAutoSettingsPage(ctx)
+
+  // provider 配置命名空间的注册**只在老契约（≤0.1.6）下需要**：
   registerProviderSettings(
     ctx,
     'llm-buddy', 'llm-buddy-intl', 'llm-workbuddy-cn', 'llm-workbuddy',
     'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qoder-cn', 'llm-trae', 'llm-trae-intl',
+    'llm-cline', 'llm-loomy', 'llm-raccoon',
     `llm-${ANTIGRAVITY_PROVIDER}`,
   )
   const service = new CodeArtsAuth(ctx)
@@ -210,7 +226,10 @@ export function apply(ctx: Context): void {
         return undefined
       }
     },
-    refresh: () => buddy.refresh(),
+    // 刷新**账号池里实际使用的那一个账号**，而不是默认单凭据 ref ——
+    // 后者在 Jet Hub 登录路径下根本不存在，会把 401 报成「未配置凭据」
+    // 并自锁。详见 createPoolRefresh 的注释。
+    refresh: createPoolRefresh(pool, 'buddy', buddy),
     fetchRemoteModels: () => buddy.fetchModels(pool),
     readImage: makeReadImage(ctx),
     accountPool: pool,
@@ -263,7 +282,9 @@ export function apply(ctx: Context): void {
         return undefined
       }
     },
-    refresh: () => workbuddy.refresh(),
+    // 同上：必须刷池内账号（`WORKBUDDY_ACCESS_TOKEN` 从未被写入过）。
+    // 这条正是「workbuddy + deepseek-v4.1-flash 一直报未配置凭据」的根因。
+    refresh: createPoolRefresh(pool, 'workbuddy', workbuddy),
     fetchRemoteModels: () => workbuddy.fetchModels(pool),
     readImage: makeReadImage(ctx),
     accountPool: pool,
@@ -482,6 +503,259 @@ export function apply(ctx: Context): void {
     product: TRAE_INTL,
   })
 
+  // ===== Cline（Cline 桌面端 / Cline API）服务 =====
+  // 第七个产品线，协议与前面六者**都不同源**：登录是 **WorkOS 设备码轮询**
+  // （api.workos.com，不起本地回调端口），鉴权头是 `Bearer workos:<jwt>`
+  // （前缀**不可剥**），推理是**标准 OpenAI 兼容**端点。
+  // 服务名由 ClineAuth 依 product.id 派生，注册为 ctx.clineAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Cline 面板。
+  const cline = new ClineAuth(ctx)
+  const clineAdapter = registerClineLlm(ctx, {
+    credentialRef: credentialRef(CLINE.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 Cline 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 CLINE.id 而非字面量 'cline'：写死字面量在
+      // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(CLINE.id, '')
+      if (available) return available.credential as ClineCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(CLINE.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as ClineCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
+      const available = await pool.getAvailableAccount(CLINE.id, '')
+      if (available) await cline.refreshAccountCredential(available.entry.credentialRef)
+      else await cline.refresh()
+    },
+    // 图片字节桥接：Cline 内嵌目录的 `capabilities` 含 `images`，
+    // 模态按模型判定（见 ClineAdapter.inputModalitiesFor）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: CLINE,
+  })
+
+  // ===== Loomy（讯飞办公助手）服务 =====
+  // 第八个产品线，与前面七者**都不同源**：登录是**短信验证码**
+  // （讯飞 CAccount，HMAC-SHA1 签名，没有 loginUrl 可打开），
+  // 推理是标准 OpenAI 兼容（复用 openai-compat.ts）。
+  // 服务名由 LoomyAuth 依 product.id 派生，注册为 ctx.loomyAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Loomy 面板。
+  const loomy = new LoomyAuth(ctx)
+
+  /**
+   * 按凭据 ref 解析 Loomy 凭据（供选号器与兜底路径共用）。
+   *
+   * 抽成局部函数而非内联两遍：选号器需要它查余额，而解析最终凭据又要用它 ——
+   * 两处若各写一遍 JSON 解析，格式一变就会只改一处。
+   */
+  const resolveLoomyCredentialByRef = async (refName: string): Promise<LoomyCredential | undefined> => {
+    const resolved = await ctx.credentials.resolve(credentialRef(refName))
+    if (!resolved) return undefined
+    try {
+      return JSON.parse(resolved.value) as LoomyCredential
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Loomy 的**按余额优先选号器**（负载均衡）。
+   *
+   * ⚠️ **为什么需要它**（真实缺陷）：实测 Loomy 的今日赠送额度（每天 5000）
+   * 耗尽后，服务端**继续扣永久积分且不报错** —— 「耗尽」是**静默降级**而非错误。
+   * 而本插件既有的「限流 → 换号」只在服务端返回限流错误时触发，
+   * 故对 Loomy **完全无效**：会一直烧同一个号（用户报障）。
+   *
+   * 策略：优先有今日额度的号 → 其次有永久积分的号 → 都无/查不到排最后。
+   * 档内保持手动拖拽顺序（详见 `loomy-balance-rank.ts`）。
+   */
+  const loomyBalanceSelector = new LoomyBalanceSelector({
+    product: LOOMY,
+    resolveCredential: resolveLoomyCredentialByRef,
+  })
+
+  const loomyAdapter = registerLoomyLlm(ctx, {
+    credentialRef: credentialRef(LOOMY.defaultCredentialRef),
+    /**
+     * 解析本轮该用哪个账号的凭据。
+     *
+     * ⚠️ `modelId` 由适配器传入（见 `LoomyAdapterOptions.resolveCredential`
+     * 的签名说明）—— **必须透传给 `getAvailableAccount`**，否则模型级限流
+     * 过滤失效（早期实现传空串 `''`，等于「不按模型过滤」）。
+     */
+    resolveCredential: async (modelId?: string) => {
+      // 只从 Loomy 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 LOOMY.id 而非字面量 'loomy'：写死字面量在
+      // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      //
+      // ⚠️ 先按「模型未受限 + 未停用」筛出候选，**再**按余额分档选号。
+      // 余额排序只在这批候选内部进行 —— 即你的要求：
+      // 「策略建立在模型没有受限且账户没有被设置为停用的基础上」。
+      const candidates = pool
+        .listAccountsByProvider(LOOMY.id)
+        .filter(a => a.enabled)
+        .filter((a) => {
+          // 与 `getAvailableAccount` 的限流判据保持一致（空 modelId = 不过滤）。
+          const key = modelId ?? ''
+          if (key.length === 0) return true
+          if (!a.modelRateLimits) return true
+          const resetAt = a.modelRateLimits[key]
+          return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+        })
+        .map(a => ({ id: a.id, credentialRef: a.credentialRef }))
+
+      // 「锁定永久积分」：只允许消耗今日赠送额度（用户要求，且持久化）。
+      const allowPermanent = !pool.loomyPermanentLocked()
+
+      if (candidates.length > 0) {
+        const picked = await loomyBalanceSelector.select(candidates, { allowPermanent })
+        if (picked !== undefined) {
+          const credential = await resolveLoomyCredentialByRef(picked.account.credentialRef)
+          if (credential !== undefined) return credential
+        } else if (!allowPermanent) {
+          // ⚠️ **锁定时绝不可落到下面的单凭据兜底** —— 那会绕过锁定、
+          // 照样消耗永久积分，锁定形同虚设。这里直接抛明确错误（用户要求）。
+          throw new Error(
+            'Loomy：没有可用账号。已锁定永久积分，而所有账号的今日赠送额度都已用尽'
+            + '（或余额查询失败）。请在 Jet Hub 的 Loomy 面板解锁永久积分，或等待明日额度刷新。',
+          )
+        }
+      }
+
+      // 兜底：账号池为空/全部不可解析时，退回单凭据 ref。
+      const resolved = await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as LoomyCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ Loomy **没有 refresh 端点**，这里的 `refresh` 语义是
+      // 「探测凭据是否仍有效」，失效时抛错提示重新登录。
+      //
+      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 否则探测的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      const available = await pool.getAvailableAccount(LOOMY.id, '')
+      if (available) await loomy.refreshAccountCredential(available.entry.credentialRef)
+      else await loomy.refresh()
+    },
+    // 远端模型目录：GET /api/v1/models。
+    // ⚠️ 必须用 **token 头**（业务端点），不是 Bearer —— 带错会得到
+    // `100002 缺少 token`，表现为「模型列表永远停在兜底表」。
+    // 失败时返回空数组，由适配器回退兜底表。
+    fetchRemoteModels: async () => {
+      const available = await pool.getAvailableAccount(LOOMY.id, '')
+      const resolved = available !== null && available !== undefined
+        ? { value: JSON.stringify(available.credential) }
+        : await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
+      if (resolved === undefined) return []
+      let credential: LoomyCredential
+      try {
+        credential = JSON.parse(resolved.value) as LoomyCredential
+      } catch {
+        return []
+      }
+      const response = await fetch(`${LOOMY.apiBase}/models`, {
+        headers: { Accept: 'application/json', token: credential.access_token },
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!response.ok) return []
+      return parseLoomyRemoteModels(await response.json())
+    },
+    // 图片字节桥接：按模型能力判定（远端 capabilities.input_modalities 含 image）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: LOOMY,
+  })
+
+  // ===== Raccoon Work（商汤小浣熊）服务 =====
+  // 第九个产品线。登录与 Loomy 同型（**本地页承载**的微信扫码 + 短信双路径），
+  // 但**有** refresh 端点（凭据可静默续期），且客户端可能未安装。
+  //
+  // ⚠️ **不依赖客户端**：官方桌面端靠 `office-raccoon://auth/callback` 自定义协议
+  // 回调，本插件（宿主侧 Node 进程）收不到；故改为「宿主本地生成 code + 自行轮询」，
+  // 完全绕开该回调。凭据存插件自有的 ctx.credentials，不读客户端任何文件。
+  // 见 tests/unit/raccoon-client-independence.spec.ts 的回归防线。
+  //
+  // 服务名由 RaccoonAuth 依 product.id 派生，注册为 ctx.raccoonAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Raccoon 面板。
+  const raccoon = new RaccoonAuth(ctx)
+  const raccoonAdapter = registerRaccoonLlm(ctx, {
+    credentialRef: credentialRef(RACCOON.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 raccoon 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 RACCOON.id 而非字面量：写死字面量在改名/多产品场景下
+      // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(RACCOON.id, '')
+      // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
+      // 联合（历史遗留），与 `RaccoonCredential` 无充分重叠，故经 `unknown` 转换。
+      // 运行时安全性由 provider 过滤保证：查询用 `RACCOON.id`，取到的必是 raccoon 凭据。
+      if (available) return available.credential as unknown as RaccoonCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(RACCOON.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as RaccoonCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ raccoon **有** refresh 端点（与 Loomy 恒 false 不同），这里是真续期。
+      //
+      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      const available = await pool.getAvailableAccount(RACCOON.id, '')
+      if (available) {
+        // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
+        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
+        //（真实缺陷：JWT 已续到 15:09、账号池仍是 12:02，相差 3.1 小时）。
+        // 这条路径正是「发消息时按需续期」，故它是最常触发回写的地方。
+        await raccoon.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await raccoon.refresh()
+      }
+    },
+    // 远端模型目录：委托给 RaccoonAuth.fetchModels（它负责 Bearer 头与
+    // visible 过滤 + raccoonDisplayName 生成含倍率的展示名）。
+    // 失败时返回空数组，由适配器回退兜底表。
+    fetchRemoteModels: () => raccoon.fetchModels(pool),
+    // 图片字节桥接：按模型能力判定（远端 tags 含 vision）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: RACCOON,
+  })
+
+  // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
+  //
+  // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
+  //（本机账号是 `RaccoonAva`），注册第二个账号时会重名、无法区分；
+  // 且凭据里没存 `phone`（后来才发现 `user_info.phone` 可用于消歧）。
+  // 光改代码只影响新登录的账号，故这里主动补一次：
+  // 拉 `user_info` 补 `phone`，并用 `buildRaccoonNickname` 重算昵称。
+  //
+  // ⚠️ 幂等 + 失败不阻塞启动（`repairAccountNicknames` 内部逐账号 catch）。
+  void raccoon.repairAccountNicknames(pool, buildRaccoonNickname).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 Raccoon 账号的显示名（追加手机号尾号以便区分）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 Raccoon 账号显示名失败：${String(error)}`)
+  })
+
   // ===== 多账号静默续期调度 =====
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000 // 每 30 分钟检查一次
 
@@ -516,6 +790,17 @@ export function apply(ctx: Context): void {
     try {
       await traeIntl.refreshAll(pool)
     } catch { /* 静默 */ }
+    try {
+      await cline.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      // ⚠️ Loomy 不可续期：这里只探测**已过期**的账号（见 LoomyAuth.refreshAll）。
+      await loomy.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      // raccoon **可续期**：只按 refreshable 过滤，且只续期已过期的账号。
+      await raccoon.refreshAll(pool)
+    } catch { /* 静默 */ }
     // ⚠️ Antigravity **刻意不在此列**：它不接账号池、不做限流轮换，续期由 IDE
     // 自己负责（见下方注册处注释）。把它并进 refreshAll 会引入 Google 侧敏感的
     // 多客户端轮换行为。
@@ -544,6 +829,9 @@ export function apply(ctx: Context): void {
         qoderCn.stop()
         trae.stop()
         traeIntl.stop()
+        cline.stop()
+        loomy.stop()
+        raccoon.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -560,6 +848,9 @@ export function apply(ctx: Context): void {
     qoderCn.stop()
     trae.stop()
     traeIntl.stop()
+    cline.stop()
+    loomy.stop()
+    raccoon.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== 可配置 provider 目录项：注册即固定，不做动态增删 =====
@@ -623,6 +914,9 @@ export function apply(ctx: Context): void {
     'qoder-cn': qoderCnAdapter,
     trae: traeAdapter,
     'trae-intl': traeIntlAdapter,
+    cline: clineAdapter,
+    loomy: loomyAdapter,
+    raccoon: raccoonAdapter,
   }
   // Antigravity 的适配器实例只在它已注册时登记。`getRegisteredAntigravityAdapter()`
   // 类型上是可选的（注册函数返回的是注销函数而非实例），故此处按需取值，
@@ -634,7 +928,7 @@ export function apply(ctx: Context): void {
 
   registerJetHubRpc(
     ctx, pool, service, buddy, buddyIntl, workbuddy, workbuddyCn,
-    lobsterai, qoder, qoderCn, trae, traeIntl, modelAdapters,
+    lobsterai, qoder, qoderCn, trae, traeIntl, cline, loomy, raccoon, modelAdapters,
   )
   ctx.provide('accountPool', pool)
 }
