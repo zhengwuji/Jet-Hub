@@ -722,7 +722,7 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
         }
       },
     }
-    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool as never, auth as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, undefined)
     const response = await handler!(new Request('http://localhost/api/jet-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -772,10 +772,17 @@ describe('account.create 必须立即返回 loginUrl（两步式登录回归）'
       },
     }
     registerJetHubRpc(
+      // ⚠️ 同样的位置参数陷阱：`failingAuth` 必须落在 trae 的位置上。
       ctx as never, pool as never,
-      {} as never, {} as never, {} as never, {} as never, {} as never,
-      failingAuth as never,
-      {} as never,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      failingAuth as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
+      {} as never, // raccoon
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -944,7 +951,8 @@ describe('model.list / model.setDisabled 端点', () => {
 
     registerJetHubRpc(
       // ⚠️ 位置参数：每新增一个 provider 都要在这里补一个 `{}` 占位，
-      // 否则 `modelAdapters` 会错位落到最后一个 auth 形参上（本次加 Loomy 时踩过）。
+      // 否则 `modelAdapters` 会错位落到最后一个 auth 形参上
+      // （加 Loomy 时踩过一次，加 Raccoon 时又踩了一次）。
       ctx as never, pool,
       {} as never, // codearts
       {} as never, // buddy
@@ -954,6 +962,7 @@ describe('model.list / model.setDisabled 端点', () => {
       {} as never, // trae
       {} as never, // cline
       {} as never, // loomy
+      {} as never, // raccoon
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
@@ -1465,7 +1474,7 @@ describe('积分端点的 provider 能力边界', () => {
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
@@ -1639,7 +1648,7 @@ describe('account.reorder 端点', () => {
       logger: { warn: () => {}, info: () => {} },
       credentials: { resolve: async () => undefined },
     }
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never)
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     const call = async (method: string, payload: unknown) => {

@@ -70,7 +70,20 @@ function makeCredential(overrides: Partial<LoomyCredential> = {}): LoomyCredenti
 }
 
 describe('凭据构造', () => {
-  it('expires_at = 现在 + 14 天（毫秒时间戳字符串）', () => {
+  /**
+   * ⚠️ 本用例的**语义边界**（容易被误读，故写清楚）：
+   *
+   * `buildCredential` 只在**登录完成的那一刻**被调用
+   *（`persistWechatLogin` / `loginWithSmsCode`），
+   * 所以它算出的 `expires_at` 就是「**登录时刻** + 14 天」——
+   * 这个值当场写进凭据并**持久化**，之后读取时**不重算**
+   *（`credentialExpiresAtMs` 只解析已存的值）。
+   *
+   * 因此本用例断言的是「**新造**凭据的 TTL 是 14 天」，
+   * 与「凭据是什么时候登录的」无关 —— 旧凭据的 `expires_at` 是历史值，
+   * 本来就该随真实时间流逝而减少（那不是缺陷，正是它能表达过期的原因）。
+   */
+  it('新建凭据的 expires_at = 构建时刻 + 14 天（登录时写入，之后不重算）', () => {
     const { ctx } = makeContext()
     const service = newService(ctx)
     const now = Date.now()
@@ -81,7 +94,11 @@ describe('凭据构造', () => {
     // 14 天 = 1_209_600_000 毫秒（允许少量执行耗时）
     const delta = expiresAt! - now
     expect(delta).toBeGreaterThan(LOOMY_SESSION_TTL_SECONDS * 1000 - 5_000)
-    expect(delta).toBeLessThanOrEqual(LOOMY_SESSION_TTL_SECONDS * 1000)
+    // ⚠️ 上界也要留余量：`buildCredential` 内部的 `Date.now()` 晚于本用例捕获的
+    // `now`，故 delta 会**略大于** 14 天整。原先写 `toBeLessThanOrEqual(14天)`
+    // 单跑时恰好通过（差值常为 0–1 ms），但**全量并发**下机器负载高，
+    // 该差值可达数毫秒 → 偶发假失败（与具体 provider 改动无关的既有抖动）。
+    expect(delta).toBeLessThanOrEqual(LOOMY_SESSION_TTL_SECONDS * 1000 + 5_000)
   })
 
   it('字段名是 access_token（AccountPool 的匹配依据）', () => {

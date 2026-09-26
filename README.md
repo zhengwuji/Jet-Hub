@@ -1482,3 +1482,81 @@ pnpm test:e2e:loomy-chat   # ⚠️ 发一次推理：默认 qwen3.8-flash（x0.
 
 ⚠️ 对话探针的闸门是 `DSH_LOOMY_CHAT_E2E=1` **且**
 `DSH_LOOMY_CHAT_E2E_CONFIRM=yes`，`max_tokens` 压到 16（单次约 1 积分）。
+
+---
+
+## Raccoon Work provider（商汤小浣熊）
+
+`raccoon` 是本插件第 9 个 provider。生产环境：
+
+### ⚠️ 与其余 provider 不同的地方
+
+1. **登录：微信扫码 + 短信双路径，由本地页承载**（与 Loomy 同型）。
+
+2. **短信登录需要阿里云滑块验证码**。手机号必须 **AES-128-CFB** 加密
+
+3. **每日 300 积分没有端点**。实测「每日积分发放」是**服务端按日自动发放**的
+   （账单 `biz_type: 'daily_grant'`，该账号 13:30 注册、13:31 即到账），
+   **不存在可调用的签到接口**。故能力矩阵**不登记 `dailyCheckin`** ——
+   登记了会让按钮每次点击都必然失败（与 CodeArts 早期「对不支持的 provider
+   无条件发请求」是同一类缺陷）。
+
+4. **一次性登录奖励是独立来源**：`POST /api/web/desktop/v1/login/points/grant`
+   给 3000 分，**幂等一次性**（已领过返回 `granted:false`，
+   且账单里能看到上一次记录）。语义与 Loomy 的新手任务同构，
+   故登记为 `onboardingTasks`，复用同一套 `onboarding.status` / `onboarding.claim`
+   端点与 UI。⚠️ 该端点**需要** `X-Client-Platform` 头
+   （`desktop-windows` / `desktop-macos` / `desktop-linux`），猜错会被拒。
+
+5. **`Raccoon-Auto` 不暴露**。它是客户端 i18n 条目（`modelPicker.auto`）渲染的
+   **「自动选模」入口**，倍率写死为 `1 倍`，**不在远端 `model_catalog` 里** ——
+   直接发给 `chat/completions` 会 404。其语义（按消息内容正则打标后从候选池
+   选模型）与 DSH「模型选择是会话级固定」的模型相冲，且选出的模型不可预测、
+   难排查。用户可直接选 `sn-deepseek-v4-1-flash`（`ability_level: 3`、
+   带 `auto` 标签，即自动选模在复杂任务下最可能选中的那个）。
+
+### 模型目录（6 个 `visible:true`）
+
+倍率取 `billing_effective_multiplier`（**当前生效价**，已含促销），
+展示为 ` · x倍率` / ` · 免费` / ` · x原价→x折后价`：
+
+| 模型 | 原价 | 生效价 | 展示 |
+|---|---|---|---|
+| `sn-sensenova-6-8-flash` | 0.5 | **0** | `SenseNova-6.8-Flash · 免费` |
+| `sn-sensenova-6-8-flash-lite` | 0.5 | **0** | `SenseNova-6.8-Flash-Lite · 免费` |
+| `sn-glm-5-3` | 0.75 | 0.75 | `GLM-5-3 · x0.75` |
+| `sn-kimi-k3` | 1 | 1 | `Kimi-K3 · x1` |
+| `sn-glm-5-3-flash` | 0.2 | **0.1** | `GLM-5-3-Flash · x0.2→x0.1` |
+| `sn-deepseek-v4-1-flash` | 0.25 | 0.25 | `DeepSeek-V4.1-Flash · x0.25` |
+
+另有 3 个 `visible:false` 的 `raccoon-*` 内部模型（自动选模的候选池），
+**不在模型选择器中暴露**。
+
+### ⚠️ 零客户端依赖（硬约束）
+
+本 provider **运行时完全不读客户端数据** —— 不读
+`%APPDATA%\office-raccoon\Local Storage\leveldb`、不读
+`~/.box-agent/config/auth.json`、不解客户端 sqlite/leveldb。
+
+### 能力矩阵
+
+```js
+raccoon: { balance: true, onboardingTasks: true }
+```
+
+⚠️ **没有 `dailyCheckin`**，理由见上文第 3 条。
+
+### e2e 探针
+
+```
+pnpm test:e2e:raccoon        # 只读：凭据/模型目录/倍率/积分余额/账单，零消耗
+pnpm test:e2e:raccoon-chat   # ⚠️ 发推理：验证标准 OpenAI SSE 与 reasoning_content
+pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：验证 **tools 被端点接受**（返回结构化 tool_calls）
+```
+
+⚠️ 后两个的闸门是 `DSH_RACCOON_{CHAT,TOOLS}_E2E=1` **且**
+`..._CONFIRM=yes`，`max_tokens` 压到 64–256（单次消耗很小）。
+
+⚠️ **`raccoon-tools` 的判据是「响应里有结构化 `tool_calls`」**，
+不是「模型在正文里说它想调用工具」—— 后者正是 Qoder / TRAE 踩过的缺陷形态
+（插件没把 `tools` 发出去，模型只能用正文 XML 臆造，harness 认不出 → 任务终止）。

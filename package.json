@@ -49,7 +49,10 @@
     "test:e2e:loomy": "cross-env DSH_LOOMY_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/loomy-probe.e2e.spec.ts",
     "test:e2e:loomy-chat": "cross-env DSH_LOOMY_CHAT_E2E=1 DSH_LOOMY_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/loomy-chat-probe.e2e.spec.ts",
     "test:e2e:cline": "cross-env DSH_CLINE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/cline-probe.e2e.spec.ts",
-    "test:e2e:cline-chat": "cross-env DSH_CLINE_CHAT_E2E=1 DSH_CLINE_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/cline-chat-probe.e2e.spec.ts"
+    "test:e2e:cline-chat": "cross-env DSH_CLINE_CHAT_E2E=1 DSH_CLINE_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/cline-chat-probe.e2e.spec.ts",
+    "test:e2e:raccoon": "cross-env DSH_RACCOON_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-probe.e2e.spec.ts",
+    "test:e2e:raccoon-chat": "cross-env DSH_RACCOON_CHAT_E2E=1 DSH_RACCOON_CHAT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-chat-probe.e2e.spec.ts",
+    "test:e2e:raccoon-tools": "cross-env DSH_RACCOON_TOOLS_E2E=1 DSH_RACCOON_TOOLS_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/raccoon-tools-probe.e2e.spec.ts"
   },
   "dsh": {
     "bundle": {

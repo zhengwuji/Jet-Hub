@@ -59,14 +59,23 @@ describe('Loomy 文档覆盖', () => {
    * `app.asar`（既有内容，不在本次要求范围）。全文匹配会误伤它。
    */
   it('Loomy 章节不含脚本清单 / AccessKey / 加密细节（用户要求）', () => {
-    // 截取 Loomy 章节（从标题到文件末尾）。
+    // 截取 Loomy 章节（从标题到**下一个二级标题**为止）。
     // ⚠️ 两个文件的标题写法不同：README 是「## Loomy provider（讯飞办公助手）」，
     // AGENTS.md 是「## ⚠️ Loomy（讯飞）provider：…」。故用共同的锚点
     // `Loomy` + 各自标题行的特征，这里取**最后一个**含 `Loomy` 的二级标题。
+    //
+    // ⚠️ **必须以「下一个二级标题」为界，不能截到文件末尾** ——
+    // 后续追加的 provider 章节（如 Raccoon）会落在同一文件的后半部分，
+    // 截到末尾会把它们的正文一并纳入本用例的禁用词扫描，
+    // 造成「Loomy 章节含 app.asar」这类**误报**
+    // （Raccoon 章节合法地提到 `app.asar`，那是它自己的逆向取证方式）。
     const loomySectionOf = (text: string): string => {
       const matches = [...text.matchAll(/^## .*Loomy.*$/gm)]
       const last = matches.at(-1)
-      return last?.index === undefined ? '' : text.slice(last.index)
+      if (last?.index === undefined) return ''
+      const rest = text.slice(last.index + last[0].length)
+      const next = /^## /m.exec(rest)
+      return next?.index === undefined ? rest : rest.slice(0, next.index)
     }
     const readmeLoomy = loomySectionOf(readme)
     const agentsLoomy = loomySectionOf(agents)

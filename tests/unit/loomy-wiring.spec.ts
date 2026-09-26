@@ -48,7 +48,10 @@ describe('Loomy 在 index.ts 的接线', () => {
   })
 
   it('registerJetHubRpc 传入了 loomy', () => {
-    expect(indexSource).toMatch(/registerJetHubRpc\([\s\S]*?cline, loomy, modelAdapters\)/)
+    // ⚠️ 断言到 `loomy` 与 `modelAdapters` 之间**不限定**具体参数 ——
+    // 每新增一个 provider 都会在这中间插一个实参（raccoon 即如此），
+    // 写死 `cline, loomy, modelAdapters` 会让每次新增 provider 都误报失败。
+    expect(indexSource).toMatch(/registerJetHubRpc\([\s\S]*?loomy,[\s\S]*?modelAdapters\)/)
   })
 
   /**

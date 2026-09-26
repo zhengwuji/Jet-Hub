@@ -95,6 +95,23 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   **一次性**（每号只能领一次），故必须与每日签到分开成一个独立按钮 ——
   //   混进「一键签到」会导致每天对已领完的账号发 8 个必然 alreadyCompleted 的请求。
   loomy: Object.freeze({ balance: true, dailyCheckin: true, onboardingTasks: true }),
+  // Raccoon Work（商汤小浣熊）：余额 + **一次性**登录奖励。
+  //
+  // 余额：`GET /api/web/points/v1/balance`（**只读**，实测返回
+  //   `{available_points, daily_points, reward_points, topup_points}`）。
+  //
+  // ⚠️ **不登记 `dailyCheckin`，且这不是遗漏** —— 实测「每日 300 积分」是
+  //   **服务端按日自动发放**的（账单里 `biz_type: 'daily_grant'`，
+  //   该账号 13:30 注册、13:31 即到账），**没有可调用的签到端点**。
+  //   把它实现成签到按钮会让用户每次点击都必然失败 ——
+  //   与 CodeArts 早期「对不支持的 provider 无条件发请求」是同一类缺陷。
+  //
+  // 登录奖励：`POST /api/web/desktop/v1/login/points/grant`，3000 分，
+  //   **幂等一次性**（已领过返回 `granted:false` 且账单里能看到上一次记录）。
+  //   语义与 Loomy 的新手任务同构，故登记为 `onboardingTasks` 而**不是**
+  //   `dailyCheckin` —— 后者会让用户以为每天都真的加了额度。
+  //   ⚠️ 该端点**需要** `X-Client-Platform` 头（值见 RaccoonProduct.clientPlatform）。
+  raccoon: Object.freeze({ balance: true, onboardingTasks: true }),
 });
 
 /**

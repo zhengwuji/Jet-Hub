@@ -8,6 +8,7 @@ import { registerQoderLlm } from './qoder-adapter.js'
 import { registerTraeLlm } from './trae-adapter.js'
 import { registerClineLlm } from './cline-adapter.js'
 import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
+import { registerRaccoonLlm } from './raccoon-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
@@ -15,10 +16,12 @@ import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
 import { ClineAuth } from './cline-auth.js'
 import { LoomyAuth } from './loomy-auth.js'
+import { RaccoonAuth } from './raccoon-auth.js'
 import { LOOMY } from './loomy-product.js'
+import { RACCOON } from './raccoon-product.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
-import { registerJetHubRpc } from './jet-hub-rpc.js'
+import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
 import { CODEBUDDY, WORKBUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER } from './qoder-product.js'
@@ -30,6 +33,7 @@ import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
 import type { LoomyCredential } from './loomy.js'
+import type { RaccoonCredential } from './raccoon.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -149,7 +153,7 @@ export function apply(ctx: Context): void {
   // `settingsNamespaceFor()` 解析为本插件条目 id。
   registerProviderSettings(
     ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
-    'llm-qoder', 'llm-trae', 'llm-cline', 'llm-loomy',
+    'llm-qoder', 'llm-trae', 'llm-cline', 'llm-loomy', 'llm-raccoon',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -485,6 +489,76 @@ export function apply(ctx: Context): void {
     product: LOOMY,
   })
 
+  // ===== Raccoon Work（商汤小浣熊）服务 =====
+  // 第九个产品线。登录与 Loomy 同型（**本地页承载**的微信扫码 + 短信双路径），
+  // 但**有** refresh 端点（凭据可静默续期），且客户端可能未安装。
+  //
+  // ⚠️ **不依赖客户端**：官方桌面端靠 `office-raccoon://auth/callback` 自定义协议
+  // 回调，本插件（宿主侧 Node 进程）收不到；故改为「宿主本地生成 code + 自行轮询」，
+  // 完全绕开该回调。凭据存插件自有的 ctx.credentials，不读客户端任何文件。
+  // 见 tests/unit/raccoon-client-independence.spec.ts 的回归防线。
+  //
+  // 服务名由 RaccoonAuth 依 product.id 派生，注册为 ctx.raccoonAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Raccoon 面板。
+  const raccoon = new RaccoonAuth(ctx)
+  const raccoonAdapter = registerRaccoonLlm(ctx, {
+    credentialRef: credentialRef(RACCOON.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 raccoon 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 RACCOON.id 而非字面量：写死字面量在改名/多产品场景下
+      // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(RACCOON.id, '')
+      // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
+      // 联合（历史遗留），与 `RaccoonCredential` 无充分重叠，故经 `unknown` 转换。
+      // 运行时安全性由 provider 过滤保证：查询用 `RACCOON.id`，取到的必是 raccoon 凭据。
+      if (available) return available.credential as unknown as RaccoonCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(RACCOON.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as RaccoonCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ raccoon **有** refresh 端点（与 Loomy 恒 false 不同），这里是真续期。
+      //
+      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      const available = await pool.getAvailableAccount(RACCOON.id, '')
+      if (available) await raccoon.refreshAccountCredential(available.entry.credentialRef)
+      else await raccoon.refresh()
+    },
+    // 远端模型目录：委托给 RaccoonAuth.fetchModels（它负责 Bearer 头与
+    // visible 过滤 + raccoonDisplayName 生成含倍率的展示名）。
+    // 失败时返回空数组，由适配器回退兜底表。
+    fetchRemoteModels: () => raccoon.fetchModels(pool),
+    // 图片字节桥接：按模型能力判定（远端 tags 含 vision）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: RACCOON,
+  })
+
+  // 一次性修复**老账号**的昵称与凭据字段（与上面 WorkBuddy 的启动清理同类）。
+  //
+  // 早期实现把服务端的 `name` 直接当昵称用，而实测它是**自动生成的默认名**
+  //（本机账号是 `RaccoonAva`），注册第二个账号时会重名、无法区分；
+  // 且凭据里没存 `phone`（后来才发现 `user_info.phone` 可用于消歧）。
+  // 光改代码只影响新登录的账号，故这里主动补一次：
+  // 拉 `user_info` 补 `phone`，并用 `buildRaccoonNickname` 重算昵称。
+  //
+  // ⚠️ 幂等 + 失败不阻塞启动（`repairAccountNicknames` 内部逐账号 catch）。
+  void raccoon.repairAccountNicknames(pool, buildRaccoonNickname).then((repaired) => {
+    if (repaired.length > 0) {
+      ctx.logger.info(
+        `[jet-hub] 已修正 ${repaired.length} 个 Raccoon 账号的显示名（追加手机号尾号以便区分）：${repaired.join(', ')}`,
+      )
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[jet-hub] 修正 Raccoon 账号显示名失败：${String(error)}`)
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -514,6 +588,10 @@ export function apply(ctx: Context): void {
     try {
       // ⚠️ Loomy 不可续期：这里只探测**已过期**的账号（见 LoomyAuth.refreshAll）。
       await loomy.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      // raccoon **可续期**：只按 refreshable 过滤，且只续期已过期的账号。
+      await raccoon.refreshAll(pool)
     } catch { /* 静默 */ }
   }
 
@@ -569,8 +647,9 @@ export function apply(ctx: Context): void {
     trae: traeAdapter,
     cline: clineAdapter,
     loomy: loomyAdapter,
+    raccoon: raccoonAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, loomy, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, loomy, raccoon, modelAdapters)
   ctx.provide('accountPool', pool)
 }

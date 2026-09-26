@@ -2605,3 +2605,264 @@ loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
 
 三处已改为**对 provider 数量中立**的断言（`[\w, ]*` / 显式补占位并注明原因）。
 **再加 provider 时请沿用这种写法**，不要写死整串。
+
+⚠️ 加 Raccoon（第 9 个）时**又踩了一次**：`tests/unit/jet-hub-rpc.spec.ts` 里
+三处 `registerJetHubRpc(...)` 调用只补到 `loomy`，于是 `raccoon` 形参收到
+`undefined`、`modelAdapters` **错位**落到 `raccoon` 上 → `model.list` 的
+「关闭的模型仍显示倍率」用例假失败（表现为「展示名退化成裸 id」）。
+`tests/unit/loomy-wiring.spec.ts` 的正则也因写死 `cline, loomy, modelAdapters`
+而假失败。两处都已改为对 provider 数量中立的写法。
+**教训**：新增 provider 后，`grep -n 'registerJetHubRpc(' tests/` 把**每一处**
+调用点都补上占位，别只改报错的那一处。
+
+---
+
+## ⚠️ Raccoon Work（商汤小浣熊）provider：不能凭直觉改的点
+
+`raccoon` 是第 9 个 provider。实现是独立一套 `src/raccoon*.ts`
+（`raccoon-product` / `raccoon` / `raccoon-oauth` / `raccoon-qr` /
+`raccoon-login-page` / `raccoon-credits` / `raccoon-auth` / `raccoon-adapter`），
+适配器复用 `src/openai-compat.ts`（与 qoder / loomy 同形）。
+
+**真实依据**：2026-09-26 对生产端点逐项实测 + 客户端 `app.asar` 逆向
+（工具 `scripts/raccoon-asar.mjs`）。
+
+### 1. 官方登录链路**不可复用**，微信扫码才是可行路径
+
+官方桌面端（`build/electron/main/desktopLogin.js`）走
+「网页授权 → `office-raccoon://auth/callback?code=` →
+`POST /login_with_authorization_code`」。
+
+⚠️ **本插件收不到那个自定义协议回调**（宿主侧 Node 进程），
+且 `/code/authorize` 页面的回调地址**写死在 Web bundle 里**
+（`hl()` 直接 `new URL("office-raccoon://auth/callback")`），改不成 localhost。
+
+**可行路径**：二维码的 `code` 由**客户端本地随机生成**
+（`CryptoJS.lib.WordArray.random(16)` → 32 位 hex），服务端只做轮询查询。
+⚠️ **实测任意自造 code 都被接受**并进入 `pending`：
+
+```
+POST /api/web/auth/v1/login_with_qrcode_code  {"qrcode_code":"1790405291292abcdef123456"}
+→ 200 {"code":0,"message":"success","data":{"status":"pending"}}
+```
+
+状态机：`pending` → `logging`（带 `expired_at`）→ `success`（带
+`access_token`/`refresh_token`）/ `canceled`。轮询间隔 **2000ms**。
+
+### 2. 手机号必须 AES-128-CFB 加密；短信强制阿里云滑块
+
+算法（渲染层模块 68284 的 `yv()`）：
+
+```
+key   = UTF8("senseraccoon2023")  → 16 字节 ⇒ AES-128
+iv    = 随机 16 字节
+mode  = CFB, padding = NoPadding
+输出  = Base64(iv ‖ ciphertext)
+```
+
+⚠️ 必须**显式**写 `aes-128-cfb`：密钥 16 字节，写成 `aes-256-cfb` 会因长度
+不足而抛错（不会自动补齐）。
+⚠️ 填充语义已实测：CFB 是流密码，`setAutoPadding(true/false)` 输出**完全一致**
+（11 字节手机号两种设置下密文都是 11 字节）—— 不必纠结。
+⚠️ 错误码区分：明文/加密错 → `100003 params_encryted_error`；
+加密格式对但号码非法 → `100002 params_invalid_error`。
+⚠️ **`send_sms` 强制阿里云滑块**（`100006 captcha_verify_error`，
+`SceneId=1pkmy0x3`、`prefix=hk1r5l`，脚本
+`https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js`）。
+已核实该脚本**无域名白名单校验**（扫 `document.domain`/`referer`/`origin`/
+`whitelist` 均无命中，唯一 `document.domain` 命中是 core-js 的 iframe polyfill），
+故本地页可以真实加载它。
+
+### 2.5 ⚠️ **1 倍倍率也必须显示**（不要省略成无后缀）
+
+**真实缺陷**（用户报障）：「为什么 Kimi-K3 没有倍率，ide 是 1 倍，1 倍也要显示倍率」。
+
+`raccoonDisplayName` 早期有一条 `if (effective === 1) return name` ——
+按「1 倍是默认，显示属噪声」省略了它。后果是**用户无法区分两种情形**：
+
+- 该模型**本来就是 1 倍**（`billing_effective_multiplier === 1`）；
+- 我们**没取到它的倍率**（字段缺失 → `Number.NaN` → 不加后缀）。
+
+两者在列表里看起来一模一样（都只有模型名）。IDE 的模型选择器对 `Kimi-K3`
+显示「1 倍」，故本插件对齐：**一律显示 `x生效价`**。
+
+⚠️ **`NaN` / 负数仍然不加后缀**（那才是真正「取不到」的情形）——
+不要把这两条合并成一条「1 倍或缺失都不显示」。
+
+⚠️ 同理适用于**兜底表**：`raccoon-product.ts` 里 `sn-kimi-k3` 的
+`name` 必须写 `'Kimi-K3 · x1'`，不能写 `'Kimi-K3'`
+（兜底表与 `raccoonDisplayName` 的输出形态必须一致，否则远端/回退两条路径
+显示不同）。
+
+回归用例：`tests/unit/raccoon.spec.ts` 的「倍率恒为 1 时也要显示」、
+`tests/unit/raccoon-product.spec.ts` 的兜底表断言、
+`tests/e2e/raccoon-probe.e2e.spec.ts` 的远端实测断言。
+
+### 3. ⚠️ 每日 300 积分**没有端点**，不要实现签到按钮
+
+实测「每日积分发放」是**服务端按日自动发放**的（账单
+`biz_type: 'daily_grant'`；该账号 13:30 注册、13:31 即到账）。
+**不存在可调用的签到接口**。
+
+故能力矩阵是 `{ balance: true, onboardingTasks: true }`，
+**不登记 `dailyCheckin`** —— 登记了会让「一键签到」按钮每次点击都必然失败
+（与 CodeArts 早期「对不支持的 provider 无条件发请求」同类）。
+
+⚠️ 同时**不要**把 `login/points/grant` 当作每日签到：它是**幂等一次性**的
+（已领过返回 `granted:false`，账单里能看到上一次记录），
+第二天再点只会继续拿到 `granted:false`，与「签到」文案不符。
+
+⚠️ 三个来源必须分清：
+
+| 来源 | 金额 | 触发 |
+|---|---|---|
+| 新人注册礼包 | 3000 | 注册时服务端自动发放（`biz_type: reward_grant`） |
+| **桌面端登录奖励** | 3000 | `POST /api/web/desktop/v1/login/points/grant` |
+| 每日积分发放 | 300 | **服务端按日自动发放** |
+
+⚠️ 判定「登录奖励是否已领」**不能只按 `biz_type === 'reward_grant'`**
+（注册礼包也是它），必须同时匹配 `event_name === '桌面端登录奖励'`。
+服务端**没有单独的奖励状态端点**，只能查 `GET /points/v1/bills` 明细
+（`fetchRaccoonOnboardingStatus`）。
+
+### 4. 零客户端依赖（硬约束，有测试守住）
+
+⚠️ **运行时绝不读客户端数据**。理由（均为实测）：
+
+1. 客户端**退出时删除** `~/.box-agent/config/auth.json`；
+2. 客户端**每次重启都轮换整组凭据** —— 实测从
+   `%APPDATA%\office-raccoon\Local Storage\leveldb` 提取的 `access_token`
+   在 `exp` **尚未到期**（剩余 5859s）时就被 `401 200003` 拒绝，
+   对照进程启动时间可确认是重启导致的轮换；
+3. 用户可能**根本没装客户端**。
+
+由 `tests/unit/raccoon-client-independence.spec.ts`（**源码扫描式**回归防线）
+守住：禁止 `src/raccoon*.ts` 出现客户端路径（`raccoon-ai` / `office-raccoon` /
+`box-agent`）、环境变量（`APPDATA`/`LOCALAPPDATA`）、文件读取
+（`readFileSync`/`node:fs`）、以及 `leveldb`/`sqlite` 引用。
+
+⚠️ **为什么用源码扫描而不是 mock**：这类约束的失效方式恰恰是
+「某次改动悄悄加了一个 `readFileSync` 兜底」，mock 测不出来。
+
+⚠️ 注释里解释「为何不这么做」是允许且鼓励的（扫描前会剥掉注释行）。
+
+客户端安装目录仅用于**逆向取证**与**构建期图标提取**，都不是运行时依赖：
+
+- `scripts/raccoon-asar.mjs`（只读探查，协议升级时用它重新核对）
+- `scripts/extract-raccoon-icon.mjs`（**不入库**，见下）
+
+### 5. 二维码是自己实现的，且**必须编码成真 PNG**
+
+仓库**没有任何 QR 依赖**（已核实 `node_modules` 与 DSH 的 `node_modules`），
+故 `src/raccoon-qr.ts` 自行实现（byte 模式 + 纠错等级 M + 版本 1–10，
+约 550 行，含 GF(256) RS 纠错、zigzag 放置、8 掩码评分）。
+
+⚠️ **两条真实教训**：
+
+1. **结构测试全过 ≠ 二维码可用**。早期 14 个用例（finder 位置、尺寸、
+   确定性）全部通过，但实际扫不出来。**判据必须是「与独立实现交叉验证」
+   或「真实解码器能解出」** —— 本次用 Python `qrcode` + `segno` 双实现
+   交叉确认，再用 **OpenCV `QRCodeDetector` 真实解码**验证
+   （4 个用例含 144 字节登录 URL 全部还原正确）。
+2. **登录页内联 SVG 时绝不能转义引号**。`renderRaccoonLoginPage` 早期把
+   SVG 的 `"` 转成 `&quot;` 再注入 HTML，浏览器把它当**文本节点**而不渲染
+   —— 用户报障「弹出页面二维码没显示出来」。
+   ⚠️ 而当时的断言 `toContain('viewBox')` 在**有 bug 时也通过**
+   （`viewBox=&quot;0 0 …&quot;` 同样含子串 `viewBox`），故缺陷从未被抓住。
+   现断言要求「无 `&quot;`」+「合法 `<svg …>` 标签」+「path 段数 > 100」。
+
+⚠️ `buildQrMatrix` 的 `options.mask` 参数**仅用于诊断与交叉验证**
+（生产路径不传，走自动评分）—— 但它必须真的生效，
+`tests/unit/raccoon-qr.spec.ts` 锁死了「8 个掩码产出各不相同」。
+
+### 6. 过期判定必须回退解析 JWT（修过的真实缺陷）
+
+`raccoonCredentialExpiresAtMs` 取值优先级是
+**`expires_at` → JWT 的 `exp`**。
+
+⚠️ 早期只读 `expires_at`，而它是**可选字段**（老凭据/手工导入可能没有）
+→ 过期判定**恒为 false** → `refreshAll` 永远跳过这些账号
+→ 表现为「凭据悄悄过期、续期从不触发」，与「续期按 `enabled` 过滤」
+那次缺陷是同一类（**静默失效，无任何报错**）。
+`tests/unit/raccoon.spec.ts` 有针对性回归。
+
+### 7. 图标：从官方 1024×1024 提取，且**必须编码成 PNG**
+
+来源 `C:\Program Files\raccoon-ai\resources\assets\icon.png`（1024×1024）。
+
+⚠️ **不用 exe 内嵌图标**：实测 `ExtractAssociatedIcon` 与
+`new Icon(exe, 64, 64)` 都只拿到 **32×32**（资源组里没有更大尺寸），
+缩到 20×20 会糊。
+
+⚠️ **真实缺陷**：`scripts/extract-raccoon-icon.mjs` 起初把**裸 RGBA 缓冲**
+直接 base64 当 PNG 用 —— 产出字符串长度正常（12310 字符）、
+`toContain('data:image/png;base64')` 也通过，但**不是合法 PNG**，
+浏览器渲染不出来（图标位置一片空白）。改用 `encodePng()` 编码
+（base64 从 12310 降到 2978）。
+判据见 `tests/unit/raccoon-client-panel.spec.ts`：
+**PNG 签名 `89504e470d0a1a0a` + IHDR 尺寸 + 非全透明**。
+⚠️ 注意：该图标的 base64 **以大片 `AAAA` 开头**（顶部透明行全 0 字节），
+目视很像空图但**数据正常** —— 故判据不能靠目视。
+
+### 8. Raccoon-Auto 不是远端模型，**不要暴露**
+
+它是客户端 i18n 条目（`modelPicker.auto` = `"Raccoon-Auto"`，
+`modelPicker.autoMultiplier` = `"1 倍"`）渲染的**「自动选模」入口**，
+**不在 `model_catalog` 里** —— 直接发给 `chat/completions` 会 404。
+
+其真实语义由客户端 `resolveAutoCatalogModel()` 实现：按消息内容正则打标
+（`TASK_TAG_PATTERNS` 识别 vision/code/analysis/office…）后按
+`ability_level` 与 `context_window` 从候选池选真实模型；
+候选池判据 `isTemporaryAutoRoutingModel()` 认 `raccoon-*` 前缀
+或**含 `deepseek`**，故 `sn-deepseek-v4-1-flash` 也在其中。
+
+**不实现的三条理由**：① DSH 的模型选择是**会话级固定**的，而 IDE 是
+**按每条消息动态**选模，语义不匹配；② 复现需移植整张正则表，且选出的模型
+**不可预测**、难排查；③ `ability_level`/`tags` 是客户端 UI 偏好，
+不构成服务端契约，随时可能变。
+
+**替代**：用户可直接选 `sn-deepseek-v4-1-flash`（`ability_level: 3`、
+带 `auto` 标签，即复杂任务下自动选模最可能选中的那个）。
+
+### 9. 工具调用：`tools` 必须真下发（Qoder/TRAE 的同型坑）
+
+⚠️ 适配器把 `options.tools` 映射成 OpenAI 的
+`{type:'function', function:{name, description?, parameters?}}`
+写入请求体**顶层 `tools`**。
+
+⚠️ **判据是「响应里有结构化 `tool_calls`」**，不是「模型在正文里说它想调用
+工具」—— 后者正是 Qoder（WASM 把 `tools` 硬编码 `[]`）与 TRAE 踩过的形态：
+模型拿不到函数 schema，只能用**正文里的 XML 文本**臆造，harness 认不出 → 任务终止。
+
+⚠️ **间接证据（不是直接验证）**：桌面端 `model-profiles.json` 指向本端点，
+且其背后的 agent 运行时 `box-agent-acp.exe` 内含 `tool_choice`（37 次命中）与
+`function_call`（15 次命中）及完整 `openai.types.*` 类型表
+—— 说明它构造的是带 tools 的 OpenAI 请求体。
+
+⚠️ **本项的正式判据在 `pnpm test:e2e:raccoon-tools`**（双重闸门，
+发真实请求验证）。实现期因客户端凭据被轮换而**未能完成真机实测**
+（见设计文档 §12）—— 若该探针报「未返回 tool_calls」，
+**不要**改用「system prompt 注入 + 正文 XML 解析」的回退方案。
+
+### 10. 短信登录的 `nation_code` 初版只做 86
+
+客户端下拉有 86/852/853/81。插件初版**只做 86（大陆）**，
+因为 `100002 params_invalid_error: param phone invalid` **无法区分**
+「号码格式错」与「该区号不支持」，不做未验证的猜测。
+
+### e2e 探针
+
+```
+pnpm test:e2e:raccoon        # 只读：凭据/模型目录/倍率/积分余额/账单，零消耗
+pnpm test:e2e:raccoon-chat   # ⚠️ 发推理：标准 OpenAI SSE + reasoning_content 形态
+pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：**tools 是否被接受**（第 9 条的正式判据）
+```
+
+### ⚠️ 报错文案：`400` 与 `401` 的语义
+
+- `401 200003 authorization_verify_error` —— 凭据失效。
+  ⚠️ 排查时**先确认客户端是否刚重启过**：那会轮换 leveldb 里的凭据，
+  让人误以为是端点或协议问题。
+- `400 100006 captcha_verify_error` —— 滑块过期，需重新过验证。
+- `400 100002 params_invalid_error` —— 手机号格式或验证码错。
+- `400 100003 params_encryted_error` —— 手机号**未加密**或加密格式不对。
