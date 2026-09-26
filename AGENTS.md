@@ -8,7 +8,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`trae`（字节跳动 **TRAE**）与 `cline`（**Cline** 桌面端 / Cline API）六个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）与 `loomy`（讯飞 **Loomy** 办公助手）七个 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -2472,3 +2472,136 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 `checkinHeaders`（`src/credits.ts`）用 `product.apiDomain` 构造 `X-Domain`，**不优先用 `credential.domain`**。凭据里的 domain 是登录时的快照，跨产品迁移后会留下旧值（早期 workbuddy 指向中国版），跟着它走会让请求的 baseURL 与身份标识自相矛盾。
 
 LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束是「`apiBase` 与 `portalBase` 都是编译期常量，不从凭据推断」。
+
+## ⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点
+
+`loomy` 是第 8 个 provider，与其余七者**都不同源**。实现是独立一套
+`src/loomy*.ts`（`loomy-product` / `loomy` / `loomy-sign` / `loomy-oauth` /
+`loomy-onboarding` / `loomy-credits` / `loomy-auth` / `loomy-adapter`），
+适配器复用 `src/openai-compat.ts`（实测是标准 OpenAI 兼容 + 标准 SSE，与 qoder 同形）。
+
+**真实依据**：2026-09-26 用本机登录态对生产端点逐项实测。
+以下五条都有实测证据，**不要按其余 provider 的直觉改**：
+
+1. **两套认证头（最容易踩）**：`/chat/completions` 只认
+   `Authorization: Bearer <session>`；`/models`、`/points/*`、
+   `/onboarding/*` 只认 `token: <session>`。带错的会得到 HTTP 200 +
+   `{"code":"100002","desc":"缺少 token"}` —— 看着像「登录失效」，
+   实为头用错了。实测交叉矩阵：
+
+   ```
+   GET /points/records  + token  → code=000000
+   GET /points/records  + Bearer → code=100002 (缺少 token)
+   ```
+
+   `loomyChatHeaders()` 两个都发（官方 `llm-completion.js:149-151` 也如此）。
+   ⚠️ `Bearer ` 前缀**必需**：无前缀同样回 `100002`。
+
+2. **没有 refresh 端点，`isLoomyRefreshable()` 恒 `false`**。
+   `session` 是登录时声明 `expire: 1209600`（14 天）得来的，凭据里**没有**
+   `refresh_token`。故 `refresh()` / `refreshAccountCredential()` 是**有效性探测**
+   而非续期（探测走 `GET /points/records?pageSize=1`，只读零消耗），
+   `refreshAll()` 只探测**已过期**的账号（避免每 30 分钟白发请求）。
+   ⚠️ **不要**为了让 `refreshAll` 有活干而把 `refreshable` 改成 true ——
+   那会让 UI 假装能续期，实际每次探测都失败。
+   ⚠️ `scheduleRefresh()` / `stop()` 是**有意为之的空实现**：`RefreshScheduler`
+   的意义是「过期前 1 小时自动续期」，Loomy 无法续期，武装它只会得到
+   「触发 → 探测 → 必然抛错 → 停止」的空转。保留空实现是**契约要求**
+   （`index.ts` 对全部 provider 统一调用）。
+
+3. **新手任务服务端不校验前置行为**：直接 `POST /onboarding/tasks/complete`
+   （body 仅 `{"key":...}`）即可拿满 10000 分，**零 token 消耗**。
+   8 个任务：`first_message` 500 / `pick_skill` 1000 / `generate_ppt` 1500 /
+   `set_schedule` 1000 / `install_skill` 1500 / `configure_remote` 1000 /
+   `create_soul` 1500 / `share_soul` 2000。
+   这与 workbuddy2api-panel 的做法**相反**（那边要模拟真实行为、
+   上报埋点事件链）。**不要**「照 workbuddy 那样」去发对话/建定时任务 ——
+   那是白花积分。若将来服务端加了校验，再走「用 `qwen3.8-flash`
+   （x0.8，全表最便宜）模拟真实动作」的降级路径。
+   ⚠️ 幂等判据是响应体的 `alreadyCompleted`，**不是** HTTP 码、**不是** `code`。
+   ⚠️ **不采信服务端 `earned`**，按本地 `LOOMY_TASK_POINTS` 现算
+   （官方 `onboarding-service.js:177-183` 明说不信任）。
+
+4. **倍率在 `name` 字符串里**，没有独立字段，且三种括号风格混用
+   （`MiniMax M3 （x4.0）` 全角带空格 / `Qwen 3.8 Max (x12.0)` 半角 /
+   `GLM 5.3 Flash(x0.8)` 半角无空格）。故用 `loomyDisplayName()` 规范化。
+   ⚠️ `splitLoomyRate()` **必须同时认两种形态**：远端原值（末尾括号）
+   **和**已规范化的 `{name} · x{n}` —— 兜底表（`loomy-product.ts`）存的就是后者。
+   早期只认括号形态，于是 `resolveModel` 无法从兜底表名去掉倍率，
+   返回 `Spark X2.5 · x0.1` 而非 `Spark X2.5`（实现时暴露的真实缺陷）。
+   该函数**幂等**，单测锁死。
+   ⚠️ chat 模型过滤判据是 **`type === 'chat'`**，不能看 `input_modalities`
+   —— 5 个 chat 模型的输入模态含 `image`（能看图），不是生图模型。
+
+5. **积分是两个池**：永久（`balance`）与每日赠送（`dailyBalance`）分开计算。
+   每日额度由 `POST /points/first-login` 触发（官方登录后立即调用），
+   语义是**触发额度重置**而非「+5000 积分」：
+   实测 `dailyBalance = dailyQuota - dailyConsumed`（4992 = 5000 - 8），
+   消耗后不回补。故「一键签到」用 `alreadyProcessed` 判幂等并映射成
+   `already-claimed`，**不是** `claimed`。
+   ⚠️ **余额查询必须走只读的 `GET /points/records`**，不能用 `first-login`
+   —— 后者是**写**端点，在「打开面板」这种高频路径上调用会意外触发签到。
+   ⚠️ `dailyQuota` **只在 `first-login` 响应里**，`points/records` 不返回它，
+   故未签到时该字段缺省 —— **不要硬编码 5000**（额度可能随活动变化）。
+
+### 短信登录：唯一没有 loginUrl 的 provider
+
+其余 7 个都是「`account.create` 返回 `loginUrl` → 前端 `window.open` →
+轮询 `login.poll`」。短信登录**没有 URL 可打开**，故扩展了登录契约：
+
+- `RpcCreateAccountRequest` 加可选 `phone`
+- `RpcCreateAccountResponse` 加可选 `loginMode: 'url' | 'sms'`
+  ⚠️ **缺省必须视为 `'url'`** —— 既有 7 个 provider 不传该字段，
+  行为必须逐字节不变
+- 新增 `login.sendSms` / `login.submitSms` 两个端点
+
+⚠️ **msgid 用内存暂存表**（`pendingSmsMsgid`），**不写进 `ctx.credentials`**
+—— 它是一次性中间态（5 分钟有效），写凭据会污染命名空间，且它不含任何秘密。
+
+⚠️ **短信登录失败不删占位账号条目**：用户多半只是验证码输错，保留条目让他能重试。
+
+⚠️ **前端短信分支绝不能回退到 `window.location.href`** —— 那会把整个设置页
+导航走（与 `createAccount` 的既有约定同因，见「+ 新建账号」章节）。
+
+### 能力矩阵第三项：`onboardingTasks`
+
+```js
+loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
+```
+
+⚠️ `onboardingTasks` 与 `dailyCheckin` **语义独立，不能互相推断**：
+前者**一次性**（每号只能领一次 10000 分），后者**每天**有收益。
+故新手任务有独立按钮与独立端点（`onboarding.status` / `onboarding.claim`），
+**不参与**页头「一键签到」遍历 —— 否则每天会对已领完的账号
+发 8 个必然 `alreadyCompleted` 的请求。
+
+⚠️ 客户端**不调用** `onboarding.status`：`onboarding.claim` 的响应已带回
+`earned`/`total`/逐任务明细，足以渲染进度，再发一次只读查询纯属多余请求。
+
+### 账号卡片：两个积分池分开显示
+
+`CreditBalanceRow` 对「恰好两个包且名字为 `永久积分` / `每日赠送`」的形态
+显示 `永久 15000 · 每日 4992`；其余 provider 的多个同类资源包仍显示
+「N/M 个资源包有效」。两种形态互斥（`isLoomyTwoPools`）。
+
+### ⚠️ AccessKey 明文入库（用户明确同意）
+
+`src/loomy-product.ts` 内含从 Loomy 客户端解密得到的讯飞账号 AccessKey。
+它**只用于讯飞账号端点**（`account.xfinfr.com` 的登录签名），与业务/推理端点无关
+（后者用用户登录后的 `session`），故泄露不涉及任何用户数据。
+
+⚠️ **具体值、解密算法与口令、脚本清单见不入库的
+`docs/loomy-protocol-notes.md`** —— 不要把它们写进 README / AGENTS.md。
+
+### 新增 provider 时的位置参数陷阱（本次踩过）
+
+`registerJetHubRpc` 与 `registerJetHubEndpoints` 的 auth 实例是**位置参数**。
+新增 Loomy 时，三个既有测试因把参数列表写死而假失败：
+
+- `tests/unit/qoder-wiring.spec.ts`（正则只允许一个 provider 插在 trae 后）
+- `tests/unit/cline-adapter.spec.ts`（`toContain` 写死整串）
+- `tests/unit/jet-hub-rpc.spec.ts`（9 个 `{}` 占位，新签名要 10 个 →
+  `modelAdapters` 错位落到 `loomy` 形参上）
+
+三处已改为**对 provider 数量中立**的断言（`[\w, ]*` / 显式补占位并注明原因）。
+**再加 provider 时请沿用这种写法**，不要写死整串。

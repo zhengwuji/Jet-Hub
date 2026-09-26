@@ -84,6 +84,17 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // 这比「某次调用没看到」强，但仍不等于「永远不存在」—— 若将来 Cline 增加
   // 签到，需按 Qoder 那次教训重新采集（见 AGENTS.md 的对应章节）。
   cline: Object.freeze({ balance: true, dailyCheckin: false }),
+  // Loomy（讯飞）：三项能力齐全，且是**唯一**有第三项（新手任务）的渠道。
+  //
+  // 余额：`GET /api/v1/points/records`（**只读**）—— 刻意不用 `first-login`，
+  //   那是写端点，在面板挂载这种高频路径上调用会意外触发签到。
+  // 每日签到：`POST /api/v1/points/first-login`。⚠️ 语义是「触发每日赠送额度」
+  //   而不是「+5000 积分」：实测 `dailyBalance = dailyQuota - dailyConsumed`
+  //   （4992 = 5000 - 8），消耗后不回补。
+  // 新手任务：`GET/POST /api/v1/onboarding/tasks*`，8 个任务合计 **10000 分**，
+  //   **一次性**（每号只能领一次），故必须与每日签到分开成一个独立按钮 ——
+  //   混进「一键签到」会导致每天对已领完的账号发 8 个必然 alreadyCompleted 的请求。
+  loomy: Object.freeze({ balance: true, dailyCheckin: true, onboardingTasks: true }),
 });
 
 /**
@@ -121,4 +132,28 @@ export function supportsDailyCheckin(provider) {
  */
 export function checkinProviders() {
   return Object.keys(CREDITS_CAPABILITIES).filter(supportsDailyCheckin);
+}
+
+/**
+ * 该 provider 是否支持「新手任务」一次性领取。
+ *
+ * ⚠️ 与 {@link supportsDailyCheckin} **语义独立，不能互相推断**：
+ * - `dailyCheckin`：**每天**有收益（每日额度刷新）
+ * - `onboardingTasks`：**一次性**（每号只能领一次固定总额）
+ *
+ * 目前只有 Loomy 具备后者。为 false 时面板**不得**渲染「领取新手任务」按钮，
+ * 也不得发起 `onboarding.status` / `onboarding.claim`。
+ */
+export function supportsOnboardingTasks(provider) {
+  return CREDITS_CAPABILITIES[provider]?.onboardingTasks === true;
+}
+
+/**
+ * 全部**支持新手任务**的渠道 id 列表。
+ *
+ * 供「一键领取全部渠道新手任务」之类的批量入口使用（当前未实现，
+ * 保留以便扩展）。**必须从能力表推导**，理由同 {@link checkinProviders}。
+ */
+export function onboardingTaskProviders() {
+  return Object.keys(CREDITS_CAPABILITIES).filter(supportsOnboardingTasks);
 }

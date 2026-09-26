@@ -22,6 +22,10 @@ import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { QoderAuth } from './qoder-auth.js'
 import type { TraeAuth } from './trae-auth.js'
 import type { ClineAuth } from './cline-auth.js'
+import { LOOMY } from './loomy-product.js'
+import type { LoomyAuth } from './loomy-auth.js'
+import type { LoomyCredential } from './loomy.js'
+import { LOOMY_TASK_POINTS, LOOMY_TASK_TITLES } from './loomy-onboarding.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { QODER } from './qoder-product.js'
 import { TRAE } from './trae-product.js'
@@ -104,6 +108,15 @@ import type {
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalancesResponse,
+  RpcCreditsClaimAccountResult,
+  RpcSendSmsRequest,
+  RpcSendSmsResponse,
+  RpcSubmitSmsRequest,
+  RpcSubmitSmsResponse,
+  RpcOnboardingStatusRequest,
+  RpcOnboardingStatusResponse,
+  RpcOnboardingClaimRequest,
+  RpcOnboardingClaimResponse,
   RpcModelListRequest,
   RpcModelListResponse,
   RpcModelSetDisabledRequest,
@@ -543,6 +556,7 @@ export function registerJetHubRpc(
   qoder: QoderAuth,
   trae: TraeAuth,
   cline: ClineAuth,
+  loomy: LoomyAuth,
   /**
    * provider → 适配器实例（可选）。
    *
@@ -554,7 +568,8 @@ export function registerJetHubRpc(
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
     registerJetHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai, qoder, trae, cline, modelAdapters,
+      connectionCtx as Context, pool, codearts, buddy, workbuddy, lobsterai,
+      qoder, trae, cline, loomy, modelAdapters,
     )
   })
 }
@@ -610,6 +625,7 @@ function registerJetHubEndpoints(
   qoder: QoderAuth,
   trae: TraeAuth,
   cline: ClineAuth,
+  loomy: LoomyAuth,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -618,6 +634,15 @@ function registerJetHubEndpoints(
     ctx.logger.warn('[jet-hub] connection.fetch not available, RPC endpoints not registered')
     return
   }
+
+  /**
+   * Loomy 短信登录的中间状态（账号 id → { phone, msgid }）。
+   *
+   * 为什么放内存而不是凭据存储：msgid 是**一次性的中间态**（5 分钟有效），
+   * 登录完成后即无意义；写进 `ctx.credentials` 会污染凭据命名空间，
+   * 且它不含任何秘密（不能用于认证）。
+   */
+  const pendingSmsMsgid = new Map<string, { phone: string; msgid: string }>()
 
   connection.fetch.register({
     path: JET_HUB_API_PATH,
@@ -904,6 +929,61 @@ function registerJetHubEndpoints(
             void pool.removeAccount(id).catch(() => {})
           })
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
+        } else if (provider === LOOMY.id) {
+          // Loomy 走**微信扫码**登录（与其余 provider 同为「两步式」）：
+          // 起本地服务器承载弹窗页（内联二维码 + 轮询 + 首次绑手机号表单），
+          // 立即返回 `loginUrl` 让前端 `window.open`。
+          //
+          // ⚠️ **真实缺陷**（用户报障「新建账号失败：Loomy 短信登录需要手机号」）：
+          // 早期实现要求 `account.create` **必须带 phone**，但表单要等它返回
+          // `loginMode:'sms'` 才渲染 —— 用户根本没机会输入手机号，直接报错，
+          // 表单永远出不来。**顺序死锁**。改用微信扫码后此矛盾消失：
+          // 手机号只在「首次扫码」时由弹窗页自己收集。
+          //
+          // ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到该账号；
+          // 登录成功后再回填昵称/有效期。
+          await pool.addAccount({
+            id,
+            provider: LOOMY.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let started
+          try {
+            started = await loomy.startWechatLogin()
+          } catch (error) {
+            // 取二维码 uuid 失败（网络/页面结构变化）：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 Loomy 微信登录（获取二维码失败）：${reason}`)
+          }
+
+          started.result.then(async (login) => {
+            const result = await loomy.persistWechatLogin(login, { refName })
+            const credential = JSON.parse(result.access) as LoomyCredential
+            await pool.updateAccount(id, {
+              // 用手机号尾号让多账号可区分（Loomy 无独立昵称接口；
+              // 微信昵称可能有，优先用它）。
+              nickname: login.nickname !== undefined && login.nickname.length > 0
+                ? login.nickname
+                : credential.phone.length >= 4
+                  ? `Loomy ${credential.phone.slice(-4)}`
+                  : id,
+              expiresAt: result.expires > 0 ? result.expires : undefined,
+              // ⚠️ 恒 false：Loomy 无续期端点。
+              refreshable: false,
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${LOOMY.id} wechat login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -994,6 +1074,11 @@ function registerJetHubEndpoints(
             case CLINE.id:
               await cline.refreshAccountCredential(entry.credentialRef)
               break
+            case LOOMY.id:
+              // ⚠️ Loomy **没有 refresh 端点**：这里只能做**有效性探测**，
+              // 失效时抛「请重新登录」。见 LoomyAuth.refreshAccountCredential。
+              await loomy.refreshAccountCredential(entry.credentialRef)
+              break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
           }
@@ -1019,6 +1104,152 @@ function registerJetHubEndpoints(
         const resolved = await ctx.credentials.resolve(ref)
         if (!resolved) return { ok: true, value: { done: false } }
         return { ok: true, value: { done: true, success: true } }
+      }
+
+      /**
+       * 下发短信验证码（**仅 Loomy，备用登录路径**）。
+       *
+       * ⚠️ 主路径是**微信扫码**（`account.create` 返回本地弹窗页）。
+       * 本端点与 `login.submitSms` 保留为**可独立调用的备用路径** ——
+       * 不依赖 `account.create` 的中间态（早期版本从内存表取手机号，
+       * 改微信登录后那张表不再被填充，会退化成坏死的死代码）。
+       *
+       * 手机号由**本端点自己接收**，故可脱离 `account.create` 单独使用。
+       */
+      case 'login.sendSms': {
+        const req = payload as RpcSendSmsRequest
+        if (req.provider !== LOOMY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        }
+        const phone = typeof req.phone === 'string' ? req.phone.trim() : ''
+        if (!/^1[3-9]\d{9}$/.test(phone)) {
+          return { ok: false, error: { code: 'bad-request', message: '需要 11 位有效手机号（phone）' } }
+        }
+        const msgid = await loomy.sendSmsCode(phone)
+        // 暂存在内存，供 submitSms 取用（一次性中间态，不写凭据存储）。
+        pendingSmsMsgid.set(req.accountId, { phone, msgid })
+        return { ok: true, value: { msgid } satisfies RpcSendSmsResponse }
+      }
+
+      /**
+       * 提交短信验证码完成登录（**仅 Loomy，备用登录路径**）。
+       *
+       * 成功后：写凭据 → 回填账号昵称/有效期 → 清理中间态。
+       */
+      case 'login.submitSms': {
+        const req = payload as RpcSubmitSmsRequest
+        if (req.provider !== LOOMY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        }
+        const pending = pendingSmsMsgid.get(req.accountId)
+        if (pending === undefined || pending.msgid.length === 0) {
+          return {
+            ok: true,
+            value: { done: false, error: '请先发送验证码' } satisfies RpcSubmitSmsResponse,
+          }
+        }
+        const account = pool.findAccount(req.accountId)
+        if (account === undefined) {
+          return {
+            ok: true,
+            value: { done: false, error: '账号不存在（可能已被删除）' } satisfies RpcSubmitSmsResponse,
+          }
+        }
+        try {
+          const result = await loomy.loginWithSmsCode(pending.phone, req.code, pending.msgid, {
+            refName: account.credentialRef,
+          })
+          const credential = JSON.parse(result.access) as LoomyCredential
+          await pool.updateAccount(req.accountId, {
+            // Loomy 无昵称接口，用手机号尾号让多账号可区分（比 `loomy-xxxx` 有用）。
+            nickname: credential.phone.length >= 4
+              ? `Loomy ${credential.phone.slice(-4)}`
+              : req.accountId,
+            expiresAt: result.expires > 0 ? result.expires : undefined,
+            // ⚠️ 恒 false：Loomy 无续期端点。
+            refreshable: false,
+          })
+          pendingSmsMsgid.delete(req.accountId)
+          return { ok: true, value: { done: true } satisfies RpcSubmitSmsResponse }
+        } catch (error) {
+          // ⚠️ 登录失败**不删除占位条目**：用户可能只是验证码输错，
+          // 保留条目让他能重试（`login.sendSms` 会重新发码）。
+          return {
+            ok: true,
+            value: {
+              done: false,
+              error: error instanceof Error ? error.message : String(error),
+            } satisfies RpcSubmitSmsResponse,
+          }
+        }
+      }
+
+      /**
+       * 查询新手任务状态（**仅 Loomy**，只读）。
+       *
+       * ⚠️ 只读：**不得**在此触发任何 `complete`（面板挂载时会调用它）。
+       */
+      case 'onboarding.status': {
+        const req = payload as RpcOnboardingStatusRequest
+        if (req.provider !== LOOMY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        }
+        const account = pool.findAccount(req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '账号不存在' } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (!resolved) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据未配置' } }
+        }
+        const credential = JSON.parse(resolved.value) as LoomyCredential
+        const state = await loomy.fetchOnboardingTasks(credential)
+        return {
+          ok: true,
+          value: {
+            tasks: state.tasks,
+            earned: state.earned,
+            total: state.total,
+            titles: { ...LOOMY_TASK_TITLES },
+            points: { ...LOOMY_TASK_POINTS },
+          } satisfies RpcOnboardingStatusResponse,
+        }
+      }
+
+      /**
+       * 领取全部新手任务（**仅 Loomy**，一次性）。
+       *
+       * ⚠️ 这是**写**操作，且**每号只能领一次**（10000 分）——
+       * 与 `credits.claimAll`（每日签到）语义完全不同，故独立端点。
+       */
+      case 'onboarding.claim': {
+        const req = payload as RpcOnboardingClaimRequest
+        if (req.provider !== LOOMY.id) {
+          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        }
+        const account = pool.findAccount(req.accountId)
+        if (account === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: '账号不存在' } }
+        }
+        const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+        if (!resolved) {
+          return { ok: false, error: { code: 'bad-request', message: '凭据未配置' } }
+        }
+        const credential = JSON.parse(resolved.value) as LoomyCredential
+        const result = await loomy.claimOnboardingTasks(credential)
+        return {
+          ok: true,
+          value: {
+            claimed: result.claimed.map((item) => ({
+              key: item.key,
+              title: LOOMY_TASK_TITLES[item.key] ?? item.key,
+              points: item.points,
+            })),
+            skipped: result.skipped,
+            earned: result.earned,
+            total: result.total,
+          } satisfies RpcOnboardingClaimResponse,
+        }
       }
 
       // ── 限流标记：重测（发真实请求验证）──
@@ -1122,6 +1353,18 @@ function registerJetHubEndpoints(
             } satisfies RpcCreditsStatusResponse,
           }
         }
+        if (req.provider === LOOMY.id) {
+          // Loomy 没有独立的「签到状态」端点：每日额度由 `POST /points/first-login`
+          // 触发，其响应自带 `alreadyProcessed`。故与 LobsterAI/CodeArts 同样
+          // 如实返回 null，由 claimAll 内部处理幂等。
+          const accounts = await pool.listAccounts(req.provider)
+          return {
+            ok: true,
+            value: {
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
+            } satisfies RpcCreditsStatusResponse,
+          }
+        }
         const product = productById(req.provider)
         if (product === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -1204,6 +1447,42 @@ function registerJetHubEndpoints(
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
+        if (req.provider === LOOMY.id) {
+          // Loomy 的「签到」= `POST /points/first-login`（触发每日赠送额度）。
+          // ⚠️ 语义**不是**「+5000 积分」：`dailyBalance = dailyQuota - dailyConsumed`，
+          // 消耗后不回补。文案由 claimLoomyDailyQuota 的 already-claimed 表达。
+          // 领取流程自带幂等判据（`alreadyProcessed`），故不做额外预检。
+          const values: RpcCreditsClaimAccountResult[] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (!resolved) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                outcome: { kind: 'failed', code: -1, message: '凭据未配置' },
+              })
+              continue
+            }
+            let credential: LoomyCredential
+            try {
+              credential = JSON.parse(resolved.value) as LoomyCredential
+            } catch {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                outcome: { kind: 'failed', code: -1, message: '凭据解析失败' },
+              })
+              continue
+            }
+            const outcome = await loomy.claimDailyQuota(credential)
+            values.push({ accountId: account.id, nickname: account.nickname, outcome })
+          }
+          return {
+            ok: true,
+            value: {
+              summary: computeClaimSummary(values.map((v) => v.outcome)),
+              results: values,
+            } satisfies RpcCreditsClaimAllResponse,
+          }
         }
         if (req.provider === CLINE.id) {
           // Cline **没有签到端点**（见 src/cline-credits.ts 的模块注释：
@@ -1362,6 +1641,41 @@ function registerJetHubEndpoints(
               ...result.balance === null
                 ? { error: result.error ?? '积分查询失败（凭据失效或响应异常）' }
                 : {},
+            })
+          }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === LOOMY.id) {
+          // 余额来自 `GET /points/records`（**只读**，无副作用）。
+          // ⚠️ 刻意不用 `first-login`：那是**写**端点，在「打开面板」这种
+          // 高频路径上调用会意外触发签到。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            if (!resolved) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置',
+              })
+              continue
+            }
+            let credential: LoomyCredential
+            try {
+              credential = JSON.parse(resolved.value) as LoomyCredential
+            } catch {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据解析失败',
+              })
+              continue
+            }
+            const balance = await loomy.fetchCreditBalance(credential)
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              // 查不到时带原因（不显示成 0，0 是「已用光」的语义）。
+              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }

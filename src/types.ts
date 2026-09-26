@@ -103,10 +103,33 @@ export interface RpcListAccountsResponse {
 
 export interface RpcCreateAccountRequest {
   provider: string
+  /**
+   * 手机号（**仅 Loomy 需要**）。
+   *
+   * 其余 7 个 provider 是「返回 loginUrl 让用户在浏览器里授权」，
+   * 不需要手机号；Loomy 走**短信验证码**登录，故须由前端先收集。
+   */
+  phone?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string
+  /**
+   * 登录页地址。
+   *
+   * ⚠️ `loginMode === 'sms'` 时为**空串** —— 短信登录没有可打开的 URL，
+   * 前端必须据此渲染验证码表单而不是弹窗。
+   */
   loginUrl: string
+  /**
+   * 登录交互形态。
+   *
+   * - `'url'`（或缺省）：前端 `window.open(loginUrl)` 并轮询 `login.poll`。
+   * - `'sms'`：前端渲染手机号 + 验证码表单，走 `login.sendSms` / `login.submitSms`。
+   *
+   * ⚠️ **缺省必须视为 `'url'`**：既有 7 个 provider 不传该字段，
+   * 行为必须逐字节不变。
+   */
+  loginMode?: 'url' | 'sms'
 }
 
 export interface RpcPollLoginRequest {
@@ -296,6 +319,93 @@ export interface RpcCreditsBalanceAccount {
 /** RPC: 查询积分余额响应 */
 export interface RpcCreditsBalancesResponse {
   accounts: RpcCreditsBalanceAccount[]
+}
+
+/**
+ * ========================================
+ * 短信验证码登录（仅 Loomy）
+ * ========================================
+ *
+ * Loomy 是唯一**没有 loginUrl** 的 provider（短信登录），故不能复用
+ * `login.poll` 那套轮询流程，需要两个专用端点。
+ */
+
+/** RPC: 为某个待登录账号下发短信验证码（Loomy **备用**登录路径）。 */
+export interface RpcSendSmsRequest {
+  accountId: string
+  provider: string
+  /**
+   * 手机号。
+   *
+   * ⚠️ **由本请求自己携带**，不从 `account.create` 的中间态取 ——
+   * 主路径是**微信扫码**，`account.create` 不再收集手机号
+   * （那正是「新建账号失败：Loomy 短信登录需要手机号」那个**顺序死锁**
+   * 缺陷的成因：表单要等 `account.create` 返回才渲染，却要求它先有手机号）。
+   */
+  phone: string
+}
+/** RPC: 下发短信验证码的响应。 */
+export interface RpcSendSmsResponse {
+  /** 服务端返回的 msgid（服务端已缓存在占位条目上，前端只需知道已发出）。 */
+  msgid: string
+}
+
+/** RPC: 提交短信验证码完成登录。 */
+export interface RpcSubmitSmsRequest {
+  accountId: string
+  provider: string
+  code: string
+}
+/** RPC: 提交验证码的响应。 */
+export interface RpcSubmitSmsResponse {
+  /** 登录是否完成（凭据已写入）。 */
+  done: boolean
+  /** 失败原因（`done: false` 时给出）。 */
+  error?: string
+}
+
+/**
+ * ========================================
+ * 新手任务（仅 Loomy）
+ * ========================================
+ *
+ * ⚠️ 与 `credits.*`（每日签到）**语义独立**：新手任务是**一次性**的
+ * （每号只能领一次 10000 分），故有独立端点，不参与「一键签到」遍历。
+ */
+
+/** RPC: 查询某账号的新手任务状态。 */
+export interface RpcOnboardingStatusRequest {
+  provider: string
+  accountId: string
+}
+/** RPC: 新手任务状态响应。 */
+export interface RpcOnboardingStatusResponse {
+  /** 8 个 task key 的完成状态。 */
+  tasks: Record<string, boolean>
+  /** 本地现算的已领积分。 */
+  earned: number
+  /** 总分（10000）。 */
+  total: number
+  /** task key → 中文标题（供前端渲染清单）。 */
+  titles: Record<string, string>
+  /** task key → 积分。 */
+  points: Record<string, number>
+}
+
+/** RPC: 领取某账号的全部新手任务。 */
+export interface RpcOnboardingClaimRequest {
+  provider: string
+  accountId: string
+}
+/** RPC: 领取新手任务的响应。 */
+export interface RpcOnboardingClaimResponse {
+  /** 本次处理的任务（含幂等重放）。 */
+  claimed: { key: string; title: string; points: number }[]
+  /** 此前已完成、本次跳过的 key。 */
+  skipped: string[]
+  /** 领取后本地现算的累计已领。 */
+  earned: number
+  total: number
 }
 
 /**

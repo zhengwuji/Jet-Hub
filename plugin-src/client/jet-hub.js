@@ -1,6 +1,11 @@
 import * as React from 'react';
 
-import { supportsCreditBalance, supportsDailyCheckin, checkinProviders } from './credits-capabilities.js';
+import {
+  supportsCreditBalance,
+  supportsDailyCheckin,
+  supportsOnboardingTasks,
+  checkinProviders,
+} from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { bulkButtonState } from './model-bulk.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './backup-crypto.js';
@@ -103,6 +108,14 @@ const TRAE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5
  */
 const CLINE_ICON = 'data:image/png;base64,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'
 
+/**
+ * Loomy（讯飞）面板图标：内联 SVG data URL（蓝底白字 L）。
+ *
+ * 与 LobsterAI / Qoder / TRAE 的 SVG 做法一致（体积小、无色差、
+ * 在白底容器 `.dim-jh-providerIcon` 里显示清晰）。
+ */
+const LOOMY_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%23007aff"/%3E%3Ctext x="12" y="17.5" font-size="15" font-family="sans-serif" font-weight="700" fill="white" text-anchor="middle"%3EL%3C/text%3E%3C/svg%3E';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -111,6 +124,7 @@ const PROVIDERS = Object.freeze([
   { id: 'qoder', label: 'Qoder', icon: QODER_ICON, logoClass: 'qoder' },
   { id: 'trae', label: 'TRAE (字节)', icon: TRAE_ICON, logoClass: 'trae' },
   { id: 'cline', label: 'Cline', icon: CLINE_ICON, logoClass: 'cline' },
+  { id: 'loomy', label: 'Loomy (讯飞)', icon: LOOMY_ICON, logoClass: 'loomy' },
 ]);
 
 /**
@@ -236,6 +250,14 @@ function CreditBalanceRow({ balance, error, loading }) {
   const detail = (balance.packages || []).map(formatPackageLine).join('\n');
   const all = balance.packages || [];
   const activeCount = all.filter(p => p.active).length;
+  /**
+   * Loomy 的两个积分池必须**分开显示**（用户明确要求）。
+   *
+   * 判据是「恰好两个包且名字为已知池名」—— 其余 provider 的 packages 是
+   * 多个同类资源包（如 5 个 Bonus Pack），不适用这种展示。
+   */
+  const isLoomyTwoPools = all.length === 2
+    && all[0].name === '永久积分' && all[1].name === '每日赠送';
   return React.createElement('div', { className: 'dim-jh-metaRow' },
     React.createElement('dt', null, '积分'),
     React.createElement('dd', {
@@ -243,7 +265,11 @@ function CreditBalanceRow({ balance, error, loading }) {
       title: detail || undefined,
     },
     React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
-    all.length > 1
+    isLoomyTwoPools
+      ? React.createElement('span', { className: 'dim-jh-creditPools' },
+          `永久 ${formatCredits(all[0].remaining) ?? '0'} · 每日 ${formatCredits(all[1].remaining) ?? '0'}`)
+      : null,
+    !isLoomyTwoPools && all.length > 1
       ? React.createElement('span', { className: 'dim-jh-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
@@ -254,7 +280,7 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
-function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, busy, credits, creditsLoading, showCredits, drag }) {
+function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -337,6 +363,42 @@ function AccountCard({ account, index, order, onToggle, onDelete, onRetest, onRe
             }, `${modelId} · ${formatTime(resetAt)}`)))
       : null,
     React.createElement('div', { className: 'dim-jh-accountActions' },
+      // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
+      // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮 ——
+      // 混进「一键签到」会导致每天对已领完的账号发 8 个必然 alreadyCompleted 的请求。
+      //
+      // ⚠️ **只显示礼物图标**（用户报障：「领取新手任务」文字太长、按钮溢出行尾）。
+      // 该行有 5 个按钮且 `flex-wrap: nowrap`，多一个宽按钮就会被挤出容器。
+      // 文案移到 `title`（hover tooltip）与 `aria-label`（无障碍）里。
+      onClaimOnboarding
+        ? React.createElement('button', {
+            className: 'dim-jh-btn dim-jh-iconBtn',
+            // tooltip 说明「是什么 + 一次性 + 多少分」，因为图标本身不自解释
+            title: '领取新手任务（合计 10000 积分，每个账号仅能领取一次）',
+            'aria-label': '领取新手任务',
+            disabled: busy || onboardingBusy,
+            onClick: () => onClaimOnboarding(account.id),
+          }, onboardingBusy
+            // 领取中：换成文字，让用户明确知道正在跑（图标无法表达进度）
+            ? '领取中…'
+            : React.createElement('svg', {
+                width: 14,
+                height: 14,
+                viewBox: '0 0 24 24',
+                fill: 'none',
+                stroke: 'currentColor',
+                strokeWidth: 2,
+                strokeLinecap: 'round',
+                strokeLinejoin: 'round',
+                'aria-hidden': 'true',
+                focusable: 'false',
+              },
+              // 礼物盒：盒身 + 盖子 + 竖带 + 蝴蝶结
+              React.createElement('rect', { x: 3, y: 8, width: 18, height: 4, rx: 1 }),
+              React.createElement('path', { d: 'M12 8v13' }),
+              React.createElement('path', { d: 'M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7' }),
+              React.createElement('path', { d: 'M7.5 8a2.5 2.5 0 0 1 0-5A4.8 4.8 0 0 1 12 8a4.8 4.8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5' })))
+        : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
         title: RETEST_HELP,
@@ -727,6 +789,48 @@ function ProviderPanel({ provider, rpcCall }) {
   // 积分领取状态：claiming 用于禁用按钮，claimNotice 展示上一次领取的结果摘要。
   const [claiming, setClaiming] = React.useState(false);
   const [claimNotice, setClaimNotice] = React.useState(null);
+  // 新手任务（一次性，仅 Loomy）：与每日签到**完全独立**的操作。
+  const [onboarding, setOnboarding] = React.useState(null);
+  const [onboardingLoading, setOnboardingLoading] = React.useState(false);
+  const [onboardingNotice, setOnboardingNotice] = React.useState(null);
+  const canClaimOnboarding = supportsOnboardingTasks(provider);
+
+  /**
+   * 领取指定账号的全部新手任务（补差额，最多 10000 分）。
+   *
+   * ⚠️ 与「一键领取积分」（每日签到）**完全不同的操作**：新手任务是
+   * **一次性**的（每号只能领一次），故独立按钮、独立端点
+   * （`onboarding.claim`），**不参与**页头的「一键签到」遍历 ——
+   * 否则每天会对已领完的账号发 8 个必然 `alreadyCompleted` 的请求。
+   */
+  const claimOnboarding = async (accountId) => {
+    if (!canClaimOnboarding) return;
+    setOnboardingLoading(true);
+    setOnboardingNotice(null);
+    try {
+      const res = await rpcCall('onboarding.claim', { provider, accountId });
+      const parts = [];
+      if (res.claimed.length > 0) {
+        const gained = res.claimed.reduce((sum, item) => sum + item.points, 0);
+        parts.push(`本次领取 ${res.claimed.length} 个任务（+${gained} 积分）`);
+      }
+      if (res.skipped.length > 0) parts.push(`${res.skipped.length} 个此前已完成`);
+      setOnboardingNotice({
+        tone: 'ok',
+        text: parts.length > 0 ? parts.join('，') : '没有可领取的任务',
+        details: [
+          `累计已领 ${res.earned} / ${res.total}`,
+          ...res.claimed.map((item) => `${item.title} +${item.points}`),
+        ],
+      });
+      setOnboarding({ earned: res.earned, total: res.total, skipped: res.skipped });
+      if (canLoadCredits) await loadCredits();
+    } catch (caught) {
+      setOnboardingNotice({ tone: 'error', text: caught?.message || '领取新手任务失败' });
+    } finally {
+      if (mounted.current) setOnboardingLoading(false);
+    }
+  };
   // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
   // 每次进入面板都白白发一次 model.list 请求。
   const [showModels, setShowModels] = React.useState(false);
@@ -800,6 +904,14 @@ function ProviderPanel({ provider, rpcCall }) {
       console.log('[jet-hub] account.create response =', res);
       accountId = res.accountId;
       loginUrl = res.loginUrl;
+      // ⚠️ Loomy 也走这条**统一的「弹窗 + 轮询」路径**：它的 `loginUrl`
+      // 指向**本地服务器**上的微信扫码页（内联二维码 + 首次绑手机号表单），
+      // 与 codearts / lobsterai / qoder / trae / cline 的体验一致。
+      //
+      // ⚠️ **真实缺陷**（用户报障「新建账号失败：Loomy 短信登录需要手机号」）：
+      // 早期这里为 Loomy 分出一个「短信表单」分支，而表单要等 `account.create`
+      // 返回才渲染、`account.create` 又要求先有手机号 —— **顺序死锁**，
+      // 表单永远出不来。改用微信扫码后该分支已删除。
       if (loginUrl) {
         // 登录页在**新窗口**中打开。这里必须能成功弹出：
         // 后端对全部 provider 都是「先返回 loginUrl、后台再等回调」的两步式，
@@ -1066,6 +1178,20 @@ function ProviderPanel({ provider, rpcCall }) {
               claimNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
           : null)
       : null,
+    // 新手任务结果（仅 Loomy，一次性领取）。
+    onboardingNotice
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': onboardingNotice.tone,
+          role: onboardingNotice.tone === 'error' ? 'alert' : 'status',
+        },
+        React.createElement('div', null, onboardingNotice.text),
+        (onboardingNotice.details || []).length > 0
+          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+              onboardingNotice.details.map((line, index) =>
+                React.createElement('li', { key: index }, line)))
+          : null)
+      : null,
     // 弹窗被拦截：给出可点击的登录链接。不劫持当前页面（见 createAccount 的说明）。
     loginUrlForManual
       ? React.createElement('div', {
@@ -1117,6 +1243,12 @@ function ProviderPanel({ provider, rpcCall }) {
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
                 onReset: (id) => void runLimitAction('reset', id),
+                // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
+                // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮。
+                onClaimOnboarding: canClaimOnboarding
+                  ? (id) => void claimOnboarding(id)
+                  : undefined,
+                onboardingBusy: onboardingLoading,
                 // 提交顺序期间禁用拖拽，避免并发提交互相覆盖。
                 drag: reordering ? { enabled: false } : dragPropsFor(account, index),
               }))),

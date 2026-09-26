@@ -37,3 +37,14 @@ docs/qoder-wasm-signing-bridge.mjs
 # README / AGENTS.md 只保留行为契约与运维指针，不含逆向细节；
 # 需要这些细节时读本文件（Qoder 升级后重新采集尤其需要它）。
 docs/qoder-encryption-notes.md
+
+# Loomy 协议逆向与加密细节（内部文档，仅本地保留）
+#
+# 含：从客户端 .env.prod 解密得到的讯飞账号 AccessKey（凭据本体）、
+# .env.prod 的 AES-256-GCM 解密算法与内嵌口令、app.asar 提取方式、
+# 排查脚本清单、微信长轮询状态机的官方 JS 原文与 errcode 语义对照表。
+#
+# ⚠️ 这是**知识库**而非运行时依赖：`src/` 不引用它。
+# README / AGENTS.md 只保留行为契约（协议差异、坑点、能力矩阵），
+# 凭据值、解密口令、脚本清单一律放本文件。
+docs/loomy-protocol-notes.md

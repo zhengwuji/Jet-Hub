@@ -6,7 +6,7 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
-此外插件内置另外四个 provider 路由：
+此外插件内置另外五个 provider 路由：
 
 - **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
   另支持「一键领取积分」（每日签到）。
@@ -16,12 +16,15 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 - **qoder（阿里系 Qoder）** — 见 [Qoder provider](#qoder-provider)；
   **支持积分余额与每日领取**（每日 100 Credits，10:00（UTC+8）刷新）；
   走**加密推理端点**，模型池与客户端一致（含 Qwen3.8 系列）。
+- **loomy（讯飞 Loomy 办公助手）** — 见 [Loomy provider](#loomy-provider讯飞办公助手)；
+  **唯一用短信验证码登录**、**唯一不能自动续期**的 provider；
+  支持积分余额（两个池）、每日额度签到，以及**新手任务一键领取 10000 积分**。
 
 `codearts` 面板同样支持**积分账户检测、积分余额与「一键领取积分」**
 （华为云「每日签到得积分」活动，走 `SDK-HMAC-SHA256` 签名）——
 见 [CodeArts 积分](#codearts-积分华为云每日签到得积分)。
 
-五个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+八个 provider 的 Jet Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
@@ -1371,3 +1374,111 @@ pnpm test:e2e:cline-chat   # ⚠️ 发一次推理：默认只发 cline-free/de
 `scripts/probe-cline-endpoints.mjs`（按关键词提取 sidecar 二进制字符串窗口）、
 `probe-cline-models.mjs`、`probe-cline-recommended.mjs`、
 `probe-cline-balance.mjs`、`probe-cline-chat.mjs`。
+## Loomy provider（讯飞办公助手）
+
+`loomy` 是本插件第 8 个、也是**与其余七者都不同源**的 provider。生产环境：
+
+| 用途 | base URL |
+|---|---|
+| 推理 / 模型列表 / 积分 / 新手任务 | `https://loomyad.xunfei.cn/api/v1` |
+| 讯飞账号（CAccount） | `https://account.xfinfr.com` |
+
+⚠️ 这两个域名是**生产**地址，不要改用测试环境。
+
+### ⚠️ 五个与其余 provider 不同的地方
+
+1. **登录是短信验证码**（唯一一个）。其余 7 个都是「返回 `loginUrl` →
+   前端 `window.open` → 轮询 `login.poll`」；短信登录没有 URL 可打开，
+   故 `account.create` 返回 `loginMode: 'sms'`（缺省视为 `'url'`，
+   既有 provider 行为不变），前端渲染验证码表单，
+   走 `login.sendSms` / `login.submitSms` 两个端点。
+
+2. **不能续期**（唯一一个）。Loomy **没有任何 refresh 端点** ——
+   `session` 是登录时向服务端声明 `expire: 1209600`（14 天）得来的。
+   故 `isLoomyRefreshable()` 恒 `false`，`refresh()` /
+   `refreshAccountCredential()` 只做**有效性探测**（失效即提示重新登录），
+   `refreshAll()` 只探测**已过期**的账号。这是**诚实标记**，
+   不是遗漏 —— 账号卡片会如实显示「凭证过期，请重新登录」。
+   `scheduleRefresh()` / `stop()` 因此是**有意为之的空实现**。
+
+3. **两套认证头**。`/chat/completions` **只认** `Authorization: Bearer <session>`，
+   而 `/models`、`/points/*`、`/onboarding/*` **只认** `token: <session>`。
+   带错的那个会得到 HTTP 200 + `{"code":"100002","desc":"缺少 token"}`。
+   `loomyChatHeaders()` 两个都发（官方客户端也如此）。
+   实测交叉矩阵（`pnpm test:e2e:loomy` 会现场验证）：
+
+   ```
+   GET /points/records  + token  → code=000000
+   GET /points/records  + Bearer → code=100002 (缺少 token)
+   ```
+
+4. **新手任务是纯 API 直领**，不需要模拟真实用户行为。
+   实测服务端**不校验任何前置行为**：直接对 8 个任务发
+   `POST /api/v1/onboarding/tasks/complete`（body 只有 `{"key":...}`）即可拿满
+   **10000 积分**，一个模型 token 都不花。
+   ⚠️ 这与 WorkBuddy 相反（后者需要发对话、建定时任务、上报埋点事件链）。
+   若将来服务端加了校验，降级路径是「用 `qwen3.8-flash`（x0.8，全表最便宜）
+   模拟真实动作」。
+
+5. **积分是两个池、分开计算**：
+   - **永久积分**（`balance`）：注册奖励 5000 + 新手任务 10000
+   - **每日赠送池**（`dailyBalance`）：每天 5000，**消耗后不回补**
+
+   「一键签到」= `POST /api/v1/points/first-login`（官方在登录后立即调用它），
+   语义是**触发每日额度重置**，**不是**「+5000 积分」。
+   幂等判据是响应体的 `alreadyProcessed`，故已初始化时映射成
+   `already-claimed` 而非虚报 `claimed`。
+   余额查询走 `GET /api/v1/points/records`（**只读**，无副作用）——
+   刻意不用 `first-login`，否则「打开面板」会悄悄触发签到。
+
+### 模型与倍率
+
+远端 `GET /api/v1/models` 返回 11 条，按 `type === 'chat'` 过滤得 **8 条**。
+⚠️ 过滤判据必须是 `type`，**不能**看 `input_modalities` —— 实测 5 个 chat
+模型的输入模态含 `image`（能看图），那不是生图模型。
+
+⚠️ **倍率在 `name` 字符串里**，没有独立字段（实测搜 `credit`/`multiplier`/
+`price`/`factor`/`rate` 全部 0 命中），且三种括号风格混用，故由
+`loomyDisplayName()` 规范化为 `MiniMax M3 · x4.0` 形态。
+
+| 模型 | 倍率 | 上下文 |
+|---|---|---|
+| `deepseek-v4-flash-0731` | x3.0 | 1048576 |
+| `MiniMax-M3` | x4.0 | 1048576 |
+| `Kimi-k2.6` | x6.5 | 262144 |
+| `qwen-3.8-max` | x12.0 | 1000000 |
+| `GLM-5.3-Flash` | x0.8 | 1048576 |
+| `qwen3.8-flash` | x0.8 | 1000000 |
+| `spark-x` | x0.1 | 1048576 |
+| `mimo-v2.5` | x3.3 | 1048576 |
+
+⚠️ **`spark-x` 的上下文有已知分歧**：远端声明 `1048576`，而 Loomy 客户端用
+本地表 `MODEL_CONTEXT_OVERRIDES = { 'spark-x': 262144 }` 强制降到 262144。
+本插件**先采信远端**；若实测长上下文被拒，改兜底表的该值为 262144。
+
+### 能力矩阵
+
+```js
+loomy: { balance: true, dailyCheckin: true, onboardingTasks: true }
+```
+
+`onboardingTasks` 是**第三项能力位**，与 `dailyCheckin` **语义独立**：
+前者**一次性**（每号只能领一次 10000 分），后者**每天**有收益。
+故新手任务有独立按钮与独立端点（`onboarding.status` / `onboarding.claim`），
+**不参与**页头「一键签到」遍历 —— 否则每天会对已领完的账号
+发 8 个必然 `alreadyCompleted` 的请求。
+
+### 账号卡片
+
+两个积分池**分开显示**（用户要求）：`永久 15000 · 每日 4992`。
+其余 provider 的多个同类资源包仍显示「N/M 个资源包有效」，两种形态互斥。
+
+### e2e 探针
+
+```
+pnpm test:e2e:loomy        # 只读：凭据/两套头交叉验证/模型目录/任务/两池余额，零消耗
+pnpm test:e2e:loomy-chat   # ⚠️ 发一次推理：默认 qwen3.8-flash（x0.8，最便宜）
+```
+
+⚠️ 对话探针的闸门是 `DSH_LOOMY_CHAT_E2E=1` **且**
+`DSH_LOOMY_CHAT_E2E_CONFIRM=yes`，`max_tokens` 压到 16（单次约 1 积分）。

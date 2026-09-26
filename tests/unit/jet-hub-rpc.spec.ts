@@ -943,8 +943,17 @@ describe('model.list / model.setDisabled 端点', () => {
     }
 
     registerJetHubRpc(
-      ctx as never, pool, {} as never, {} as never, {} as never, {} as never, {} as never, {} as never,
-      {} as never,
+      // ⚠️ 位置参数：每新增一个 provider 都要在这里补一个 `{}` 占位，
+      // 否则 `modelAdapters` 会错位落到最后一个 auth 形参上（本次加 Loomy 时踩过）。
+      ctx as never, pool,
+      {} as never, // codearts
+      {} as never, // buddy
+      {} as never, // workbuddy
+      {} as never, // lobsterai
+      {} as never, // qoder
+      {} as never, // trae
+      {} as never, // cline
+      {} as never, // loomy
       options.modelAdapters as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')

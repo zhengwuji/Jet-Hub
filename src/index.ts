@@ -7,12 +7,15 @@ import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
 import { registerTraeLlm } from './trae-adapter.js'
 import { registerClineLlm } from './cline-adapter.js'
+import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { TraeAuth } from './trae-auth.js'
 import { ClineAuth } from './cline-auth.js'
+import { LoomyAuth } from './loomy-auth.js'
+import { LOOMY } from './loomy-product.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
@@ -26,6 +29,7 @@ import type { LobsteraiCredential } from './lobsterai.js'
 import type { QoderCredential } from './qoder.js'
 import type { TraeCredential } from './trae.js'
 import type { ClineCredential } from './cline.js'
+import type { LoomyCredential } from './loomy.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -144,7 +148,8 @@ export function apply(ctx: Context): void {
   // profile 条目 id，故这里不做任何注册；各 provider 的 settingsNs 由
   // `settingsNamespaceFor()` 解析为本插件条目 id。
   registerProviderSettings(
-    ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai', 'llm-qoder', 'llm-trae', 'llm-cline',
+    ctx, 'llm-buddy', 'llm-workbuddy', 'llm-codearts', 'llm-lobsterai',
+    'llm-qoder', 'llm-trae', 'llm-cline', 'llm-loomy',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -414,6 +419,72 @@ export function apply(ctx: Context): void {
     product: CLINE,
   })
 
+  // ===== Loomy（讯飞办公助手）服务 =====
+  // 第八个产品线，与前面七者**都不同源**：登录是**短信验证码**
+  // （讯飞 CAccount，HMAC-SHA1 签名，没有 loginUrl 可打开），
+  // 推理是标准 OpenAI 兼容（复用 openai-compat.ts）。
+  // 服务名由 LoomyAuth 依 product.id 派生，注册为 ctx.loomyAuth。
+  // 不注册斜杠命令：入口在 Jet Hub 的 Loomy 面板。
+  const loomy = new LoomyAuth(ctx)
+  const loomyAdapter = registerLoomyLlm(ctx, {
+    credentialRef: credentialRef(LOOMY.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 Loomy 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 LOOMY.id 而非字面量 'loomy'：写死字面量在
+      // 改名/多产品场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(LOOMY.id, '')
+      // `getAvailableAccount` 的凭据类型是 `CodeArtsCredential | BuddyCredential`
+      // 联合（历史遗留），与 `LoomyCredential` 无充分重叠，故经 `unknown` 转换。
+      // 运行时安全性由 provider 过滤保证：查询用 `LOOMY.id`，取到的必是 Loomy 凭据。
+      if (available) return available.credential as unknown as LoomyCredential
+      const resolved = await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
+      if (!resolved) return undefined
+      try {
+        return JSON.parse(resolved.value) as LoomyCredential
+      } catch {
+        return undefined
+      }
+    },
+    refresh: async () => {
+      // ⚠️ Loomy **没有 refresh 端点**，这里的 `refresh` 语义是
+      // 「探测凭据是否仍有效」，失效时抛错提示重新登录。
+      //
+      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 否则探测的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
+      const available = await pool.getAvailableAccount(LOOMY.id, '')
+      if (available) await loomy.refreshAccountCredential(available.entry.credentialRef)
+      else await loomy.refresh()
+    },
+    // 远端模型目录：GET /api/v1/models。
+    // ⚠️ 必须用 **token 头**（业务端点），不是 Bearer —— 带错会得到
+    // `100002 缺少 token`，表现为「模型列表永远停在兜底表」。
+    // 失败时返回空数组，由适配器回退兜底表。
+    fetchRemoteModels: async () => {
+      const available = await pool.getAvailableAccount(LOOMY.id, '')
+      const resolved = available !== null && available !== undefined
+        ? { value: JSON.stringify(available.credential) }
+        : await ctx.credentials.resolve(credentialRef(LOOMY.defaultCredentialRef))
+      if (resolved === undefined) return []
+      let credential: LoomyCredential
+      try {
+        credential = JSON.parse(resolved.value) as LoomyCredential
+      } catch {
+        return []
+      }
+      const response = await fetch(`${LOOMY.apiBase}/models`, {
+        headers: { Accept: 'application/json', token: credential.access_token },
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!response.ok) return []
+      return parseLoomyRemoteModels(await response.json())
+    },
+    // 图片字节桥接：按模型能力判定（远端 capabilities.input_modalities 含 image）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: LOOMY,
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -440,6 +511,10 @@ export function apply(ctx: Context): void {
     try {
       await cline.refreshAll(pool)
     } catch { /* 静默 */ }
+    try {
+      // ⚠️ Loomy 不可续期：这里只探测**已过期**的账号（见 LoomyAuth.refreshAll）。
+      await loomy.refreshAll(pool)
+    } catch { /* 静默 */ }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期。
@@ -462,6 +537,7 @@ export function apply(ctx: Context): void {
         qoder.stop()
         trae.stop()
         cline.stop()
+        loomy.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -475,6 +551,7 @@ export function apply(ctx: Context): void {
     qoder.stop()
     trae.stop()
     cline.stop()
+    loomy.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Jet Hub RPC 注册 =====
@@ -491,8 +568,9 @@ export function apply(ctx: Context): void {
     qoder: qoderAdapter,
     trae: traeAdapter,
     cline: clineAdapter,
+    loomy: loomyAdapter,
   }
 
-  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, modelAdapters)
+  registerJetHubRpc(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, loomy, modelAdapters)
   ctx.provide('accountPool', pool)
 }

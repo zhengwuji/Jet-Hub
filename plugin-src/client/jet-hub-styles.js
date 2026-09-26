@@ -103,6 +103,16 @@ const STYLES = `
 .dim-jh-btn[data-kind="danger"]:hover:not(:disabled) { color: #b3261e; border-color: #d93025; background: rgb(217 48 37 / 6%); }
 .dim-jh-btn:disabled { opacity: 0.5; cursor: default; }
 
+/* 纯图标按钮（如「领取新手任务」的礼物图标）。
+   ⚠️ 存在的理由：.dim-jh-accountActions 是 flex-wrap: nowrap，
+   行内已有 5 个文字按钮，再加一个「领取新手任务」会被挤出容器（用户报障）。
+   故把它压成等宽等高的方形图标按钮，文案移到 title tooltip。
+   正方形靠固定 padding（左右 = 上下）实现，不依赖内容宽度。
+   ⚠️ 本文件整体是一个 JS 模板字符串，注释里**不能出现反引号** —— 会提前
+   终止字符串（本次构建失败的成因）。 */
+.dim-jh-iconBtn { display: inline-flex; align-items: center; justify-content: center; padding: 4px 8px; min-width: 26px; }
+.dim-jh-iconBtn svg { display: block; }
+
 /* 限流 TTL 徽章 */
 .dim-jh-ttlBadge { display: inline-block; padding: 1px 8px; border-radius: 999px; background: rgb(227 116 0 / 10%); color: #b45309; font-size: 11px; line-height: 17px; font-weight: 500; }
 
