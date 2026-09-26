@@ -616,6 +616,15 @@ export class RaccoonAuth extends Service {
     }
     return repaired
   }
+
+  /**
+   * 停止认证服务生命周期。
+   *
+   * 保留它是契约要求 —— `index.ts` 的 cleanup 对全部 provider 统一调 `stop()`。
+   */
+  stop(): void {
+    // Raccoon 定时续期由 index.ts 的统一调度器驱动，自身无独立单凭据定时器
+  }
 }
 
 /**

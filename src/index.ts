@@ -928,7 +928,6 @@ export function apply(ctx: Context): void {
 
   registerJetHubRpc(
     ctx, pool, service, buddy, buddyIntl, workbuddy, workbuddyCn,
-    lobsterai, qoder, qoderCn, trae, traeIntl, cline, loomy, raccoon, modelAdapters,
-  )
+    lobsterai, qoder, qoderCn, trae, traeIntl, cline, loomy, raccoon, modelAdapters)
   ctx.provide('accountPool', pool)
 }

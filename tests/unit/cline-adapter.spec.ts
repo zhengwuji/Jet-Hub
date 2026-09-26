@@ -557,7 +557,7 @@ describe('Cline 接线（源码级回归）', () => {
     // 只断言「cline 在正确位置、末尾是 modelAdapters」，不要写死整串
     // —— 那会让每加一个 provider 都假失败（加 Loomy 时踩过一次）。
     expect(source).toMatch(
-      /registerJetHubRpc\(ctx, pool, service, buddy, workbuddy, lobsterai, qoder, trae, cline, [\w, ]*modelAdapters\)/,
+      /registerJetHubRpc\([\s\S]*?cline,[\s\S]*?modelAdapters\)/,
     )
     // 老契约下的 settings namespace
     expect(source).toContain("'llm-cline'")

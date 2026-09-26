@@ -29,10 +29,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的插件（`dsh-codearts-auth`），提供华为云 CodeArts
-浏览器登录与凭据管理，并作为多服务商统一接入网关。
-
-**14 个 provider**，分属 8 套互不相同的协议族：
+本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件演进涵盖了七个 LLM provider 路由核心骨架及其区域版本，全量支持 **14 个 provider**，分属 8 套互不相同的协议族：
 
 | 协议族 | provider | 特点 |
 |---|---|---|
@@ -415,6 +412,17 @@ TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通
 - E2E 按 provider 分开（`pnpm test:e2e:*`），**均带闸门默认跳过**
 - ⚠️ oauth 类用例会起本地 HTTP server，**并行跑偶发端口竞态**；
   排查失败时先**隔离运行单个文件**再判断是否真失败
+
+## ⚠️ Loomy（讯飞）provider：协议要点与负载均衡
+
+- **两套认证头**：chat 推理用 Bearer 头（`Bearer <token>`），而业务与模型端点使用 token 头（`token: <token>`）。
+- **不可续期**：Loomy 服务端没有 refresh 端点，因此 `isLoomyRefreshable` 恒为 false（凭据失效需重新登录）。
+- **新手任务**：纯 API 直领新手任务奖励积分，无需客户端环境。
+- **负载均衡与选号策略**：
+  - Loomy 不会因积分耗尽报错，而是**静默降级**为扣永久积分，既有报错换号机制无效。
+  - 必须由适配器在 `resolveCredential` 中接收 `modelId` 并透传，先过滤「未停用 + 该模型未受限」的候选账号，再按余额分档：优先消耗每日赠送额度，其次消耗永久积分。
+  - 档内保持手动拖拽顺序，查询失败归最后一档；调用 `getAvailableAccount` 兜底。
+- **位置参数注意点**：`registerJetHubRpc` 采用位置参数传递各 provider 服务实例，新增服务时需严格维护形参位置顺序，避免错位。
 
 ## LLM Provider 约定
 

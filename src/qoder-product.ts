@@ -423,6 +423,7 @@ export const QODER_CN: QoderProduct = {
     business_type: 'agent',
     scene: 'assistant',
   },
+  sashClientType: '10',
   userAgentPrefix: 'qoder',
   defaultCredentialRef: 'QODER_CN_ACCESS_TOKEN',
   fallbackModels: QODER_FALLBACK_MODELS,
