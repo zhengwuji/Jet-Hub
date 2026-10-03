@@ -665,6 +665,63 @@ describe('CodeArtsAdapter', () => {
     expect(JSON.parse(toolCallBlock!.arguments)).toEqual({ command: 'ls -la' })
   })
 
+  // 回归（严重，2026-10-04 用户报障「用 CodeArts 的模型一运行命令就失败」）：
+  // CodeArts 的 `deepseek-v4.1-flash` 在 `delta.tool_calls[]` 里**从不签发 id**。
+  // 旧实现用 `call.id !== undefined` 判据收 id、用 `block.callId ?? ''` 发射，
+  // 于是工具调用块 id 是**空串**；harness 的 session v4 校验器（判据含
+  // `toolCallId.length === 0`）抛
+  // `format v4 tool/result at seq N requires toolCallId matching its tool source`
+  // → 工具结果行永远写不回会话记录，该步固定失败（实测会话 session-4dd38717
+  // 第 2 轮·第 1 步：assistant 块 id="" / tool-call 行 callId="" / 结果行缺失）。
+  // 判据：id 必须非空，且**续片的 delta 与收尾 block-end 用同一个 id**。
+  it('synthesizes a non-empty call id when the provider omits tool_call ids', async () => {
+    const fetchImpl = vi.fn(async () => new Response(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"pwsh","arguments":"{\\"command\\":\\"ls"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"\\"}"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const deltaIds: string[] = []
+    let toolCallBlock: { type: 'tool-call'; id: string; name: string; arguments: string } | undefined
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'tool-call-delta') deltaIds.push(chunk.id)
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') toolCallBlock = chunk.block
+    }
+    expect(toolCallBlock).toMatchObject({ type: 'tool-call', name: 'pwsh' })
+    expect(toolCallBlock!.id.length).toBeGreaterThan(0)
+    expect(toolCallBlock!.id).toMatch(/^codearts-[0-9a-f]{32}$/)
+    expect(JSON.parse(toolCallBlock!.arguments)).toEqual({ command: 'ls' })
+    // 续片与收尾必须同 id：两处不一致时 tool/call ↔ tool/result 依旧配不上。
+    expect(deltaIds.length).toBe(2)
+    expect(new Set(deltaIds)).toEqual(new Set([toolCallBlock!.id]))
+  })
+
+  // 同上缺陷的第二面：一次响应里的多个工具调用必须拿到**互不相同**的 id。
+  // 用户报障那次响应正是两个调用（pwsh + glob）；若合成逻辑退化成常量或
+  // 复用同一个块状态，两行会撞成同一个 key，配对与 UI 渲染一起错乱。
+  it('gives distinct ids to multiple tool calls in one response that lacks ids', async () => {
+    const fetchImpl = vi.fn(async () => new Response(
+      'data: {"choices":[{"delta":{"tool_calls":['
+      + '{"index":0,"function":{"name":"pwsh","arguments":"{}"}},'
+      + '{"index":1,"function":{"name":"glob","arguments":"{}"}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + 'data: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+    const adapter = makeAdapter({ fetchImpl })
+    const blocks: Array<{ id: string; name: string }> = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+        blocks.push({ id: chunk.block.id, name: chunk.block.name })
+      }
+    }
+    expect(blocks.map(block => block.name).sort()).toEqual(['glob', 'pwsh'])
+    for (const block of blocks) expect(block.id).toMatch(/^codearts-[0-9a-f]{32}$/)
+    expect(new Set(blocks.map(block => block.id)).size).toBe(2)
+  })
+
   it('serializes harness tool schemas into the request tools field', async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const sent = JSON.parse(String(init?.body ?? '{}')) as {

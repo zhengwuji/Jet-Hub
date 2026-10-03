@@ -436,6 +436,43 @@ function readCodeArtsChunk(
 }
 
 /**
+ * 合成工具调用的 `callId`。
+ *
+ * ⚠️ **绝不能返回空串**：harness 用 callId 作 `tool/call` ↔ `tool/result` 的
+ * 配对键与 web UI 工具行的身份，session v4 校验器对空 id 的判据是
+ * `toolCallId.length === 0`，命中即抛
+ * `format v4 tool/result at seq N requires toolCallId matching its tool source`
+ * —— 工具结果行永远写不进会话记录，该步固定报失败。
+ *
+ * 真实缺陷（2026-10-04 用户报障「用 CodeArts 的模型一运行命令就失败」）：
+ * CodeArts 的 `deepseek-v4.1-flash` 在 `delta.tool_calls[]` 里**从不签发 id**，
+ * 而原生路径此前只做 `block.callId ?? ''`，产出的工具调用块 id 为空串。
+ *
+ * @param prefix - 来源标记（`dsml` = 正文内嵌 DSML 块，`codearts` = 上游未签发 id 的原生工具调用）。
+ * @returns 形如 `<prefix>-<32 位 hex>` 的唯一 id。
+ */
+function synthesizeToolCallId(prefix: 'dsml' | 'codearts'): ToolCallId {
+  return ToolCallId(`${prefix}-${crypto.randomUUID().replace(/-/g, '')}`)
+}
+
+/**
+ * 取块的 `callId`，为空时合成并**写回块**。
+ *
+ * ⚠️ 写回不可省：同一工具调用会发射多次（`tool-call-delta` 续片 + 收尾
+ * `block-end`），每次都现合成会让两处 id 不同 —— 配对依旧断裂、web UI 也会
+ * 把同一次调用渲染成两行。首个非空值因此**固定不变**。
+ *
+ * 调用点必须覆盖**全部**发射处（漏一处就有一条路径仍发空 id）。
+ *
+ * @param block - 承载 `callId` 的块状态（原生 `delta.tool_calls` 路径）。
+ * @returns 该块最终使用的非空 id。
+ */
+function ensureToolCallId(block: { callId?: string }): ToolCallId {
+  block.callId ??= synthesizeToolCallId('codearts')
+  return ToolCallId(block.callId)
+}
+
+/**
  * DSML 工具调用格式提取器。
  *
  * 某些模型（如 deepseek-v4）在未通过 `tools` 字段告知工具模式、或工具
@@ -1250,7 +1287,7 @@ export class CodeArtsAdapter extends LlmAdapter {
           index: nextIndex++,
           text: call.arguments,
           name: call.name,
-          callId: ToolCallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+          callId: synthesizeToolCallId('dsml'),
           announced: true,
         }
         toolCalls.set(wireIndex, block)
@@ -1407,7 +1444,7 @@ export class CodeArtsAdapter extends LlmAdapter {
                 index: nextIndex++,
                 text: call.arguments,
                 name: call.name,
-                callId: ToolCallId(`dsml-${crypto.randomUUID().replace(/-/g, '')}`),
+                callId: synthesizeToolCallId('dsml'),
                 announced: true,
               }
               toolCalls.set(wireIndex, block)
@@ -1429,7 +1466,15 @@ export class CodeArtsAdapter extends LlmAdapter {
               block = { index: nextIndex++, text: '', announced: false }
               toolCalls.set(wireIndex, block)
             }
-            if (call.id !== undefined) block.callId = call.id
+            // ⚠️ 只认**非空**的 provider id，且**首个非空值即固定**（与 DSML 分支
+            // 同一判据）。旧写法 `!== undefined` 会让上游下发的 `id: ""` / `id: null`
+            // 原样落进 callId；而 CodeArts 的 `deepseek-v4.1-flash` 更彻底 ——
+            // 连该字段都不下发，于是工具调用块以空 id 发射，harness 的 session v4
+            // 校验器拒收工具结果行（见 synthesizeToolCallId）。
+            // 固定而不覆盖：保证同一调用的 delta 与收尾 block-end 用同一个 id。
+            if (block.callId === undefined && typeof call.id === 'string' && call.id.length > 0) {
+              block.callId = call.id
+            }
             // 后续参数分片会带上空的 function.name（""），它不是 undefined，
             // 直接覆盖会把首个分片解析出的真实工具名清空，导致
             // `unknown tool ""`。只有非空名字才允许更新。
@@ -1450,7 +1495,7 @@ export class CodeArtsAdapter extends LlmAdapter {
               yield {
                 type: 'tool-call-delta',
                 index: block.index,
-                id: ToolCallId(block.callId ?? ''),
+                id: ensureToolCallId(block),
                 name: block.name!,
                 argumentsDelta: block.text,
               }
@@ -1459,7 +1504,7 @@ export class CodeArtsAdapter extends LlmAdapter {
             yield {
               type: 'tool-call-delta',
               index: block.index,
-              id: ToolCallId(block.callId ?? ''),
+              id: ensureToolCallId(block),
               ...block.name !== undefined ? { name: block.name } : {},
               argumentsDelta: fragment,
             }
@@ -1608,7 +1653,9 @@ export class CodeArtsAdapter extends LlmAdapter {
         index,
         block: {
           type: 'tool-call',
-          id: ToolCallId(block.callId ?? ''),
+          // ⚠️ 收尾 `block-end` 是**权威覆盖**：这里必须与前面的 delta 用同一个
+          // 非空 id，否则 harness 的 tool/call ↔ tool/result 配对依旧会断。
+          id: ensureToolCallId(block),
           name: block.name!,
           // 同上：空分片补 {}，残缺参数保持原样交由截断判定处理。
           arguments: isTruncatedArguments(block.text)
