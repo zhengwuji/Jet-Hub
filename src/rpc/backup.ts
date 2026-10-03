@@ -60,11 +60,25 @@ export async function handleBackupMethod(
       // 账号池统计（导入前的覆盖提示用）：缺 expiresAt 的条目疑似 DSH 版本
       // 切换后自动恢复的产物（反推不读凭据值，故无有效期）。前端据此在
       // 确认导入前提示用户「有 N 个自动恢复的账号将被整体覆盖」。
+      //
+      // ⚠️ **判据必须再加 `refreshable`**，不能只看「缺 expiresAt」：
+      // 有一类 provider 的凭据**结构上就没有过期时间**，它们永远缺 `expiresAt`，
+      // 只看缺失会把它们永久误判成「自动恢复的账号」并每次都弹警告。
+      //   · CatPaw：凭据只有 `X-Passport-Token` + `uid`，token 不是 JWT，
+      //     上游也不下发 `expires_at`（只在真正失效时回 401）；
+      //   · ZCode：编码套餐的访问令牌是不透明串，套餐 JWT 只带 `iat` 不带 `exp`；
+      //   · 「粘贴 Key」族：用户从平台复制的 Key 没有固定有效期。
+      // 这三类都是 `refreshable: false`（本来就不能静默续期）。
+      // 而 `bootstrapFromCredentialRefs` 恢复出来的条目是**硬编码
+      // `refreshable: true`** 的 —— 于是「缺 expiresAt 且可续期」恰好就是
+      // 「疑似自动恢复」的准确特征，新增 provider 也不必回来维护这张清单。
       case 'backup.status': {
         const state = pool.getStateSnapshot()
         const value: RpcBackupStatusResponse = {
           accounts: state.accounts.length,
-          withoutExpiry: state.accounts.filter((entry) => entry.expiresAt === undefined).length,
+          withoutExpiry: state.accounts
+            .filter((entry) => entry.expiresAt === undefined && entry.refreshable)
+            .length,
         }
         return { ok: true, value }
       }

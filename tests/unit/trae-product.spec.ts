@@ -12,6 +12,7 @@ import {
   TRAE,
   TRAE_AGENT_HOST,
   TRAE_CONSOLE_HOST,
+  TRAE_INTL,
   TRAE_OAUTH_HOST,
   TRAE_UG_HOST,
 } from '../../src/trae-product.js'
@@ -92,6 +93,40 @@ describe('TRAE 产品配置', () => {
       'portalBase', 'apiBase', 'clientVersionApi', 'fallbackClientVersion', 'clientCapabilities',
     ]) {
       expect(TRAE, banned).not.toHaveProperty(banned)
+    }
+  })
+})
+
+describe('TRAE 国际版产品配置', () => {
+  /**
+   * ⚠️ **真实缺陷回归**（2026-10-03）：`TRAE_INTL_UG_HOST` 原为 `api.trae.ai`，
+   * 但那个 host 只承载 `cloudide/api/v3/trae/*` 认证类接口，`/trae/api/*` 一律
+   * 网关 404（实测同 host 的 `GetUserInfo` 对同一凭据返回 200 + `AIRegion: SG`，
+   * 说明凭据有效、就是没有该服务）。国际版真实的用量/权益站点是
+   * `ug-normal.trae.ai` —— 取自 TRAE 官网 bundle 的两个导出（`QU` / `gp`）。
+   */
+  it('ugHost 是 ug-normal.trae.ai，不是 api.trae.ai', () => {
+    expect(TRAE_INTL.ugHost).toBe('https://ug-normal.trae.ai')
+  })
+
+  it('认证 host 仍为 api.trae.ai（与 Ug 站点是两个不同的服务）', () => {
+    expect(TRAE_INTL.oauthHost).toBe('https://api.trae.ai')
+    expect(new URL(TRAE_INTL.ugHost).hostname).not.toBe(new URL(TRAE_INTL.oauthHost).hostname)
+  })
+
+  /**
+   * ⚠️ **区域差异不只在域名，连路径版本号都不同**：国内版 v2、国际版 **v1**。
+   * 所以 `postJson` 不能写死路径 —— 它必须取 `product.entUsagePath`。
+   */
+  it('积分/用量路径按区域区分（国内 v2 / 国际 v1）', () => {
+    expect(TRAE.entUsagePath).toBe('/trae/api/v2/pay/ide_user_ent_usage')
+    expect(TRAE_INTL.entUsagePath).toBe('/trae/api/v1/pay/ide_user_ent_usage')
+  })
+
+  it('两个区域的产品都声明了 entUsagePath（防止回退到写死路径）', () => {
+    for (const product of [TRAE, TRAE_INTL]) {
+      expect(product.entUsagePath.startsWith('/'), product.id).toBe(true)
+      expect(product.entUsagePath, product.id).not.toContain('://')
     }
   })
 })

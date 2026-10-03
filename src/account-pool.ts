@@ -223,6 +223,49 @@ export class AccountPool {
     await this.writeModels(next)
   }
 
+  /**
+   * 丢掉该 provider 黑名单里**已不对应任何模型**的键，返回丢弃的条数。
+   *
+   * ## 为什么需要它（真实故障，2026-10-04）
+   *
+   * 用户报障「Accio 国内版怎么有 76 个模型，已隐藏 41 个」——上游目录真实只有
+   * **42** 个模型，而黑名单里有 **34 条旧键**：Accio 把对外 id 从上游混淆代号
+   * （`1Helix-…`）改成可读 slug（`gpt-6-astra`）之后，旧键永久留在了 settings 里。
+   * 它们既不对应任何可路由的模型，又会被旧版的「保底补回」逻辑渲染成幽灵条目。
+   *
+   * ## 与 `clearDisabledModels` 的区别（不可互相替代）
+   *
+   * - `clearDisabledModels` 是 UI 的「打开全部」：**删掉该 provider 的全部**关闭项，
+   *   语义是「我全都要」；
+   * - 本方法只删**目录里不存在**的那些键，语义是「把改过 id 之后留下的残渣扫掉」，
+   *   用户真实的关闭选择一个都不动。
+   *
+   * ⚠️ **调用方必须提供可信的完整目录**。若拿一份**兜底表**（例如远端拉取失败时
+   * 的静态表）当 `validIds`，会把用户真实的关闭项当成残留**全部删掉** ——
+   * 那是破坏性操作。所以本方法刻意不自己判断「谁算有效」，由调用方担保。
+   *
+   * 该 provider 本就无残留时直接返回、不落盘（不产生无意义的写入与广播）。
+   */
+  async pruneDisabledModels(provider: string, validIds: Iterable<string>): Promise<number> {
+    // 同 setModelsDisabled：写路径必须自己保证已载入，否则会把磁盘上已有的
+    // 黑名单当成空表。
+    this.ensureLoaded()
+    const current = this.modelCache[provider]
+    if (current === undefined) return 0
+    const keep = new Set(validIds)
+    const stale = Object.keys(current).filter((id) => !keep.has(id))
+    if (stale.length === 0) return 0
+    const kept: Record<string, boolean> = {}
+    for (const [id, value] of Object.entries(current)) {
+      if (keep.has(id)) kept[id] = value
+    }
+    const next: ModelDisableMap = { ...this.modelCache }
+    if (Object.keys(kept).length === 0) delete next[provider]
+    else next[provider] = kept
+    await this.writeModels(next)
+    return stale.length
+  }
+
   /** 持久化模型黑名单（同时更新进程内权威副本）。 */
   private async writeModels(disabledModels: ModelDisableMap): Promise<void> {
     this.modelCache = disabledModels

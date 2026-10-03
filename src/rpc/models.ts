@@ -72,12 +72,28 @@ export async function handleModelMethod(
         const all = catalogSource?.listAllModels()
         let catalog: Array<{ id: string; name: string }>
         if (all !== undefined) {
+          // ✅ 全量目录在此分支是**权威且完整**的：`listAllModels()` 刻意**不套
+          //    黑名单**（见适配器里的实现），所以每一个「被关闭的模型」都仍在
+          //    这个数组里。于是**不需要**再拿黑名单去补任何东西。
+          //
+          // ⚠️ 这里曾有一句「保底」补回逻辑，把黑名单里 `!known.has(id)` 的键
+          //    也 push 成 `{ id, name: id }`。它的注释写着「正常不会发生」——
+          //    但真实故障（2026-10-04，用户报障「Accio 国内版怎么有 76 个模型，
+          //    已隐藏 41 个」）证明它**会发生**，而且后果很刺眼：
+          //
+          //      上游目录真实 42 个模型，黑名单里却有 34 条**旧 id**（Accio 把
+          //      对外 id 从上游混淆代号改成可读 slug 之后，旧键就永久留在了
+          //      settings 里）。补回逻辑把这 34 条渲染成模型条目，于是
+          //      `42 + 34 = 76 个模型`，且它们 `disabled: true` →
+          //      `已隐藏 34 + 7 = 41 个`。用户看到的是「列表里多出一堆看不见的
+          //      混淆 id」，而且**再也删不掉**（列表里没有它们的可读身份）。
+          //
+          //    判据：在全量目录已知的前提下，**黑名单里任何不在目录中的键都只能是
+          //    过期残留**（上游下架、或我们改过对外 id），它不对应任何可路由的模型。
+          //    把它渲染成条目既无法选中、也无法解释，只会污染计数。
+          //    真正的修法是**改 id 时同步迁移黑名单**（见 AGENTS.md 的铁律），
+          //    而不是在读取侧把残留键假装成模型。
           catalog = [...all]
-          // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
-          const known = new Set(catalog.map((model) => model.id))
-          for (const id of Object.keys(disabledMap)) {
-            if (disabledMap[id] === true && !known.has(id)) catalog.push({ id, name: id })
-          }
         } else {
           const listedIds = new Set(models.map((model) => model.id))
           const filteredOut = Object.keys(disabledMap)

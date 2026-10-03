@@ -366,6 +366,37 @@ describe('fetchLobsteraiCreditBalance', () => {
     expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()
   })
 
+  /**
+   * ⚠️ **真实缺陷回归**（2026-10-03，池内账号 LOBSTERAI_ACCOUNT_92FFD425）。
+   *
+   * 免费额度**真的用光**时，服务端如实返回 `totalCreditsRemaining: 0` 与
+   * `creditItems: []`（信封 `code: 0`，解析完全正常）；独立口径
+   * `GET /api/user/quota` 同样确认 `freeCreditsTotal: 300 / freeCreditsUsed: 300`。
+   *
+   * 旧判据 `total === 0 && packages.length === 0 ⇒ null` 把「字段值为 0」与
+   * 「字段缺失」压成同一个值，于是真实余额 0 被报成「余额查询失败」，
+   * 卡片永远停在失败态、把用户引向排查凭据/网络。
+   *
+   * 判据必须看**原始字段是否存在**，而不是它的值。
+   */
+  it('⚠️ 总额字段存在且为 0、但无明细 → 返回 0，不是「查不到」', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: 0, creditItems: [] },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance).not.toBeNull()
+    expect(balance?.total).toBe(0)
+    expect(balance?.packages).toEqual([])
+    expect(balance?.expiredTotal).toBe(0)
+  })
+
+  it('总额以字符串形态给出 0 时同样算「字段存在」', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: '0', creditItems: [] },
+    }), { status: 200 }))
+    expect((await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher))?.total).toBe(0)
+  })
+
   it('网络失败返回 null', async () => {
     const fetcher = vi.fn(async () => { throw new Error('down') }) as unknown as typeof fetch
     expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()

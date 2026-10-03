@@ -8,7 +8,8 @@ import {
   type BackupPool,
 } from '../../src/backup.js'
 import type { JetHubState } from '../../src/jet-hub-store.js'
-import type { ProviderAccountEntry } from '../../src/types.js'
+import type { ProviderAccountEntry, RpcBackupStatusResponse } from '../../src/types.js'
+import { handleBackupMethod } from '../../src/rpc/backup.js'
 
 /** 构造一份最小账号条目。 */
 function account(partial: Partial<ProviderAccountEntry> & { id: string; provider: string; credentialRef: string }): ProviderAccountEntry {
@@ -321,5 +322,75 @@ describe('backup round-trip', () => {
     // 账号与黑名单还原
     expect(targetPool.replaced!.accounts.map(a => a.id)).toEqual(['codearts-a1', 'buddy-b2'])
     expect(targetPool.replaced!.disabledModels).toEqual({ qoder: { qfmodel: true } })
+  })
+})
+
+/**
+ * `backup.status` 的 `withoutExpiry` 判据。
+ *
+ * ## 为什么这条要单独立一个 describe
+ *
+ * 它的判据从「缺 `expiresAt`」收紧成「缺 `expiresAt` **且** `refreshable`」，
+ * 起因是用户报障「CatPaw 账号的有效期显示未知」。查下去发现有两处同源问题：
+ *
+ *   1. 账号卡片的「有效期」行：不可续期又没有过期时间的渠道，显示无信息量的
+ *      「未知」，让人以为凭据坏了；
+ *   2. 本端点：`withoutExpiry` 把这类账号也当成「版本切换后自动恢复的产物」，
+ *      于是每次导出备份都弹一次「有 N 个账号缺少有效期信息」的假警告。
+ *
+ * 这两类的共同点是**上游结构上就不给过期时间**（CatPaw 只有 token + uid、
+ * ZCode 的令牌不可解析、粘贴 Key 族无固定有效期），且都 `refreshable: false`；
+ * 而真正「自动恢复」的条目来自 `bootstrapFromCredentialRefs`，那里
+ * **硬编码 `refreshable: true`**。判据因此能同时命中这两种情形且无需维护清单。
+ */
+describe('backup.status：withoutExpiry 只算「缺有效期且可续期」的条目', () => {
+  /** 直接驱动 RPC 处理器（它的依赖只有 ctx / pool / broadcastCatalogChanged）。 */
+  async function status(accounts: ProviderAccountEntry[]): Promise<RpcBackupStatusResponse> {
+    const pool = createPool({ accounts, disabledModels: {} })
+    const result = await handleBackupMethod('backup.status', undefined, {
+      ctx: {} as never,
+      pool,
+      broadcastCatalogChanged: () => {},
+    }, new AbortController().signal)
+    if (!result.ok) throw new Error(`backup.status 失败: ${result.error.message}`)
+    return result.value as RpcBackupStatusResponse
+  }
+
+  it('缺 expiresAt 且 refreshable → 计入（自动恢复产物的特征）', async () => {
+    const value = await status([
+      account({ id: 'buddy-b1', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_B1' }),
+    ])
+    expect(value.accounts).toBe(1)
+    expect(value.withoutExpiry).toBe(1)
+  })
+
+  it('缺 expiresAt 但**不可续期** → 不计入（CatPaw / ZCode / 粘贴 Key 族）', async () => {
+    const value = await status([
+      account({ id: 'catpaw-c1', provider: 'catpaw', credentialRef: 'CATPAW_ACCOUNT_C1', refreshable: false }),
+      account({ id: 'zcode-z1', provider: 'zcode', credentialRef: 'ZCODE_ACCOUNT_Z1', refreshable: false }),
+      account({ id: 'commandcode-k1', provider: 'commandcode', credentialRef: 'COMMANDCODE_ACCOUNT_K1', refreshable: false }),
+    ])
+    expect(value.accounts).toBe(3)
+    // 这三家的凭据结构上就没有过期时间，不该被当成「自动恢复的账号」而每次导出都报警
+    expect(value.withoutExpiry).toBe(0)
+  })
+
+  it('有 expiresAt 的条目一律不计入（无论可不可续期）', async () => {
+    const value = await status([
+      account({ id: 'buddy-b2', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_B2', expiresAt: Date.now() + 60_000 }),
+      account({ id: 'accio-a1', provider: 'accio', credentialRef: 'ACCIO_ACCOUNT_A1', refreshable: false, expiresAt: Date.now() + 60_000 }),
+    ])
+    expect(value.accounts).toBe(2)
+    expect(value.withoutExpiry).toBe(0)
+  })
+
+  it('混合场景只数其中该数的那些', async () => {
+    const value = await status([
+      account({ id: 'auto-recovered-1', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_R1' }),
+      account({ id: 'catpaw-c2', provider: 'catpaw', credentialRef: 'CATPAW_ACCOUNT_C2', refreshable: false }),
+      account({ id: 'trae-t1', provider: 'trae', credentialRef: 'TRAE_ACCOUNT_T1', expiresAt: Date.now() + 60_000 }),
+    ])
+    expect(value.accounts).toBe(3)
+    expect(value.withoutExpiry).toBe(1)
   })
 })

@@ -18,6 +18,14 @@ import { LOBSTERAI } from '../lobsterai-product.js'
 import { QODER, qoderProductById } from '../qoder-product.js'
 import { TRAE, traeProductById } from '../trae-product.js'
 import { CLINE } from '../cline-product.js'
+import { ZCODE, ZCODE_INTL } from '../zcode-product.js'
+import { parseZcodeCredential } from '../zcode.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from '../autoclaw-product.js'
+import { parseAutoclawCredential } from '../autoclaw.js'
+import { ACCIO, ACCIO_CN } from '../accio-product.js'
+import { parseAccioCredential } from '../accio.js'
+import { CATPAW } from '../catpaw-product.js'
+import { parseCatpawCredential } from '../catpaw.js'
 import type { QoderCredential } from '../qoder.js'
 import { claimQoderDailyCheckin, fetchQoderCreditBalance } from '../qoder-credits.js'
 import type { TraeCredential } from '../trae.js'
@@ -34,7 +42,7 @@ import type { RpcResult, JetHubRpcContext, JetHubRpcServices, JetHubRegionRoutin
 
 /** `credits.*` 端点处理器所需依赖（由 `src/jet-hub-rpc.ts` 装配）。 */
 export type CreditsEndpointDeps = JetHubRpcContext
-  & Pick<JetHubRpcServices, 'codearts' | 'buddy' | 'workbuddy' | 'lobsterai' | 'qoder' | 'trae' | 'cline' | 'loomy' | 'raccoon'>
+  & Pick<JetHubRpcServices, 'codearts' | 'buddy' | 'workbuddy' | 'lobsterai' | 'qoder' | 'trae' | 'cline' | 'loomy' | 'raccoon' | 'zcode' | 'zcodeIntl' | 'autoclaw' | 'autoclawIntl' | 'accio' | 'accioCn' | 'catpaw'>
   & Pick<JetHubRegionRouting, 'isQoderProvider' | 'isTraeProvider'>
   & Pick<JetHubCreditsHelpers, 'computeClaimSummary' | 'collectCreditsStatus' | 'collectClaimResults' | 'collectCreditBalances'>
 
@@ -46,6 +54,10 @@ export async function handleCreditsMethod(
   _signal: AbortSignal,
 ): Promise<RpcResult> {
   const { ctx, pool, codearts, buddy, workbuddy, lobsterai, qoder, trae, cline, loomy, raccoon,
+    zcode, zcodeIntl,
+    autoclaw, autoclawIntl,
+    accio, accioCn,
+    catpaw,
     isQoderProvider, isTraeProvider, computeClaimSummary, collectCreditsStatus,
     collectClaimResults, collectCreditBalances, } = deps
 
@@ -291,6 +303,47 @@ export async function handleCreditsMethod(
             },
           }
         }
+        if (req.provider === AUTOCLAW.id || req.provider === AUTOCLAW_INTL.id) {
+          // AutoClaw 有**真实的**每日签到端点（与 raccoon 相反）。
+          // ⚠️ 幂等判据是**响应体字段**（`already_completed === true` 一律算
+          // 「今天已签到」），重复领取同样返回 HTTP 200 + `success:false` ——
+          // 只看状态码会把「今天已领」误判成「领取成功」。
+          const autoclawService = req.provider === AUTOCLAW.id ? autoclaw : autoclawIntl
+          const results: RpcCreditsClaimAllResponse['results'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            const credential = resolved === undefined ? undefined : parseAutoclawCredential(resolved.value)
+            if (credential === undefined) {
+              results.push({
+                accountId: account.id,
+                nickname: account.nickname,
+                outcome: { kind: 'failed', code: 0, message: '凭据未配置或解析失败' },
+              })
+              continue
+            }
+            try {
+              const outcome = await autoclawService.claimDailyCheckin(credential)
+              results.push({ accountId: account.id, nickname: account.nickname, outcome })
+            } catch (error) {
+              results.push({
+                accountId: account.id,
+                nickname: account.nickname,
+                outcome: {
+                  kind: 'failed',
+                  code: 0,
+                  message: error instanceof Error ? error.message : String(error),
+                },
+              })
+            }
+          }
+          return {
+            ok: true,
+            value: {
+              summary: computeClaimSummary(results.map((item) => item.outcome)),
+              results,
+            } satisfies RpcCreditsClaimAllResponse,
+          }
+        }
         const product = productById(req.provider)
         if (product === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
@@ -504,6 +557,134 @@ export async function handleCreditsMethod(
               // ⚠️ 查不到时带原因（**不显示成 0** —— 0 是「已用光」的语义，
               // 把「查询失败」显示成 0 会让用户以为自己积分没了）。
               ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
+            })
+          }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === ZCODE.id || req.provider === ZCODE_INTL.id) {
+          // ZCode 的余额走**套餐 JWT**（不是推理用的 access_token），
+          // 逐账号顺序查（**不可并发**：实测批量并发会被上游 429 风控限流）。
+          const zcodeService = req.provider === ZCODE.id ? zcode : zcodeIntl
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            const credential = resolved === undefined ? undefined : parseZcodeCredential(resolved.value)
+            if (credential === undefined) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置或解析失败',
+              })
+              continue
+            }
+            const balance = await zcodeService.fetchCreditBalance(credential)
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              // ⚠️ 查不到时带原因（**不显示成 0** —— 0 是「已用光」的语义）。
+              // 缺套餐 JWT 是最常见的一种：那说明该账号只换到了推理凭证。
+              ...balance === null ? { error: '余额查询失败（缺套餐 JWT 或凭据已失效）' } : {},
+            })
+          }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === AUTOCLAW.id || req.provider === AUTOCLAW_INTL.id) {
+          // AutoClaw 的余额走 `agent-assetmgr` 钱包接口（**只读**，无副作用）。
+          const autoclawService = req.provider === AUTOCLAW.id ? autoclaw : autoclawIntl
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            const credential = resolved === undefined ? undefined : parseAutoclawCredential(resolved.value)
+            if (credential === undefined) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置或解析失败',
+              })
+              continue
+            }
+            const balance = await autoclawService.fetchCreditBalance(credential)
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              // ⚠️ 查不到时带原因（**不显示成 0** —— 0 是「已用光」的语义）。
+              ...balance === null ? { error: '积分查询失败（凭据失效或响应异常）' } : {},
+            })
+          }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === ACCIO.id || req.provider === ACCIO_CN.id) {
+          // Accio 的余额走 `/api/entitlement/quota`（用量百分比，**只读**）。
+          const accioService = req.provider === ACCIO.id ? accio : accioCn
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            const credential = resolved === undefined ? undefined : parseAccioCredential(resolved.value)
+            if (credential === undefined) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置或解析失败',
+              })
+              continue
+            }
+            let balance = null
+            try {
+              balance = await accioService.fetchCreditBalance(credential)
+            } catch (error) {
+              // 401/403 会原样抛出（供上层触发续期重试）—— 这里如实带出原因，
+              // 而不是把「凭据失效」显示成「余额为 0」。
+              values.push({
+                accountId: account.id,
+                nickname: account.nickname,
+                balance: null,
+                error: error instanceof Error ? error.message : String(error),
+              })
+              continue
+            }
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              // ⚠️ 查不到时带原因（**不显示成 0** —— 0 是「已用光」的语义）。
+              ...balance === null ? { error: '额度查询失败（凭据失效或响应异常）' } : {},
+            })
+          }
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (req.provider === CATPAW.id) {
+          // CatPaw 的积分余额走 `GET {gateway}/api/gateway/credit/balance`，
+          // ⚠️ 该端点**只认 `X-Auth-Token`**（`X-Passport-Token` / `Cookie` /
+          // `Authorization` 全部 401）—— 与推理用的鉴权头刻意不同。
+          const values: RpcCreditsBalancesResponse['accounts'] = []
+          for (const account of accounts) {
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+            const credential = resolved === undefined ? undefined : parseCatpawCredential(resolved.value)
+            if (credential === undefined) {
+              values.push({
+                accountId: account.id, nickname: account.nickname,
+                balance: null, error: '凭据未配置或解析失败',
+              })
+              continue
+            }
+            let balance = null
+            try {
+              balance = await catpaw.fetchCreditBalance(credential)
+            } catch (error) {
+              // 401 / code 4010 / 4011 会抛出「请重新登录」—— 如实带出原因，
+              // 而不是把「登录态失效」显示成「余额为 0」。
+              values.push({
+                accountId: account.id,
+                nickname: account.nickname,
+                balance: null,
+                error: error instanceof Error ? error.message : String(error),
+              })
+              continue
+            }
+            values.push({
+              accountId: account.id,
+              nickname: account.nickname,
+              balance,
+              ...balance === null ? { error: '积分查询失败（登录态失效或响应异常）' } : {},
             })
           }
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }

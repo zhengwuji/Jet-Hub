@@ -136,17 +136,51 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 
 - 取 `data.totalCreditsRemaining`
 - **不要**用 `/api/user/quota`：它只有 `freeCreditsTotal=300`，不含活动积分
+  （但**排查**时它是极好的独立对照组，见下条）
+- ⚠️ **「余额真的为 0」与「查不到」必须分开**（真实缺陷，2026-10-03）：免费额度用光时
+  服务端如实返回 `totalCreditsRemaining: 0` + `creditItems: []`，信封 `code: 0`。
+  早期判据写成 `total === 0 && packages.length === 0 ⇒ null`，而 `readNumber` 对
+  「字段缺失」与「字段值为 0」都返回 0 —— 两件语义相反的事被压成同一个值，于是
+  **余额 0 被报成「余额查询失败」**，卡片永远停在失败态。
+  判据必须是**原始字段能否解析为数字**：字段存在（含 0、含字符串 `'0'`）即真实余额，
+  只有字段缺失且无任何明细才算「查不到」。排查该账号时可用 `/api/user/quota` 交叉确认
+  （实测 `freeCreditsTotal: 300 / freeCreditsUsed: 300 / freeCreditsRemaining: 0`）。
 
 **CodeArts** —— `GET /snap-manager/v1/statistics/plugin`（与账户类型检测**同一响应**）：
 
 - 取 `metrics[]` 中 `usageTotalPackageCredit` 的 `package_credit_remain`；**不累加**基础/按需/赠送分类明细（它们是总额的构成项，相加会重复计算）
 - 非积分账户的文案是「Token 计费账户，无积分余额」而非「查询失败」——账户类型差异不是故障。实现走 `CreditsEndpointDeps.fetchBalanceDetailed` 钩子带回精确原因
 
-**TRAE** —— `POST /trae/api/v2/pay/ide_user_ent_usage`（body **`{"require_usage": true, "req_source": 2}`**）：
+**TRAE** —— 基址取 `product.ugHost`、路径取 `product.entUsagePath`（body **`{"require_usage": true, "req_source": 2}`**）：
 
+| 区域 | 基址 | 路径 |
+|---|---|---|
+| 国内 `trae` | `api.trae.cn` | `/trae/api/v2/pay/ide_user_ent_usage` |
+| 国际 `trae-intl` | **`ug-normal.trae.ai`** | **`/trae/api/v1/pay/ide_user_ent_usage`**（v1） |
+
+- ⚠️ **国际版不是 `api.trae.ai`，路径也不是 v2**（真实缺陷，2026-10-03）：`api.trae.ai`
+  只承载 `/cloudide/api/v3/trae/*` 认证类接口，`/trae/api/*` 一律网关 404（同 host 的
+  `GetUserInfo` 对同一凭据返回 200 + `AIRegion: SG`，证明凭据有效、就是没有该服务）。
+  真实站点与路径来自 TRAE 官网 `account-setting` 的 bundle：`GetIdeUserEntUsage` →
+  `genBaseURL("/trae/api/v1/pay/ide_user_ent_usage")`，且该模块导出 `ug-normal.trae.ai`。
+  **教训**：国际版与国内版的差异**不只在域名，连路径版本号都不同**，所以两者都必须
+  由产品配置承载（`ugHost` + `entUsagePath`），不能有任何一处写死。
 - 响应 `user_entitlement_pack_list[]`，每项 `entitlement_base_info.quota.credits_limit` 为额度、`usage.credits_amount` 为已用
 - 余额 = `∑(credits_limit - credits_amount)`；`credits_limit <= 0` 的条目跳过（与 Go 端 `EntUsage` 同口径）
 - ⚠️ **必须带 `require_usage: true`**：不带时上游不返回 `usage` 明细，`credits_amount` 恒缺省为 0，余额会等于额度总额（虚高）。头同样走 `traeCheckinHeaders`
+- ⚠️ **用量计费（`is_dollar_usage_billing: true`）没有 credits 口径**：国际版 Free plan 的
+  `credits_limit` 恒为 0，只认 `credits_limit > 0` 会**一个包都产不出 ⇒ 返回 null ⇒
+  面板恒显示「余额查询失败」**。此时改列请求额度（与官网 usage 页同款字段，单位「次」）：
+  高级模型请求 `advanced_model_request_limit`、快速 `premium_model_fast_request_limit`、
+  慢速 `premium_model_slow_request_limit`、自动补全 `auto_completion_limit`。
+- ⚠️ **「有效」判定不能恒真**：`active` 原为硬编码 `true`，套餐到期后仍显示
+  「N/N 个资源包有效」并把失效额度算进总额（`expiredTotal` 更是从不累加）。
+  官网 bundle 的判据是 **`pack.status === d.it.Active`**（`Active` 实测为 `1`；
+  **不是** `ent_status` —— 后者在 bundle 里根本不是权益字段，只作为 `progress_status` /
+  `present_status` 的子串出现），到期时间取 `expire_time || entitlement_base_info.end_time`
+  （秒级）。未知 `status` **保守视为有效**，避免把未知当失效造成可见回退。
+  失效包不计入 `total` 而计入 `expiredTotal`，并把到期时间写入 `cycleEndTime` /
+  `expiredTime` 供卡片 tooltip 复用。
 
 上述各族共同的约定：
 

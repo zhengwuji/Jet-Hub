@@ -708,14 +708,18 @@ export interface RpcBackupImportResponse {
 /**
  * RPC: 查询当前账号池统计（导入前的覆盖提示用）。
  *
- * `withoutExpiry` 统计缺 `expiresAt` 的账号条目——这正是 DSH 版本切换后
- * 自动恢复（`bootstrapFromCredentialRefs`）产生的条目特征：反推只按凭据
- * ref 名重建，不读凭据值，故拿不到有效期。正常登录的账号基本都带
- * `expiresAt`。该数字用于导入前提示「有 N 个自动恢复的账号将被覆盖」。
+ * `withoutExpiry` 统计「缺 `expiresAt` **且** `refreshable`」的账号条目 ——
+ * 这正是 DSH 版本切换后自动恢复（`bootstrapFromCredentialRefs`）产生的条目特征：
+ * 反推只按凭据 ref 名重建，不读凭据值，故拿不到有效期，而它的 `refreshable`
+ * 是**硬编码 true**。该数字用于导入前提示「有 N 个自动恢复的账号将被覆盖」。
+ *
+ * ⚠️ **`refreshable` 这个条件不可省**：有一类 provider 的凭据结构上就没有过期
+ * 时间（CatPaw 只有 token + uid、ZCode 的令牌不可解析、粘贴 Key 族无固定有效期），
+ * 它们永远缺 `expiresAt`，只看缺失会把它们永久误报成「自动恢复的账号」。
  */
 export interface RpcBackupStatusResponse {
   /** 当前账号池的账号总数。 */
   accounts: number
-  /** 缺 `expiresAt` 的账号条目数（疑似自动恢复产物）。 */
+  /** 缺 `expiresAt` 且可续期的账号条目数（疑似自动恢复产物）。 */
   withoutExpiry: number
 }

@@ -10,6 +10,10 @@ import { registerClineLlm } from './cline-adapter.js'
 import { registerLoomyLlm, parseLoomyRemoteModels } from './loomy-adapter.js'
 import { registerRaccoonLlm } from './raccoon-adapter.js'
 import { registerKeyedLlm } from './keyed-adapter.js'
+import { registerZcodeLlm } from './zcode-adapter.js'
+import { registerAutoclawLlm } from './autoclaw-adapter.js'
+import { registerAccioLlm } from './accio-adapter.js'
+import { registerCatpawLlm } from './catpaw-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth, createPoolRefresh } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
@@ -19,10 +23,18 @@ import { ClineAuth } from './cline-auth.js'
 import { LoomyAuth } from './loomy-auth.js'
 import { RaccoonAuth } from './raccoon-auth.js'
 import { KeyedAuth } from './keyed-auth.js'
+import { ZcodeAuth } from './zcode-auth.js'
+import { AutoclawAuth } from './autoclaw-auth.js'
+import { AccioAuth } from './accio-auth.js'
+import { CatpawAuth } from './catpaw-auth.js'
 import { LOOMY } from './loomy-product.js'
 import { LoomyBalanceSelector } from './loomy-balance-selector.js'
 import { RACCOON } from './raccoon-product.js'
 import { ALL_KEYED_PRODUCTS } from './keyed-product.js'
+import { ZCODE, ZCODE_INTL } from './zcode-product.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js'
+import { ACCIO, ACCIO_CN } from './accio-product.js'
+import { CATPAW } from './catpaw-product.js'
 import { AccountPool } from './account-pool.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { broadcastCatalogChanged, buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
@@ -40,6 +52,14 @@ import type { LoomyCredential } from './loomy.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { KeyedCredential } from './keyed.js'
 import { parseKeyedCredential } from './keyed.js'
+import type { ZcodeCredential } from './zcode.js'
+import { parseZcodeCredential } from './zcode.js'
+import type { AutoclawCredential } from './autoclaw.js'
+import { parseAutoclawCredential } from './autoclaw.js'
+import type { AccioCredential } from './accio.js'
+import { parseAccioCredential } from './accio.js'
+import type { CatpawCredential } from './catpaw.js'
+import { parseCatpawCredential } from './catpaw.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -158,6 +178,10 @@ export function apply(ctx: Context): void {
     'llm-codearts', 'llm-lobsterai',
     'llm-qoder', 'llm-qoder-cn', 'llm-trae', 'llm-trae-intl',
     'llm-cline', 'llm-loomy', 'llm-raccoon', 'llm-commandcode', 'llm-opencode-zen',
+    'llm-zcode', 'llm-zcode-intl',
+    'llm-autoclaw', 'llm-autoclaw-intl',
+    'llm-accio', 'llm-accio-cn',
+    'llm-catpaw',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -760,6 +784,248 @@ export function apply(ctx: Context): void {
     ctx.logger.warn(`[jet-hub] 修正 Raccoon 账号显示名失败：${String(error)}`)
   })
 
+  // ===== ZCode（智谱 / Z.AI 编码代理客户端）服务 =====
+  // 第十个产品线，与前面九者**都不同源**：登录是**服务端中介的 CLI 轮询**
+  // （`/oauth/cli/init` + `/oauth/cli/poll/{flow_id}`，不起本地回调端口 ——
+  // 造一个带 localhost redirect_uri 的授权地址会被上游拒），
+  // 且登录后**必须再换一次**推理凭证（OAuth 的 access_token 不是推理凭证，
+  // 直接拿去打 /chat/completions 必 401）。
+  //
+  // 两个区域分别注册（国内 `zcode` / 国际 `zcode-intl`）：zcode 平面两地相同
+  // （都是 zcode.z.ai），只有**推理平面**不同（open.bigmodel.cn / api.z.ai），
+  // 登录态互不相通，故与 qoder / trae 一样各自成实例、互不覆盖。
+  //
+  // 服务名由 ZcodeAuth 依 product.id 派生 → ctx.zcodeAuth / ctx['zcode-intlAuth']。
+  // 不注册斜杠命令：入口在 Jet Hub 的 ZCode 面板。
+  const zcode = new ZcodeAuth(ctx, { product: ZCODE })
+  const zcodeAdapter = registerZcodeLlm(ctx, {
+    credentialRef: credentialRef(ZCODE.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 zcode 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 ZCODE.id 而非字面量：写死字面量在改名/多产品场景下
+      // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(ZCODE.id, '')
+      if (available) return parseZcodeCredential(available.credential)
+      const resolved = await ctx.credentials.resolve(credentialRef(ZCODE.defaultCredentialRef))
+      if (!resolved) return undefined
+      return parseZcodeCredential(resolved.value)
+    },
+    refresh: async () => {
+      // ⚠️ 本家**不可续期**（上游没有 refresh 端点）：这里的语义是「如实报错
+      // 让用户重新登录」，而不是「换个新令牌」。仍须针对**解析凭据时所用的
+      // 那一个**账号，而不是默认单凭据 ref。
+      const available = await pool.getAvailableAccount(ZCODE.id, '')
+      if (available) await zcode.refreshAccountCredential(available.entry.credentialRef)
+      else await zcode.refresh()
+    },
+    // 图片字节桥接：ZCode 的视觉档（glm-4.6v / glm-5v-turbo）支持图片，
+    // 模态按模型判定（静态表的 supportsImage）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: ZCODE,
+  })
+
+  // ===== ZCode 国际版（Z.AI）服务 =====
+  // 与国内版共用 ZcodeAdapter，端点与 OAuth 的 provider 取值差异全部由
+  // product 配置承载。登录态互不相通，故独立 provider 与独立凭据 ref。
+  const zcodeIntl = new ZcodeAuth(ctx, { product: ZCODE_INTL })
+  const zcodeIntlAdapter = registerZcodeLlm(ctx, {
+    credentialRef: credentialRef(ZCODE_INTL.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 `zcode-intl` 的账号池取号，回退到国际版自己的 ref ——
+      // 绝不回退到国内版 ref（两者登录态不通，串用必然 401）。
+      const available = await pool.getAvailableAccount(ZCODE_INTL.id, '')
+      if (available) return parseZcodeCredential(available.credential)
+      const resolved = await ctx.credentials.resolve(credentialRef(ZCODE_INTL.defaultCredentialRef))
+      if (!resolved) return undefined
+      return parseZcodeCredential(resolved.value)
+    },
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(ZCODE_INTL.id, '')
+      if (available) await zcodeIntl.refreshAccountCredential(available.entry.credentialRef)
+      else await zcodeIntl.refresh()
+    },
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: ZCODE_INTL,
+  })
+
+  // ===== AutoClaw（智谱 autoglm）服务 =====
+  // 第十一个产品线。**国内版与国际版是两家 provider**（与 AutoClaw 的两个地区
+  // 同一思路：地区做成账号的属性会让「哪个账号走哪个站点」看不出来）。
+  //
+  // 两家**共用一套实现**（`AutoclawAdapter` 持有一个 product），差异只有：
+  //   · 上游域名（zhipuai.cn / autoglm.ai）
+  //   · 登录方式：国内版**手机验证码**、国际版 **Zai/Google 网页 OAuth**
+  //   · 订阅接口路径
+  //
+  // ⚠️ 认证头是 **`X-Authorization`**（不是 `Authorization`）—— 发错稳定 401。
+  // ⚠️ 出站 system 提示词必须过白名单改写（`normalizeAutoclawSystemMessages`）：
+  //    上游 2026-09-22 起对 system 做**字面**校验，带外来身份句会 403/406。
+  // 服务名由 AutoclawAuth 依 product.id 派生 → ctx.autoclawAuth / ctx['autoclaw-intlAuth']。
+  const autoclaw = new AutoclawAuth(ctx, { product: AUTOCLAW })
+  const autoclawAdapter = registerAutoclawLlm(ctx, {
+    credentialRef: credentialRef(AUTOCLAW.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 autoclaw 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 AUTOCLAW.id 而非字面量：写死字面量在改名/多产品场景下
+      // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(AUTOCLAW.id, '')
+      if (available) return parseAutoclawCredential(available.credential)
+      const resolved = await ctx.credentials.resolve(credentialRef(AUTOCLAW.defaultCredentialRef))
+      if (!resolved) return undefined
+      return parseAutoclawCredential(resolved.value)
+    },
+    refresh: async () => {
+      // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
+      // 两者错配会让「刚登录好却一直认证失败」（本插件在 LobsterAI 上踩过）。
+      const available = await pool.getAvailableAccount(AUTOCLAW.id, '')
+      if (available) await autoclaw.refreshAccountCredential(available.entry.credentialRef)
+      else await autoclaw.refresh()
+    },
+    fetchRemoteModels: () => autoclaw.fetchModels(pool),
+    // 图片字节桥接：glm-5.3-flash 支持图片（远端 input 含 image）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: AUTOCLAW,
+  })
+
+  // ===== AutoClaw 国际版（autoglm.ai）服务 =====
+  // 与国内版共用 AutoclawAdapter，差异全部由 product 配置承载。
+  // ⚠️ 国际版走 **OAuth 网页登录**（国内版是手机验证码），且回调端口有白名单
+  // （`AUTOCLAW_CALLBACK_PORTS`，Zai 逐字校验且 host 必须是 `localhost`）。
+  const autoclawIntl = new AutoclawAuth(ctx, { product: AUTOCLAW_INTL })
+  const autoclawIntlAdapter = registerAutoclawLlm(ctx, {
+    credentialRef: credentialRef(AUTOCLAW_INTL.defaultCredentialRef),
+    resolveCredential: async () => {
+      const available = await pool.getAvailableAccount(AUTOCLAW_INTL.id, '')
+      if (available) return parseAutoclawCredential(available.credential)
+      const resolved = await ctx.credentials.resolve(credentialRef(AUTOCLAW_INTL.defaultCredentialRef))
+      if (!resolved) return undefined
+      return parseAutoclawCredential(resolved.value)
+    },
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(AUTOCLAW_INTL.id, '')
+      if (available) await autoclawIntl.refreshAccountCredential(available.entry.credentialRef)
+      else await autoclawIntl.refresh()
+    },
+    fetchRemoteModels: () => autoclawIntl.fetchModels(pool),
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: AUTOCLAW_INTL,
+  })
+
+  // ===== Accio（阿里 Accio Work）服务 =====
+  // 第十二个产品线，上游不是 OpenAI 协议而是**阿里 ADK 的 Gemini 风格信封**
+  // （`POST /api/adk/llm/generateContent`，SSE，token 放在 **body** 里而不是头），
+  // 因此适配器自己完成「构造 → 发送 → 翻译」，与 Qoder / CatPaw 同一处境。
+  //
+  // 两家**共用一套实现**（`AccioAdapter` 持有一个 product），差异只有三处：
+  //   · 登录站点（www.accio.com / www.accio-ai.com）
+  //   · `x-package-region`（GLOBAL / CN）
+  //   · provider id 与账号 id 前缀
+  // 业务网关与推理网关是**同一个 host**，client_id 两地逐字相同。
+  //
+  // 服务名由 AccioAuth 依 product.id 派生 → ctx.accioAuth / ctx['accio-cnAuth']。
+  const accio = new AccioAuth(ctx, { product: ACCIO })
+  const accioAdapter = registerAccioLlm(ctx, {
+    credentialRef: credentialRef(ACCIO.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 accio 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 ACCIO.id 而非字面量：写死字面量在改名/多产品场景下
+      // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(ACCIO.id, '')
+      if (available) return parseAccioCredential(available.credential)
+      const resolved = await ctx.credentials.resolve(credentialRef(ACCIO.defaultCredentialRef))
+      if (!resolved) return undefined
+      return parseAccioCredential(resolved.value)
+    },
+    refresh: async () => {
+      // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
+      // ⚠️ 传 pool + accountId：续期成功后要把新的 expiresAt 写回账号池，
+      // 否则 UI 会一直显示「已过期」而实际能正常发消息（raccoon 踩过的坑）。
+      const available = await pool.getAvailableAccount(ACCIO.id, '')
+      if (available) await accio.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
+      else await accio.refresh()
+    },
+    fetchRemoteModels: () => accio.fetchModels(pool),
+    // 图片字节桥接：目录 `multimodal` 为真才播报图片能力（按模型判定）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: ACCIO,
+  })
+
+  // ===== Accio 国内版（www.accio-ai.com）服务 =====
+  // 与上面的国际版共用 AccioAdapter，差异全部由 product 配置承载。
+  // 服务名由 product.id 派生 → 注册为 ctx['accio-cnAuth']，与国际版互不覆盖。
+  const accioCn = new AccioAuth(ctx, { product: ACCIO_CN })
+  const accioCnAdapter = registerAccioLlm(ctx, {
+    credentialRef: credentialRef(ACCIO_CN.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 `accio-cn` 的账号池取号，回退到国内版自己的单凭据 ref ——
+      // 绝不回退到国际版 ref（两者登录态不通，串用必然 401）。
+      const available = await pool.getAvailableAccount(ACCIO_CN.id, '')
+      if (available) return parseAccioCredential(available.credential)
+      const resolved = await ctx.credentials.resolve(credentialRef(ACCIO_CN.defaultCredentialRef))
+      if (!resolved) return undefined
+      return parseAccioCredential(resolved.value)
+    },
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(ACCIO_CN.id, '')
+      if (available) await accioCn.refreshAccountCredential(available.entry.credentialRef, pool, available.entry.id)
+      else await accioCn.refresh()
+    },
+    fetchRemoteModels: () => accioCn.fetchModels(pool),
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: ACCIO_CN,
+  })
+
+  // ===== CatPaw（美团 AI 客户端）服务 =====
+  // 第十三个产品线，也是**最难**的一家：上游不是 OpenAI 协议，而是一套自有的
+  // **conversation 会话协议**（round → event(running) → turn(SSE) → 工具循环
+  // → event(completed)），一次客户端请求对应多个上游请求，中间还要维护
+  // 「x-session-id → conversationId」映射与已同步消息的指纹链。
+  //
+  // 因此适配器是**有状态**的（`is_stateful` 语义）：会话注册表只在进程内，
+  // 重启后自然回落到「全新会话 + 全量历史」，功能不受影响。
+  //
+  // ⚠️ 凭据是桌面端会话 Cookie 里的 `X-Passport-Token` + 独立的 `uid` 头
+  //    （token 不是 JWT，不含 uid），且**没有 refreshToken** —— 过期只能重新登录。
+  // 服务名由 CatpawAuth 派生 → ctx.catpawAuth。不注册斜杠命令。
+  const catpaw = new CatpawAuth(ctx, { product: CATPAW })
+  const catpawAdapter = registerCatpawLlm(ctx, {
+    credentialRef: credentialRef(CATPAW.defaultCredentialRef),
+    resolveCredential: async () => {
+      // 只从 catpaw 自己的账号池取账号，回退到自己的单凭据 ref，
+      // 保证不会串用其它 provider 的凭据。
+      // provider 实参用 CATPAW.id 而非字面量：写死字面量在改名/多产品场景下
+      // 会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+      const available = await pool.getAvailableAccount(CATPAW.id, '')
+      if (available) return parseCatpawCredential(available.credential)
+      const resolved = await ctx.credentials.resolve(credentialRef(CATPAW.defaultCredentialRef))
+      if (!resolved) return undefined
+      return parseCatpawCredential(resolved.value)
+    },
+    refresh: async () => {
+      // ⚠️ 本家**没有 refreshToken、没有续期端点**：这里的语义是「如实报错
+      // 让用户重新登录」（与 Loomy / ZCode 同型）。仍须针对**解析凭据时所用的
+      // 那一个**账号，而不是默认单凭据 ref。
+      const available = await pool.getAvailableAccount(CATPAW.id, '')
+      if (available) await catpaw.refreshAccountCredential(available.entry.credentialRef)
+      else await catpaw.refresh()
+    },
+    fetchRemoteModels: () => catpaw.fetchModels(pool),
+    // 图片字节桥接：上游**不拉取 http(s) 图片**，只能内联 data URL；过大时
+    // 适配器会如实省略而不是发一个必然 504 的请求（见适配器模块头）。
+    readImage: makeReadImage(ctx),
+    accountPool: pool,
+    product: CATPAW,
+  })
+
   // ===== 「粘贴 API Key」族（commandcode / opencode）=====
   // 这两个 provider 与其余 12 个**形态完全不同**：凭据由用户在前端弹窗里
   // 粘贴（`login.submitKey`），插件负责校验后持久化。
@@ -884,6 +1150,31 @@ export function apply(ctx: Context): void {
     await raccoon.refreshAll(pool)
     } catch { /* 静默 */ }
     try {
+      // ⚠️ ZCode 不可续期（无 refresh 端点）：这里是**标记纠正**（把误标的
+      // refreshable 改回 false），不是续期。见 ZcodeAuth.refreshAll。
+      await zcode.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await zcodeIntl.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await autoclaw.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await autoclawIntl.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await accio.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      await accioCn.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
+      // ⚠️ CatPaw 不可续期（无 refreshToken）：这里是**标记纠正**，
+      // 把误标的 refreshable 改回 false，避免调度器每轮白试。
+      await catpaw.refreshAll(pool)
+    } catch { /* 静默 */ }
+    try {
       // ⚠️ 本族恒不可续期（Key 由用户手工粘贴），这里是**空操作**。
       // 保留调用只为与其余 provider 形态一致 —— 否则这里得为它们加特例分支。
       for (const auth of keyedServices.values()) await auth.refreshAll(pool)
@@ -916,6 +1207,13 @@ export function apply(ctx: Context): void {
         cline.stop()
         loomy.stop()
         raccoon.stop()
+        zcode.stop()
+        zcodeIntl.stop()
+        autoclaw.stop()
+        autoclawIntl.stop()
+        accio.stop()
+        accioCn.stop()
+        catpaw.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -935,6 +1233,13 @@ export function apply(ctx: Context): void {
     cline.stop()
     loomy.stop()
     raccoon.stop()
+    zcode.stop()
+    zcodeIntl.stop()
+    autoclaw.stop()
+    autoclawIntl.stop()
+    accio.stop()
+    accioCn.stop()
+    catpaw.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== 可配置 provider 目录项：注册即固定，不做动态增删 =====
@@ -978,6 +1283,13 @@ export function apply(ctx: Context): void {
     cline: clineAdapter,
     loomy: loomyAdapter,
     raccoon: raccoonAdapter,
+    zcode: zcodeAdapter,
+    'zcode-intl': zcodeIntlAdapter,
+    autoclaw: autoclawAdapter,
+    'autoclaw-intl': autoclawIntlAdapter,
+    accio: accioAdapter,
+    'accio-cn': accioCnAdapter,
+    catpaw: catpawAdapter,
     // 「粘贴 Key」族的适配器实例：设置页「模型列表」要用它们的 `listAllModels()`
     // （不受黑名单影响的全量目录）。每个产品的目录是**其全部账号模型的并集**。
     ...Object.fromEntries(keyedAdapters),
@@ -1001,6 +1313,13 @@ export function apply(ctx: Context): void {
     cline,
     loomy,
     raccoon,
+    zcode,
+    zcodeIntl,
+    autoclaw,
+    autoclawIntl,
+    accio,
+    accioCn,
+    catpaw,
     keyed: keyedServices,
     modelAdapters,
   })

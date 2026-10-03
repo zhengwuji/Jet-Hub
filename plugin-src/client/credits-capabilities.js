@@ -103,6 +103,32 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   loomy: Object.freeze({ balance: true, dailyCheckin: true, onboardingTasks: true }),
   // Raccoon Work（商汤小浣熊）：余额 + **一次性**登录奖励。
   raccoon: Object.freeze({ balance: true, onboardingTasks: true }),
+  // ZCode（智谱 / Z.AI 编码代理客户端）：**只有余额**（套餐额度）。
+  //
+  // ⚠️ 没有每日签到，也**不登记** `onboardingTasks`：ZCode 的运营玩法是
+  // 「限时套餐领取」，而那条链**每条请求都要一枚阿里云验证码令牌**，令牌只能由
+  // 桌面端 WebView 铸造（阿里云侧有铸造风控，Node 侧无 DOM 铸不出来）。
+  // 本插件是宿主侧 Node 进程，做不到，故如实登记为不支持 ——
+  // 与 AGENTS.md「不支持的 provider 必须如实返回 null 状态，不得臆造」同一取舍。
+  // 面板因此不会渲染「一键领取积分」按钮，也不会发起必然失败的请求。
+  zcode: Object.freeze({ balance: true, dailyCheckin: false }),
+  // ZCode 国际版（Z.AI）：同一套协议、同一份实现，只是推理平面不同。
+  'zcode-intl': Object.freeze({ balance: true, dailyCheckin: false }),
+  // AutoClaw（智谱 autoglm）国内/国际两版：**余额 + 每日签到**都有。
+  // 签到走 `POST /autoclaw-proxy/proxy/autoclaw-task-complete` body
+  // `{task_id:'daily_signin'}`；幂等判据是**响应体字段**
+  //（`already_completed === true` 一律算「今天已签到」），
+  // 重复领取同样返回 HTTP 200 + `success:false` —— **不能只看状态码**。
+  autoclaw: Object.freeze({ balance: true, dailyCheckin: true }),
+  'autoclaw-intl': Object.freeze({ balance: true, dailyCheckin: true }),
+  // Accio（阿里 Accio Work）国际/国内两版：**只有余额**（`/api/entitlement/quota`
+  // 的用量百分比），**没有签到** —— 上游全包检索无「签到 / checkin」活动。
+  accio: Object.freeze({ balance: true, dailyCheckin: false }),
+  'accio-cn': Object.freeze({ balance: true, dailyCheckin: false }),
+  // CatPaw（美团）：**只有余额**（`GET https://catx.nocode.cn/api/gateway/credit/balance`，
+  // 该端点只认 `X-Auth-Token` 头 —— `X-Passport-Token` / `Cookie` / `Authorization`
+  // 全部 401）。上游**没有**每日签到活动。
+  catpaw: Object.freeze({ balance: true, dailyCheckin: false }),
   // 「粘贴 API Key」族（Command Code / OpenCode Zen）：**两项都没有**，
   // 且是刻意的负能力登记。
   //
@@ -140,6 +166,9 @@ export const RATE_LIMIT_CAPABILITIES = Object.freeze({
   // Loomy（讯飞）：**不返回限流错误** —— 积分耗尽时静默降级为扣永久积分，
   // 故「重测 / 重置」这组按钮对它无意义（重测还会白烧积分）。
   loomy: Object.freeze({ rateLimit: false }),
+  // CatPaw（美团）：上游**没有任何 429 判定**（原项目全仓 grep 429 零命中），
+  // 也没有多账号轮换或可解析的限额码 —— 「重测 / 重置」按钮同样无意义。
+  catpaw: Object.freeze({ rateLimit: false }),
 });
 
 /**

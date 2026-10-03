@@ -474,6 +474,56 @@ res.writeHead(400, ...); res.end(...); return   // ← 没有 resolve 也没有 
 > `TRAE_CHECKIN_BUSY_CODE` 的轮换链路**保留但不再被调用**，仅为兼容既有账号条目；
 > 新语义下设备号由 `uid` 派生，无需持久化代次。
 
+### ⚠️ 积分/用量查询：国际版的**站点与版本号都与国内版不同**（2026-10-03 实测）
+
+**真实缺陷**：`postJson` 把 `https://api.trae.cn` 与 v2 路径**写死**，于是
+`TraeProduct.ugHost` 成了死配置、`entUsagePath` 更是根本不存在 —— 国际版账号被发到
+国内站点 + 错版本号，面板恒显示「余额查询失败」。用户看到的故障是「查询失败」，
+真相却是**端点根本不对**。
+
+必须记住的几件事：
+
+1. **国际版的 Ug 站点不是 `api.trae.ai`，而是 `ug-normal.trae.ai`**。
+   `api.trae.ai` 只承载认证类接口（`/cloudide/api/v3/trae/*`）：同 host 的
+   `GetUserInfo` 对**同一凭据**返回 200 且 `AIRegion: "SG"`、`Region: "Singapore-Central"`
+   —— 凭据有效、登录态正常，只是**没有** Ug 服务（`/trae/api/*` 一律网关 404）。
+   ⚠️ **别再用「这个 host 上没有」推断「接口不存在」** —— 那正是本次误判的成因，
+   我因此一度向用户报告「国际版没有该接口」，随后被用户用官网用量页推翻。
+
+2. **路径版本号也不同**：国内 v2、国际 **v1**。
+   `POST /trae/api/v1/pay/ide_user_ent_usage`（国际）vs
+   `POST /trae/api/v2/pay/ide_user_ent_usage`（国内）。国际版打 v2 是 404。
+   ⚠️ 所以「按区域取产品配置」不够 —— **域名与路径版本两个维度都得下沉到产品配置**。
+
+3. **判据来自官方自己的前端**，不必靠猜：TRAE 官网 `account-setting` 页面的 bundle 里
+   `GetIdeUserEntUsage` → `genBaseURL("/trae/api/v1/pay/ide_user_ent_usage")`，
+   该模块导出的 API 基址即 `ug-normal.trae.ai`（导出名 `QU` / `gp`）。
+   同一 bundle 还给出该页展示的用量字段：`slowRequestLimit/Usage`、
+   `advancedModelLimit/Usage`、`autocompleteLimit/Usage`
+   → 分别对应 `premium_model_slow_request_limit` / `advanced_model_request_limit` /
+   `auto_completion_limit`（及其 `*_usage` / `*_amount`）。
+   ⚠️ **网页端 bundle 里没有 `checkin_credits` 字面量**（网页端不做签到），
+   所以国际版的签到端点**仍未找到**，`trae-intl` 的「一键领取」目前会失败。
+
+4. **国际版是「用量计费」，没有 credits 口径**：`is_dollar_usage_billing: true`、
+   Free plan 的 `credits_limit` 恒为 0。只认 `credits_limit > 0` 的实现对这类账号
+   **一个包都产不出 ⇒ 返回 null ⇒ 面板「余额查询失败」**。故在 `credits_limit <= 0`
+   时改列上面那组请求额度，单位「次」。
+
+5. ⚠️ **`active` 不得恒真**：原实现硬编码 `true`，套餐到期后仍显示「N/N 个资源包有效」
+   且把失效额度算进总额（`expiredTotal` 从不累加，声明了却从不写入）。
+   官方判据是 **`pack.status === d.it.Active`**（`Active` 实测为 `1`），到期时间取
+   `expire_time || entitlement_base_info.end_time`（秒级）。
+   ⚠️ **不是 `ent_status`** —— 它在 bundle 里只作为 `progress_status` /
+   `present_status` 的子串出现，不是权益字段。未知 `status` 保守视为有效，
+   避免把未知当失效造成可见回退。
+
+判定与探针的写法：
+
+- ⚠️ **探针必须用 `new Headers(base).set(...)`** 叠同名头（见上文通则）。
+- ⚠️ **`claim` 是写端点，探针绝不能用它试探路由** —— 命中且账号可领就会真的领取。
+  测路由存在性只用只读端点（`ide_user_ent_usage` / `checkin_credits/status`）。
+
 ### ⚠️ 历史超过约 500K 字符时上游会**静默断流**
 
 上游在请求体过大时会**不发错误码、直接结束事件流** —— 日志里看到的只是「模型

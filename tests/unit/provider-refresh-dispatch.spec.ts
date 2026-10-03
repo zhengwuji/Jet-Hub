@@ -65,6 +65,20 @@ const RPC_SERVICE_FIELD: Record<string, keyof JetHubRpcServices> = {
   cline: 'cline',
   loomy: 'loomy',
   raccoon: 'raccoon',
+  // ZCode 两个地区：**没有** refresh 端点（上游不提供），但账号卡片的
+  // 「刷新」仍必须有一条分支 —— 语义是**有效性探测 + 如实报错**，
+  // 否则会抛 `Unknown provider: zcode`（与 byok 那次同一形态的缺陷）。
+  zcode: 'zcode',
+  'zcode-intl': 'zcodeIntl',
+  // AutoClaw 两个地区：有 refresh_token 轮换（`400002` 时降级重试）。
+  autoclaw: 'autoclaw',
+  'autoclaw-intl': 'autoclawIntl',
+  // Accio 两个地区：有 refresh_token 轮换（401 后走 force=true 强制续期）。
+  accio: 'accio',
+  'accio-cn': 'accioCn',
+  // CatPaw（美团）：**没有 refreshToken、没有续期端点**，但账号卡片的
+  // 「刷新」仍必须有一条分支（语义是有效性探测 + 如实报错）。
+  catpaw: 'catpaw',
 }
 
 /** 从客户端源码派生 provider id 集合（与面板列表同一真相源）。 */
@@ -157,6 +171,13 @@ async function callRefresh(
     cline: makeServiceStub('cline', calls) as never,
     loomy: makeServiceStub('loomy', calls) as never,
     raccoon: makeServiceStub('raccoon', calls) as never,
+    zcode: makeServiceStub('zcode', calls) as never,
+    zcodeIntl: makeServiceStub('zcode-intl', calls) as never,
+    autoclaw: makeServiceStub('autoclaw', calls) as never,
+    autoclawIntl: makeServiceStub('autoclaw-intl', calls) as never,
+    accio: makeServiceStub('accio', calls) as never,
+    accioCn: makeServiceStub('accio-cn', calls) as never,
+    catpaw: makeServiceStub('catpaw', calls) as never,
     // 「粘贴 Key」族（commandcode / opencode）：它们**没有** refresh 端点，
     // 这个替身的 `refreshAccountCredential` 语义是**有效性探测**（打一次平台
     // chat 端点），但对外仍是同一个入口 —— 故它们同样必须出现在这张 Map 里，

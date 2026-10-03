@@ -157,6 +157,35 @@ const COMMANDCODE_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/200
 
 const OPENCODE_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%232f3640"/%3E%3Cpath d="M8.4 7.5h4.1a4.5 4.5 0 0 1 0 9H8.4z" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/%3E%3C/svg%3E';
 
+/**
+ * ZCode（智谱 / Z.AI 编码代理客户端）图标。
+ *
+ * 内联 SVG（与 keyed 族同款做法）：`Z` 字标 + 编码斜杠，无外部依赖、
+ * 不新增图片资源，暗色底与其它非厂商图标一致。
+ */
+const ZCODE_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%232f3640"/%3E%3Cpath d="M7 7.6h6.6L7 16.4h10" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/%3E%3C/svg%3E';
+
+/**
+ * AutoClaw（智谱 autoglm）图标。
+ *
+ * 内联 SVG（与 keyed / zcode 族同款做法）：爪形抽象标记，无外部依赖。
+ */
+const AUTOCLAW_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%232f3640"/%3E%3Cpath d="M8 16.5c0-3.6 1.8-6.5 4-6.5s4 2.9 4 6.5" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"/%3E%3Ccircle cx="12" cy="7.4" r="1.9" fill="white"/%3E%3C/svg%3E';
+
+/**
+ * Accio（阿里 Accio Work）图标。
+ *
+ * 内联 SVG（与 keyed / zcode / autoclaw 族同款做法）：环形轨道标记，无外部依赖。
+ */
+const ACCIO_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%232f3640"/%3E%3Ccircle cx="12" cy="12" r="5.2" fill="none" stroke="white" stroke-width="2"/%3E%3Ccircle cx="12" cy="12" r="1.6" fill="white"/%3E%3Cpath d="M12 3.4v3.1M12 17.5v3.1" stroke="white" stroke-width="2" stroke-linecap="round"/%3E%3C/svg%3E';
+
+/**
+ * CatPaw（美团）图标。
+ *
+ * 内联 SVG（与其余非厂商图标同款做法）：爪印标记，无外部依赖。
+ */
+const CATPAW_ICON = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"%3E%3Crect width="24" height="24" rx="6" fill="%232f3640"/%3E%3Ccircle cx="12" cy="14.4" r="3.1" fill="white"/%3E%3Ccircle cx="7.6" cy="9.7" r="1.7" fill="white"/%3E%3Ccircle cx="16.4" cy="9.7" r="1.7" fill="white"/%3E%3Ccircle cx="10.4" cy="6.7" r="1.5" fill="white"/%3E%3Ccircle cx="13.6" cy="6.7" r="1.5" fill="white"/%3E%3C/svg%3E';
+
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'CodeArts (华为云)', icon: CODEARTS_ICON, logoClass: 'codearts' },
   { id: 'buddy', label: 'CodeBuddy (国内版)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
@@ -177,6 +206,25 @@ const PROVIDERS = Object.freeze([
   // ⚠️ 用『Raccoon (商汤)』而非『Raccoon Work (商汤)』—— 后者在 provider 列表里
   // **触发换行**（用户报障）。与 `RaccoonProduct.displayName` 保持一致。
   { id: 'raccoon', label: 'Raccoon (商汤)', icon: RACCOON_ICON, logoClass: 'raccoon' },
+  // ZCode 分国内/国际两版：zcode 平面（登录 / 领取）两地**相同**
+  // （都是 zcode.z.ai），只有**推理平面**不同（open.bigmodel.cn / api.z.ai），
+  // 登录态互不相通，故各占一个面板（见 src/zcode-product.ts 的模块头）。
+  { id: 'zcode', label: 'ZCode (国内版)', icon: ZCODE_ICON, logoClass: 'zcode' },
+  { id: 'zcode-intl', label: 'ZCode (国际版)', icon: ZCODE_ICON, logoClass: 'zcode' },
+  // AutoClaw 分国内/国际两版：上游域名、登录方式（手机验证码 / 网页 OAuth）
+  // 与订阅接口都不同，登录态互不相通，故各占一个面板
+  //（见 src/autoclaw-product.ts 的模块头）。
+  { id: 'autoclaw', label: 'AutoClaw (国内版)', icon: AUTOCLAW_ICON, logoClass: 'autoclaw' },
+  { id: 'autoclaw-intl', label: 'AutoClaw (国际版)', icon: AUTOCLAW_ICON, logoClass: 'autoclaw' },
+  // Accio（阿里 Accio Work）分国际/国内两版：登录站点与 `x-package-region`
+  // 不同（业务网关与推理网关两地相同），登录态互不相通，故各占一个面板
+  //（见 src/accio-product.ts 的模块头）。
+  { id: 'accio', label: 'Accio (国际版)', icon: ACCIO_ICON, logoClass: 'accio' },
+  { id: 'accio-cn', label: 'Accio (国内版)', icon: ACCIO_ICON, logoClass: 'accio' },
+  // CatPaw（美团）：上游是**自有的 conversation 会话协议**（不是 OpenAI 兼容），
+  // 是本插件唯一的有状态 provider，故独占一个面板
+  //（见 src/catpaw-product.ts 与 src/catpaw-adapter.ts 的模块头）。
+  { id: 'catpaw', label: 'CatPaw (美团)', icon: CATPAW_ICON, logoClass: 'catpaw' },
   // 「粘贴 API Key」族：**非厂商**面板项，代表「自带 Key」这一类渠道。
   //
   // ⚠️ 与其余 13 项的两点差异：
@@ -357,6 +405,52 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
+/**
+ * 渲染账号卡片的「有效期」值。
+ *
+ * ## 为什么单独成函数
+ *
+ * 这段判据有四种出口，每种背后的「为什么」都不短；塞在 `AccountCard` 的 JSX
+ * 里会把卡片正文撑长（而卡片正文是源码级回归测试按窗口截取比对的对象，
+ * 见 `tests/unit/credits-capabilities.spec.ts`）。抽出来既让卡片保持可读，
+ * 也让这段语义有一处明确的注释归属。
+ *
+ * ## 四种出口
+ *
+ * 1. **有 `expiresAt`** → 显示时间，可续期时追加「· 自动续期」；
+ * 2. **「粘贴 Key」族**（`commandcode` / `opencode-zen`）→ 用户自己贴的
+ *    第三方 Key，对方平台不提供过期时间，故明说「不适用」而不是留悬念；
+ * 3. **不可续期且上游没给过期时间** → 说明**上游压根没下发**，不是我们弄丢了。
+ *    CatPaw 就是这一类：凭据只有 `X-Passport-Token` 与 `uid`，token 不是 JWT、
+ *    也没有 `expires_at`，上游只在真正失效时回 401
+ *    （见 `catpawCredentialExpiresAtMs`）；ZCode 同型（编码套餐的访问令牌是
+ *    不透明串，套餐 JWT 只带 `iat` 不带 `exp`）。
+ *    ⚠️ 判据用 `refreshable` 而**不是逐个列 provider id**：它恰好表达
+ *    「这份凭据能不能自己变新」——不能变新又没有过期时间的，就只能等上游报错。
+ *    这样将来新增同类渠道也不必回来维护清单。
+ * 4. **其余**（可续期却仍无 `expiresAt`，属异常数据）→ 才显示「未知」。
+ *
+ * ⚠️ 第 2、3 种出口是**真实用户反馈**驱动的：一律显示「未知」会让用户以为
+ * 凭据坏了，进而去重新登录一个本来正常的账号。
+ */
+function renderExpiryValue(account, provider) {
+  if (account.expiresAt) {
+    return `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
+  }
+  if (KEYED_PROVIDER_IDS.includes(provider)) {
+    return React.createElement('span', {
+      title: 'API Key 没有固定有效期；是否仍可用由平台决定（遇 401 请重新粘贴）',
+    }, '不适用（API Key 无固定有效期）')
+  }
+  if (!account.refreshable) {
+    return React.createElement('span', {
+      title: '该渠道上游不下发过期时间（登录态里只有令牌与身份，不是 JWT）。'
+        + '无法预判何时失效；失效时请求会报未授权，届时重新登录并把新登录态导入即可。',
+    }, '上游未提供（失效后需重新登录）')
+  }
+  return '未知'
+}
+
 function AccountCard({ account, provider, index, order, onToggle, onDelete, onRetest, onReset, onClaimOnboarding, onboardingBusy, busy, credits, creditsLoading, showCredits, showRateLimitActions, drag }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
@@ -414,17 +508,8 @@ function AccountCard({ account, provider, index, order, onToggle, onDelete, onRe
       React.createElement('div', { className: 'dim-jh-metaRow' },
         React.createElement('dt', null, '有效期'),
         React.createElement('dd', { 'data-tone': expired ? 'warn' : undefined },
-          account.expiresAt
-            ? `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
-            // ⚠️ 「粘贴 Key」族的「凭据」是用户自己粘贴的第三方 API Key：
-            // 对方平台不提供过期时间，凭据里自然没有 `expiresAt`。此时一律显示
-            // 「未知」会让用户以为凭据坏了（真实反馈过「怎么显示未知？」）
-            // —— 不是故障，是这一行对它不适用，故明说语义而不是留一个悬念。
-            : (KEYED_PROVIDER_IDS.includes(provider)
-                ? React.createElement('span', {
-                    title: 'API Key 没有固定有效期；是否仍可用由平台决定（遇 401 请重新粘贴）',
-                  }, '不适用（API Key 无固定有效期）')
-                : '未知'))),
+          // 出口与各自的原委见 `renderExpiryValue` 的文档注释。
+          renderExpiryValue(account, provider))),
       // 不支持积分余额的 provider 不渲染该行：留着它只能显示「查询失败」，
       // 而失败原因是「这个 provider 根本没有此接口」——与其展示一条无法修复
       // 的错误，不如不展示。

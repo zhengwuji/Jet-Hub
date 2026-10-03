@@ -29,7 +29,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件演进涵盖了七个 LLM provider 路由核心骨架及其区域版本，全量支持 **15 个 provider**，分属 8 套互不相同的协议族：
+本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件演进涵盖了七个 LLM provider 路由核心骨架及其区域版本，全量支持 **22 个 provider**，分属 12 套互不相同的协议族：
 
   协议族   provider   特点  
  --- --- --- 
@@ -41,11 +41,17 @@
   Cline   `cline`   WorkOS 设备码轮询 + 免费模型识别 + 5 档思考强度  
   讯飞 Loomy   `loomy`   微信扫码 + 手机号/短信登录 + 智能余额选号  
   商汤小浣熊   `raccoon`   二维码扫码/手机验证码 + AES-128 加密 + 积分签到  
+  智谱 ZCode   `zcode` / `zcode-intl`   **服务端中介的 CLI 轮询登录**（无本地回调）+ 登录后再换一次编码套餐 API Key  
+  智谱 AutoClaw   `autoclaw` / `autoclaw-intl`   `X-Authorization` 头 + **出站 system 白名单改写**；国内手机验证码 / 国际 Zai·Google OAuth  
+  阿里 Accio   `accio` / `accio-cn`   **ADK Gemini 风格信封**（token 在 body）+ OAuth 2.0 PKCE（S256）  
+  美团 CatPaw   `catpaw`   **自有的 conversation 会话协议**（round/event/turn + 工具循环）—— 唯一的有状态 provider  
   自带 Key（粘贴 Key）   `commandcode` / `opencode-zen`   **没有登录链**：粘贴 API Key → 校验 → 入库
 
 ⚠️ **区域版各占一个 provider**：CodeBuddy `buddy`(国内)/`buddy-intl`(国际)、
 WorkBuddy `workbuddy-cn`(国内)/`workbuddy`(国际)、Qoder `qoder`(国际)/`qoder-cn`(国内)、
-TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通**，凭据各自独立。
+TRAE `trae`(国内)/`trae-intl`(国际)、ZCode `zcode`(国内)/`zcode-intl`(国际)、
+AutoClaw `autoclaw`(国内)/`autoclaw-intl`(国际)、Accio `accio`(国际)/`accio-cn`(国内)。
+两侧端点与登录态**互不相通**，凭据各自独立。
 
 ### 协议族的硬性差异（改代码前必读）
 
@@ -71,6 +77,31 @@ TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通
   （`BUDDY_DETAIL_OPTIONS`、`CODEARTS_DETAIL_OPTIONS`、`quota` 开关等）。
   ⚠️ `400` 必须先过 `isContextOverflow` 再回退 `INVALID_REQUEST`，
   且判据要看**完整远端报文**（只看 `errorDetail` 会丢掉 `extError`/`displayMsg` 而漏判）。
+- **ZCode（智谱 / Z.AI）**：独立一套 `src/zcode*.ts`。
+  ⚠️ **登录是服务端中介的 CLI 轮询**（`/oauth/cli/init` → `/oauth/cli/poll/{flow_id}`），
+  **没有本地回调端口** —— 造一个带 localhost `redirect_uri` 的授权地址会被上游拒。
+  ⚠️ **OAuth 的 `access_token` 不是推理凭证**，必须再经 `resolveZcodeCodingKey`
+  换一次编码套餐 API Key（直接拿去打 chat 端点必 401）。**没有续期端点**。
+- **AutoClaw（智谱 autoglm）**：独立一套 `src/autoclaw*.ts`。
+  ⚠️ 认证头是 **`X-Authorization`**（不是 `Authorization`）—— 发错稳定 401。
+  ⚠️ 出站 system 必须过**白名单改写**（`normalizeAutoclawSystemMessages`）：上游
+  2026-09-22 起对 system 做字面校验，带外来身份句（含 DSH 自己注入的那条）会 403/406。
+  ⚠️ 国内版走**手机验证码**、国际版走 **Zai/Google OAuth**（回调端口白名单
+  `AUTOCLAW_CALLBACK_PORTS`，host 必须是 `localhost`）—— 故登录走**本地登录页**
+  （`src/autoclaw-login-page.ts`），客户端没有短信表单。
+- **Accio（阿里 Accio Work）**：独立一套 `src/accio*.ts`。
+  ⚠️ 上游是 **ADK 的 Gemini 风格信封**，鉴权 token 放 **body**（不是头）；
+  `tool_config` / `parameters_json` / `args_json` / `response_json` **四个都是 JSON 字符串**。
+  ⚠️ `appKey` 必带非空 —— 缺了上游会以 HTTP 200 + 正常帧回一段「版本不受支持」文本，
+  会被当模型输出吐给下游。⚠️ 思考档位落点按模型（Gemini 系放 `properties` 是硬 400）。
+- **CatPaw（美团）**：独立一套 `src/catpaw*.ts`，**唯一的有状态 provider**。
+  ⚠️ 上游是自有的 **conversation 会话协议**（round → event(running) → turn(SSE) →
+  工具循环 → event(completed)），一次客户端请求对应多个上游请求。
+  ⚠️ **每轮结束必须回报 `event(completed)`**，否则 conversation 停在上游「执行中」，
+  下一轮 round 被拒；唯一例外是本轮返回工具调用时**不报**终态。
+  ⚠️ **turn 的 SSE 必须消费到服务端关连接**（`message.finished=true` ≠ turn 结束）。
+  ⚠️ 上游的 `text`/`reasoningContent`/`toolParams` 是**累积全量值不是增量**，必须后缀差分。
+  ⚠️ 凭据是 `X-Passport-Token` + 独立的 `uid` 头，**没有 refreshToken**。
 - **自带 Key 渠道（`commandcode` / `opencode`）**：与上面七族**形态完全不同** ——
   没有厂商登录链、没有 refresh 端点、没有身份头，只有一个固定端点 + 用户自己的 Key。
   ⚠️ 因此 `account.create` 对它们**不返回 `loginUrl`**（返回空串 + `loginMode: 'key'`），
@@ -217,6 +248,37 @@ TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通
 各 provider 的登录/续期机制不同（见分册与 README.md），
 但均通过 `ctx.credentials` 统一管理凭据生命周期。
 
+### ⚠️ 部署脚本写 `package.json` 绝不能带 UTF-8 BOM
+
+**真实故障（2026-10-04，用户报障「重启后设置里看不到 Jet Hub」）**：
+`deploy.ps1` / `deploy-profile.ps1` 用 Windows PowerShell 的
+`Set-Content -Encoding UTF8` 改写插件 `package.json`，而该 cmdlet **会写入
+UTF-8 BOM**。DSH 对这份 manifest 做**严格** `JSON.parse`，于是：
+
+```text
+SyntaxError: Unexpected token '\uFEFF', "﻿{" is not valid JSON
+```
+
+→ 插件条目加载失败 → DSH **不再把它算作 enabled 条目** → 按
+`@deepseek-ai/dsh-client-modules` 的契约（宿主扫描 enabled 条目来组装浏览器
+boot graph），它的 `client.js` 也就不再随组合脚本下发 → **设置里整块 Jet Hub
+消失**。宿主侧其它功能一起失效，而不只是某个面板。
+
+- **判据**：部署后 `package.json` 的**首字节必须是 `{`（0x7B）**。
+  用 `[System.IO.File]::ReadAllBytes($p)[0] -eq 123` 断言。
+- ⚠️ **不能用 `ConvertFrom-Json` 自检**：它**能容忍 BOM**，所以「字段逐项比对
+  全部相等」也会放过 BOM —— 上面那次故障正是这样躲过自检的。
+- **正确写法**：`[System.IO.File]::WriteAllText($p, $json, (New-Object System.Text.UTF8Encoding($false)))`。
+  两个部署脚本都已封装成 `Write-NoBom`，并在自检里加了 BOM 断言。
+- ⚠️ **脚本文件本身**（`*.ps1`）反过来**需要** BOM：Windows PowerShell 5.1
+  按 ANSI 读脚本，没有 BOM 会把中文注释读成乱码并报语法错误。两者要求相反，
+  别「顺手统一」。
+- 排查手法：想在不反复麻烦用户重启的前提下复现宿主侧加载失败，可用
+  `dsh <临时profile> --from-default-profile web` 造一个隔离 profile、
+  把插件放进它的 `node_modules` 并加入 `dsh.profile.bundles`，再
+  `dsh plugin --profile <临时profile> allow-version '<pkg>@<ver>' --dsh-version <dsh版本> --accept-risk`
+  放行版本闸门后启动；抓到的错误原文比猜快得多。
+
 ## 账号池与多账号
 
 `AccountPool`（`src/account-pool.ts`）在 `jet-hub` settings 命名空间保存账号索引，
@@ -299,6 +361,24 @@ TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通
 📖 [catalog-gating 分册](docs/agents/catalog-gating.md)
 
 - **黑名单制**：只有键存在且为 `true` 才隐藏，未记录的模型默认打开。
+- ⚠️ **改模型的对外 id 必须同步处理黑名单里的旧键**（真实故障，2026-10-04）。
+  模型 id 会进 `disabledModels` 被持久化；一旦把 id 换掉（例如 Accio 把上游混淆
+  代号 `1Helix-…` 改成可读 slug `gpt-6-astra`），旧键就**永久留在 settings 里**
+  成为孤儿，后果有两个且都很刺眼：
+  1. 用户此前的「关闭」选择**静默失效**（新 id 不在黑名单里 → 模型重新可见）；
+  2. 孤儿键会被 `model.list` 当模型补回来 —— 于是「上游真实 42 个模型」显示成
+     `42 + 34 = 76 个模型，已隐藏 41 个`，而用户**再也删不掉**它们
+     （列表里没有它们的可读身份）。
+  处理方式（改 id 的同一个提交里必须做其一）：
+  - **迁移**：老 id 能映射到新 id 时（例如老 id 就是今天的 `upstreamKey`），
+    把 `true` 搬到新键上，保住用户的选择；
+  - **清理**：不迁移时用 `AccountPool.pruneDisabledModels()` 删掉孤儿键。
+    ⚠️ **必须拿可信的完整目录当「有效 id 全集」** —— 远端拉取失败时 `listAllModels()`
+    会退化成静态兜底表，拿它去 prune 会把用户真实的关闭项**全部误删**。
+    因此清理落在**刚拉到非空远端目录**的那一刻（`AccioAuth.fetchModels`），
+    而不是读取侧。
+  - 读取侧（`model.list`）**不得**再把黑名单里目录中不存在的键渲染成条目：
+    那些键只可能是残留，渲染出来既选不中也解释不通，只会污染计数。
 - 过滤点在适配器的 `listModels`，每次调用实时读，改开关后无需重建适配器。
 - **只影响模型目录播报，不影响路由**：被关闭的模型仍可 `resolveModel` / 正常收发。
 - ⚠️ `writeAccounts` / `writeModels` 都是**整体 replace**，两者必须互相携带对方字段，
@@ -331,8 +411,8 @@ TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通
 ### 积分领取（每日签到）
 📖 [credits 分册](docs/agents/credits.md)
 
-- 有每日签到的渠道（**真相源是 `plugin-src/client/credits-capabilities.js` 的 `dailyCheckin`，不是本列表**）：`codearts`、`buddy` / `buddy-intl`、**`workbuddy-cn`**、`lobsterai`、`qoder` / `qoder-cn`、`trae` / `trae-intl`、`loomy`。
-  **只有 WorkBuddy 国际版（`workbuddy`）没有**；`cline` 没有；`raccoon` 的积分入口是**登录奖励/新手任务**，不是每日签到。
+- 有每日签到的渠道（**真相源是 `plugin-src/client/credits-capabilities.js` 的 `dailyCheckin`，不是本列表**）：`codearts`、`buddy` / `buddy-intl`、**`workbuddy-cn`**、`lobsterai`、`qoder` / `qoder-cn`、`trae` / `trae-intl`、`loomy`、**`autoclaw` / `autoclaw-intl`**。
+  **只有 WorkBuddy 国际版（`workbuddy`）没有**；`cline` 没有；`raccoon` 的积分入口是**登录奖励/新手任务**，不是每日签到；`zcode` 是**限时套餐领取**（且需 WebView 铸造的验证码令牌，宿主侧做不到，故登记为不支持）；`accio` 与 `catpaw` 上游**没有**签到活动。
   ⚠️ **「端点存在性 ≠ 活动存在性」**：四个 WorkBuddy/CodeBuddy 区域**都有**
   `POST /v2/billing/meter/checkin-activity-status` 与 `/daily-checkin` 两个端点，
   差异只在**活动位是否下发**。`workbuddy-cn` 曾因「国际版无接口」这个错误结论
@@ -479,9 +559,10 @@ TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通
 
 ## LLM Provider 约定
 
-- provider 名称（**15 个**）：`codearts` / `buddy` / `buddy-intl` / `workbuddy-cn` /
+- provider 名称（**22 个**）：`codearts` / `buddy` / `buddy-intl` / `workbuddy-cn` /
   `workbuddy` / `lobsterai` / `qoder` / `qoder-cn` / `trae` / `trae-intl` / `cline` /
-  `loomy` / `raccoon` / `commandcode` / `opencode-zen`
+  `loomy` / `raccoon` / `zcode` / `zcode-intl` / `autoclaw` / `autoclaw-intl` /
+  `accio` / `accio-cn` / `catpaw` / `commandcode` / `opencode-zen`
   - ⚠️ 必须与 `plugin-src/client/jet-hub.js` 的 `PROVIDERS` **完全一致**
 - 端点格式为 OpenAI 兼容
 - 请求签名/鉴权方式因 provider 而异：
@@ -490,6 +571,16 @@ TRAE `trae`(国内)/`trae-intl`(国际)。两侧端点与登录态**互不相通
   - `lobsterai`：Bearer + `X-LobsterAI-Client-*`（**无签名**）
   - `qoder`：推理请求头**由 WASM 生成**（含签名），**必须原样透传**；余额端点另走 `Bearer`
   - `trae`：`Cloud-IDE-JWT <token>` + 十余个 `X-*` 身份头（**无签名**）
+  - `zcode` / `zcode-intl`：`Authorization: Bearer <换取后的编码套餐 API Key>`
+    + 一整套 ZCode 客户端身份头（`X-ZCode-App-Version` / `X-Platform` / `X-Os-Category`…）。
+    ⚠️ **没有续期端点**，凭据失效只能重新登录。
+  - `autoclaw` / `autoclaw-intl`：**`X-Authorization: Bearer <token>`**（不是 `Authorization`）
+    + 品牌头；⚠️ **在 LLM 域刻意不发 `X-Harness-Type`**（带它会 403 pay-view / 406），
+    但**业务域（刷新/余额/签到/目录）必须带它**（否则签名 400002）—— 两处刻意不一致。
+  - `accio` / `accio-cn`：**没有鉴权头** —— token 放在请求体 `token` 字段里；
+    另需 `appKey`（**必带非空**）、`x-package-region`。
+  - `catpaw`：`Cookie: X-Passport-Token=<token>` + `user-uid: <uid>`（**两个都要**，
+    token 不含 uid）。积分端点是例外：只认 `X-Auth-Token`。
   - `commandcode` / `opencode`：`Authorization: Bearer <用户自己的 Key>` + `Accept`
     （**只有这两个头**，不带任何厂商身份头；请求打在**产品表里的固定端点**上）。
     ⚠️ 不要试图伪装「官方客户端」头/UA：opencode 的免费档位在服务端判定，

@@ -936,6 +936,75 @@ describe('AccountPool 模型黑名单', () => {
   })
 
   /**
+   * 清理「改过对外 id 之后留下的残渣键」。
+   *
+   * ## 真实故障（2026-10-04，用户报障）
+   *
+   * 「Accio 国内版怎么有 76 个模型，已隐藏 41 个」——上游目录真实只有 **42** 个，
+   * 黑名单里却有 **34 条旧键**（Accio 把对外 id 从 `1Helix-…` 这类混淆代号改成
+   * 可读 slug 之后，旧键就永久留下了）。它们既不对应任何可路由的模型，又会被
+   * 旧的「保底补回」逻辑渲染成幽灵条目，把计数撑到 76 / 41。
+   *
+   * 语义与 `clearDisabledModels`（UI 的「打开全部」）**必须区分开**：
+   * 后者删该 provider 的**全部**关闭项，前者只删**目录里不存在**的那些，
+   * 用户真实的关闭选择一个都不动。
+   */
+  describe('pruneDisabledModels（清理改名残渣键）', () => {
+    it('只删目录里不存在的键，保留真实的关闭项', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setModelsDisabled('accio-cn', [
+        'gpt-6-astra',            // 真实模型，仍关闭 → 保留
+        '1Helix-G6aS8tR2qN7m',    // 旧混淆代号，已无对应模型 → 删
+        '1Orbit-I9eY4tK8bW1f',    // 同上
+      ])
+
+      const removed = await pool.pruneDisabledModels('accio-cn', [
+        'gpt-6-astra',
+        'claude-sonnet-4-6',
+      ])
+
+      expect(removed).toBe(2)
+      expect([...pool.disabledModelsFor('accio-cn')]).toEqual(['gpt-6-astra'])
+    })
+
+    it('无残渣时不落盘（不产生无意义的写入）', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      await pool.setModelsDisabled('accio', ['gpt-6-astra'])
+      const before = ctx.replacePayloads.length
+
+      const removed = await pool.pruneDisabledModels('accio', ['gpt-6-astra', 'kimi-k3'])
+
+      expect(removed).toBe(0)
+      expect(ctx.replacePayloads).toHaveLength(before)
+    })
+
+    it('该 provider 没进过黑名单时是空操作', async () => {
+      const ctx = createMockContext()
+      const pool = new AccountPool(ctx as never)
+      expect(await pool.pruneDisabledModels('accio', ['a'])).toBe(0)
+      expect(ctx.replacePayloads).toHaveLength(0)
+    })
+
+    it('全部都是残渣时，连该 provider 的键一起删掉（不留空对象）', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setModelsDisabled('accio-cn', ['1Helix-old', '1Orbit-old'])
+
+      expect(await pool.pruneDisabledModels('accio-cn', ['gpt-6-astra'])).toBe(2)
+      // 空对象会让配置文件里留一个 `accio-cn: {}` 的噪音
+      expect(pool.getStateSnapshot().disabledModels['accio-cn']).toBeUndefined()
+    })
+
+    it('删除方向**不对**写 false 项：整表按值原样保留', async () => {
+      const pool = new AccountPool(createMockContext() as never)
+      await pool.setModelDisabled('accio', 'gpt-6-astra', true)
+      // 显式写一个 false（历史行为：打开是删键，但旧数据里可能残留 false）
+      await pool.pruneDisabledModels('accio', ['gpt-6-astra'])
+      expect(pool.listDisabledModels('accio')).toEqual({ 'gpt-6-astra': true })
+    })
+  })
+
+  /**
    * ⚠️ **Loomy 永久积分锁定**（用户要求「需要支持持久化」）。
    *
    * 这是**第三个**整体写入的字段，与 `disabledModels` 当年踩过的坑同型：

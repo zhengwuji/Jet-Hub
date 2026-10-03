@@ -18,7 +18,7 @@ import {
   fetchTraeCreditBalance,
   classifyTraeCheckinError,
 } from '../../src/trae-credits.js'
-import { TRAE } from '../../src/trae-product.js'
+import { TRAE, TRAE_INTL } from '../../src/trae-product.js'
 import type { TraeCredential } from '../../src/trae.js'
 
 function makeCredential(overrides: Partial<TraeCredential> = {}): TraeCredential {
@@ -176,5 +176,202 @@ describe('fetchTraeCheckinStatus / fetchTraeCreditBalance', () => {
   it('无资源包时返回 null（区分「查不到」与「余额为 0」）', async () => {
     const { fetcher } = stubFetcher([{ user_entitlement_pack_list: [] }])
     expect(await fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)).toBeNull()
+  })
+})
+
+describe('fetchTraeCreditBalance · 区域端点', () => {
+  /** 记录请求 URL 的桩 fetcher。 */
+  function recordingFetcher(payload: unknown): { fetcher: typeof fetch; urls: string[] } {
+    const urls: string[] = []
+    const fetcher = (async (input: unknown) => {
+      urls.push(String(input))
+      return new Response(JSON.stringify(payload), { status: 200 })
+    }) as unknown as typeof fetch
+    return { fetcher, urls }
+  }
+
+  /**
+   * ⚠️ **真实缺陷回归**：`postJson` 曾把 `https://api.trae.cn` 与 v2 路径写死，
+   * 于是 `TraeProduct.ugHost` / `entUsagePath` 成了死配置，国际版账号被发到
+   * 国内站点 + 错版本号，面板恒显示「余额查询失败」。
+   *
+   * 国际版真实站点是 `ug-normal.trae.ai`、路径是 **v1**（判据来自 TRAE 官网
+   * `account-setting` 的 bundle：`genBaseURL("/trae/api/v1/pay/ide_user_ent_usage")`，
+   * 且该模块导出 `ug-normal.trae.ai`）。
+   */
+  it('国际版走 product.ugHost + entUsagePath（ug-normal.trae.ai / v1）', async () => {
+    const { fetcher, urls } = recordingFetcher({ user_entitlement_pack_list: [] })
+    await fetchTraeCreditBalance(makeCredential(), TRAE_INTL, fetcher)
+    expect(urls[0]).toBe('https://ug-normal.trae.ai/trae/api/v1/pay/ide_user_ent_usage')
+  })
+
+  it('国内版仍走 api.trae.cn / v2（无回归）', async () => {
+    const { fetcher, urls } = recordingFetcher({ user_entitlement_pack_list: [] })
+    await fetchTraeCreditBalance(makeCredential(), TRAE, fetcher)
+    expect(urls[0]).toBe('https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage')
+  })
+})
+
+describe('fetchTraeCreditBalance · 用量计费（dollar usage billing）', () => {
+  /** 造一个 entitlement pack（默认 status=1、无到期时间 ⇒ 有效）。 */
+  function pack(opts: {
+    status?: unknown
+    expireTime?: number
+    endTime?: number
+    quota?: Record<string, number>
+    usage?: Record<string, number>
+  } = {}): Record<string, unknown> {
+    return {
+      display_desc: 'Free plan',
+      status: opts.status,
+      expire_time: opts.expireTime ?? 0,
+      entitlement_base_info: { quota: opts.quota ?? {}, end_time: opts.endTime ?? 0 },
+      usage: opts.usage ?? {},
+    }
+  }
+
+  function balanceOf(packList: unknown[]): Promise<unknown> {
+    const fetcher = (async () => new Response(
+      JSON.stringify({ user_entitlement_pack_list: packList }), { status: 200 },
+    )) as unknown as typeof fetch
+    return fetchTraeCreditBalance(makeCredential(), TRAE_INTL, fetcher)
+  }
+
+  type Balance = {
+    total: number
+    expiredTotal: number
+    packages: { name: string; unit: string; remaining: number; total: number; active: boolean }[]
+  }
+
+  /**
+   * ⚠️ **真实缺陷回归**：国际版是 `is_dollar_usage_billing: true`，
+   * `credits_limit` 恒为 0（实测国际版 Free plan = 0），旧实现只认
+   * `credits_limit > 0`，一个包都产不出 ⇒ 返回 null ⇒ 面板恒「余额查询失败」。
+   * 现按官网同款字段展开请求额度，单位「次」。
+   */
+  it('credits_limit=0 时展开请求额度（与官网 usage 页同口径）', async () => {
+    const balance = await balanceOf([pack({
+      quota: {
+        credits_limit: 0,
+        advanced_model_request_limit: 1000,
+        premium_model_fast_request_limit: 10,
+        premium_model_slow_request_limit: 50,
+        auto_completion_limit: 5000,
+      },
+      usage: { credits_amount: 0 },
+    })]) as Balance
+
+    expect(balance.total).toBe(6060)
+    expect(balance.packages.map((p) => p.name)).toEqual([
+      '高级模型请求 · Free plan', '快速请求 · Free plan', '慢速请求 · Free plan', '自动补全 · Free plan',
+    ])
+    expect(balance.packages.every((p) => p.unit === '次')).toBe(true)
+  })
+
+  it('用量值从对应字段扣除', async () => {
+    const balance = await balanceOf([pack({
+      quota: { credits_limit: 0, advanced_model_request_limit: 1000 },
+      usage: { advanced_model_request_usage: 250 },
+    })]) as Balance
+    expect(balance.packages[0]).toMatchObject({ remaining: 750, total: 1000, active: true })
+    expect(balance.total).toBe(750)
+  })
+
+  it('limit <= 0 的项不产生条目', async () => {
+    const balance = await balanceOf([pack({
+      quota: { credits_limit: 0, advanced_model_request_limit: 0, auto_completion_limit: 5000 },
+    })]) as Balance
+    expect(balance.packages).toHaveLength(1)
+    expect(balance.packages[0]!.name).toBe('自动补全 · Free plan')
+  })
+})
+
+describe('fetchTraeCreditBalance · 资源包有效性判定', () => {
+  const NOW_S = Math.floor(Date.now() / 1000)
+  const FUTURE = NOW_S + 30 * 86_400
+  const PAST = NOW_S - 86_400
+
+  function pack(opts: {
+    status?: unknown
+    expireTime?: number
+    endTime?: number
+    quota?: Record<string, number>
+    usage?: Record<string, number>
+  } = {}): Record<string, unknown> {
+    return {
+      display_desc: 'Free plan',
+      status: opts.status,
+      expire_time: opts.expireTime ?? 0,
+      entitlement_base_info: { quota: opts.quota ?? {}, end_time: opts.endTime ?? 0 },
+      usage: opts.usage ?? {},
+    }
+  }
+
+  function balanceOf(packList: unknown[]): Promise<unknown> {
+    const fetcher = (async () => new Response(
+      JSON.stringify({ user_entitlement_pack_list: packList }), { status: 200 },
+    )) as unknown as typeof fetch
+    return fetchTraeCreditBalance(makeCredential(), TRAE_INTL, fetcher)
+  }
+
+  type Balance = {
+    total: number
+    expiredTotal: number
+    packages: { name: string; remaining: number; active: boolean; cycleEndTime: string; expiredTime: string }[]
+  }
+
+  const usageQuota = { credits_limit: 0, advanced_model_request_limit: 1000 }
+
+  /**
+   * ⚠️ **真实缺陷回归**：`active` 原为硬编码 `true` —— 套餐到期后面板仍显示
+   * 「N/N 个资源包有效」并把失效额度算进总额，`expiredTotal` 更是从不累加。
+   * 官网 bundle 的判据是 `pack.status === d.it.Active`（**不是** `ent_status`），
+   * 到期时间取 `expire_time || entitlement_base_info.end_time`。
+   */
+  it('status=1 且未到期 → 有效并计入 total', async () => {
+    const balance = await balanceOf([pack({ status: 1, endTime: FUTURE, quota: usageQuota })]) as Balance
+    expect(balance.packages[0]!.active).toBe(true)
+    expect(balance.total).toBe(1000)
+    expect(balance.expiredTotal).toBe(0)
+  })
+
+  it('已过 end_time → 失效、不计入 total 而计入 expiredTotal', async () => {
+    const balance = await balanceOf([pack({ status: 1, endTime: PAST, quota: usageQuota })]) as Balance
+    expect(balance.packages[0]!.active).toBe(false)
+    expect(balance.total).toBe(0)
+    expect(balance.expiredTotal).toBe(1000)
+  })
+
+  it('status !== 1（非 Active）→ 失效', async () => {
+    const balance = await balanceOf([pack({ status: 2, endTime: FUTURE, quota: usageQuota })]) as Balance
+    expect(balance.packages[0]!.active).toBe(false)
+    expect(balance.expiredTotal).toBe(1000)
+  })
+
+  it('expire_time 优先于 end_time', async () => {
+    const balance = await balanceOf([
+      pack({ status: 1, expireTime: PAST, endTime: FUTURE, quota: usageQuota }),
+    ]) as Balance
+    expect(balance.packages[0]!.active).toBe(false)
+  })
+
+  it('status 缺失且无到期时间 → 保守视为有效（不把未知当失效）', async () => {
+    const balance = await balanceOf([pack({ quota: usageQuota })]) as Balance
+    expect(balance.packages[0]!.active).toBe(true)
+    expect(balance.total).toBe(1000)
+  })
+
+  it('失效包的到期时间写入 expiredTime（tooltip 据此显示「失效于」）', async () => {
+    const balance = await balanceOf([pack({ status: 1, endTime: PAST, quota: usageQuota })]) as Balance
+    expect(balance.packages[0]!.expiredTime).not.toBe('')
+    expect(balance.packages[0]!.cycleEndTime).toBe('')
+  })
+
+  it('credits 口径同样受影响：过期包不计入 total', async () => {
+    const balance = await balanceOf([
+      pack({ status: 1, endTime: PAST, quota: { credits_limit: 500 }, usage: { credits_amount: 100 } }),
+    ]) as Balance
+    expect(balance.total).toBe(0)
+    expect(balance.expiredTotal).toBe(400)
   })
 })

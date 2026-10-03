@@ -35,6 +35,10 @@ import type { TraeAuth } from './trae-auth.js'
 import type { ClineAuth } from './cline-auth.js'
 import type { LoomyAuth } from './loomy-auth.js'
 import type { RaccoonAuth } from './raccoon-auth.js'
+import type { ZcodeAuth } from './zcode-auth.js'
+import type { AutoclawAuth } from './autoclaw-auth.js'
+import type { AccioAuth } from './accio-auth.js'
+import type { CatpawAuth } from './catpaw-auth.js'
 import type { KeyedAuth } from './keyed-auth.js'
 import type { RaccoonCredential } from './raccoon.js'
 import { QODER, QODER_CN } from './qoder-product.js'
@@ -537,6 +541,26 @@ export interface JetHubRpcServices {
   cline: ClineAuth
   loomy: LoomyAuth
   raccoon: RaccoonAuth
+  /** ZCode 国内版（智谱 / Z.AI 编码代理客户端；CLI 轮询登录）。 */
+  zcode: ZcodeAuth
+  /** ZCode 国际版（Z.AI；与国内版同一份实现、不同推理平面）。 */
+  zcodeIntl: ZcodeAuth
+  /** AutoClaw 国内版（智谱 autoglm；手机验证码登录）。 */
+  autoclaw: AutoclawAuth
+  /** AutoClaw 国际版（autoglm.ai；Zai/Google 网页 OAuth 登录）。 */
+  autoclawIntl: AutoclawAuth
+  /** Accio 国际版（阿里 Accio Work；PKCE 网页登录）。 */
+  accio: AccioAuth
+  /** Accio 国内版（与上面同一份实现、不同登录站点与 package-region）。 */
+  accioCn: AccioAuth
+  /**
+   * CatPaw（美团 AI 客户端）。
+   *
+   * ⚠️ 这是**唯一的有状态 provider**：上游是自有的 conversation 会话协议
+   * （round / event / turn 多步时序 + 工具循环），适配器自己维护会话注册表与
+   * 指纹链。登录是 passport 会话 + loopback 回调（`startLogin` 自带回调服务器）。
+   */
+  catpaw: CatpawAuth
   /**
    * 「粘贴 API Key」族认证服务（`provider id → KeyedAuth`）。
    *
@@ -735,6 +759,13 @@ function registerJetHubEndpoints(
     cline: services.cline,
     loomy: services.loomy,
     raccoon: services.raccoon,
+    zcode: services.zcode,
+    zcodeIntl: services.zcodeIntl,
+    autoclaw: services.autoclaw,
+    autoclawIntl: services.autoclawIntl,
+    accio: services.accio,
+    accioCn: services.accioCn,
+    catpaw: services.catpaw,
     keyed: services.keyed,
     modelAdapters: services.modelAdapters,
     buddyAuthForProduct,

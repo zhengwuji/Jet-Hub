@@ -1080,6 +1080,54 @@ describe('model.list / model.setDisabled 端点', () => {
   })
 
   /**
+   * 回归：黑名单里的**过期残留键**不得被渲染成模型条目。
+   *
+   * ## 真实故障（2026-10-04，用户报障）
+   *
+   * 「Accio 国内版怎么有 76 个模型，已隐藏 41 个」。
+   *
+   * 上游目录真实只有 **42** 个模型，但黑名单里有 **34 条旧 id** —— Accio 把对外
+   * id 从上游混淆代号（`1Helix-…`）改成可读 slug 之后，旧键永久留在了 settings 里。
+   * 端点当时有一句「保底」补回逻辑：全量目录里找不到的黑名单键也 push 成
+   * `{ id, name: id }`，于是 `42 + 34 = 76 个模型`、`已隐藏 34 + 7 = 41 个`，
+   * 而且那 34 条**再也删不掉**（列表里没有它们的可读身份）。
+   *
+   * 判据：`listAllModels()` 刻意不套黑名单，所以它给出的目录是**权威且完整**的；
+   * 任何不在其中的黑名单键都只能是过期残留，渲染出来既选不中也解释不通。
+   */
+  it('黑名单里的过期残留键不会被补成模型条目（防幽灵计数）', async () => {
+    const catalog = [
+      { id: 'gpt-6-astra', name: 'GPT 6 Astra · x1' },
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 · x2' },
+    ]
+    const { call } = registerEndpoints({
+      models: catalog,
+      disabledModels: {
+        accio: {
+          // 正常：目录里存在的关闭项
+          'gpt-6-astra': true,
+          // 残留：改 id 之前的老键（上游混淆代号），目录里已不存在
+          '1Helix-G6aS8tR2qN7m': true,
+          '1Orbit-I9eY4tK8bW1f': true,
+        },
+      },
+      modelAdapters: { accio: { listAllModels: () => catalog } },
+    })
+
+    const result = await call('model.list', { provider: 'accio' })
+    expect(result.ok).toBe(true)
+    const models = (result.value as { models: Array<{ id: string; name: string; disabled: boolean }> }).models
+
+    // 目录就是权威全量：两个真实模型，一个关闭
+    expect(models.map((m) => m.id)).toEqual(['gpt-6-astra', 'claude-sonnet-4-6'])
+    expect(models.every((m) => !/^1[A-Z]/.test(m.id))).toBe(true)
+    // 残留键一个都不能出现（既不能进列表，也不能让「已隐藏」计数虚高）
+    expect(models.filter((m) => m.disabled)).toHaveLength(1)
+    expect(models.some((m) => m.id === '1Helix-G6aS8tR2qN7m')).toBe(false)
+    expect(models.some((m) => m.id === '1Orbit-I9eY4tK8bW1f')).toBe(false)
+  })
+
+  /**
    * 回归测试：关闭 → 列表 → 重新打开的完整往返。
    *
    * 历史 bug：`model.list` 直接在 `llm.listModels()`（已被适配器过滤）的结果上

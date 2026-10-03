@@ -64,6 +64,23 @@ export interface TraeProduct {
   agentHost: string
   /** 签到/积分/Ug 基址。 */
   ugHost: string
+  /**
+   * 积分/用量查询路径（**区域间连版本号都不同**）。
+   *
+   * - 国内版：`/trae/api/v2/pay/ide_user_ent_usage`
+   * - 国际版：`/trae/api/v1/pay/ide_user_ent_usage`（**v1**）
+   *
+   * 为什么必须下沉到产品配置：早期实现把整条 URL 写死在 `trae-credits.ts`
+   * （自造 `https://api.trae.cn` + v2 路径），国际版账号因此既打错站点、
+   * 又用错版本号，面板恒显示「余额查询失败」。
+   *
+   * 证据（2026-10-03）：从 TRAE 官网 `account-setting` 页面的 JS bundle 中
+   * 读到 `GetIdeUserEntUsage` → `genBaseURL("/trae/api/v1/pay/ide_user_ent_usage")`，
+   * 且该模块导出的 API 基址为 `ug-normal.trae.ai`。实测
+   * `https://ug-normal.trae.ai/trae/api/v1/pay/ide_user_ent_usage` 返回 200
+   * （含 `user_entitlement_pack_list`），而同 host 的 v2 路径是 404。
+   */
+  entUsagePath: string
   /** OAuth/认证基址（ExchangeToken / GetUserInfo）。 */
   oauthHost: string
   /** 登录门户基址。 */
@@ -189,13 +206,20 @@ export const TRAE_CONSOLE_HOST = 'https://www.trae.cn'
  * `ahanet/server.json` 的 IP 映射表里 —— 那是**接入点**，与业务 host 不同层。
  * 取实测出站的那个。
  *
- * ⚠️ 国际版**没有** `api.trae.cn` 那层「站点域」，其 Ug（签到/积分）走
- * `api.trae.ai`（日志里 userRegion=us 时 host 为 `api-us-east.trae.ai`；
- * 通用入口用 `api.trae.ai`，与 `coresg-normal.trae.ai` 同域族）。
+ * ⚠️ 国际版的 Ug（签到/积分）**不在 `api.trae.ai`**（旧注释如此断言，2026-10-03
+ * 实测证伪）—— 真实站点是 `ug-normal.trae.ai`，见 {@link TRAE_INTL_UG_HOST}。
  */
 export const TRAE_INTL_AGENT_HOST = 'https://api5-normal-alisg.mchost.guru'
-/** 签到/积分/Ug 基址（国际版）。 */
-export const TRAE_INTL_UG_HOST = 'https://api.trae.ai'
+/**
+ * 签到/积分/Ug 基址（国际版）。
+ *
+ * ⚠️ **不是 `api.trae.ai`**（2026-10-03 实测修正）。`api.trae.ai` 只承载
+ * 认证类接口（`/cloudide/api/v3/trae/GetUserInfo` 等），其
+ * `/trae/api/*` 路径一律返回网关 404；国际版真正的 Ug（用量/权益）站点是
+ * `ug-normal.trae.ai` —— 该域名来自 TRAE 官网 bundle 里 `QU`/`gp` 两个导出，
+ * 实测 `/trae/api/v1/pay/ide_user_ent_usage` 返回 200。
+ */
+export const TRAE_INTL_UG_HOST = 'https://ug-normal.trae.ai'
 /** OAuth/认证基址（国际版）。 */
 export const TRAE_INTL_OAUTH_HOST = 'https://api.trae.ai'
 /** 登录门户基址（国际版）。 */
@@ -307,6 +331,7 @@ export const TRAE: TraeProduct = {
   displayName: 'TRAE (字节)',
   agentHost: TRAE_AGENT_HOST,
   ugHost: TRAE_UG_HOST,
+  entUsagePath: '/trae/api/v2/pay/ide_user_ent_usage',
   oauthHost: TRAE_OAUTH_HOST,
   consoleHost: TRAE_CONSOLE_HOST,
   clientId: 'en1oxy7wnw8j9n',
@@ -352,6 +377,7 @@ export const TRAE_INTL: TraeProduct = {
   displayName: 'TRAE (国际版)',
   agentHost: TRAE_INTL_AGENT_HOST,
   ugHost: TRAE_INTL_UG_HOST,
+  entUsagePath: '/trae/api/v1/pay/ide_user_ent_usage',
   oauthHost: TRAE_INTL_OAUTH_HOST,
   consoleHost: TRAE_INTL_CONSOLE_HOST,
   clientId: 'en1oxy7wnw8j9n',

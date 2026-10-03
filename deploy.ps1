@@ -1,4 +1,4 @@
-# 部署 dsh-codearts-auth 到 DSH Desktop 运行时
+﻿# 部署 dsh-codearts-auth 到 DSH Desktop 运行时
 #
 # 用法：
 #   pwsh -File deploy.ps1             # 部署
@@ -41,6 +41,19 @@ function Write-Info([string]$m) { Write-Host "         $m" -ForegroundColor Gray
 function Copy-Fresh([string]$From, [string]$To) {
   if (Test-Path $To) { Remove-Item $To -Recurse -Force }
   Copy-Item $From $To -Recurse -Force
+}
+
+# 写**无 BOM** 的 UTF-8 文件。
+#
+# ⚠️ Windows PowerShell 的 `Set-Content -Encoding UTF8` 会写入 **UTF-8 BOM**，
+# 而 DSH 对 `package.json` 做**严格** `JSON.parse` —— BOM 会让它抛
+# `SyntaxError: Unexpected token '\uFEFF'`，插件条目加载失败、客户端 bundle
+# 不再下发，症状是**设置里整块 Jet Hub 消失**（2026-10-04 实测：
+# 部署后 package.json 首三字节 EF BB BF，而备份是 7B）。
+# .NET 的 `UTF8Encoding($false)` 才是真正的「无 BOM」。
+function Write-NoBom([string]$Path, [string]$Content) {
+  $encoding = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -149,9 +162,11 @@ foreach ($item in $PluginFiles) {
     $targetPkg = $srcManifest | ConvertTo-Json -Depth 10 | ConvertFrom-Json
     $targetPkg.version = $curVersion
     $pkgJson = $targetPkg | ConvertTo-Json -Depth 10
-    Set-Content -Path (Join-Path $Runtime 'package.json') -Value $pkgJson -Encoding UTF8
+    # ⚠️ 必须无 BOM（见 Write-NoBom 的说明）：写 BOM 会让 DSH 读不了这份
+    #    manifest，整条插件在设置里消失。
+    Write-NoBom (Join-Path $Runtime 'package.json') $pkgJson
     if (Test-Path $SourceMirror) {
-      Set-Content -Path (Join-Path $SourceMirror 'package.json') -Value $pkgJson -Encoding UTF8
+      Write-NoBom (Join-Path $SourceMirror 'package.json') $pkgJson
     }
     $copied++
     continue

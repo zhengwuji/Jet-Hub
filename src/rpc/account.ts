@@ -18,6 +18,17 @@ import type { LoomyCredential } from '../loomy.js'
 import { RACCOON } from '../raccoon-product.js'
 import type { RaccoonCredential } from '../raccoon.js'
 import type { StartedRaccoonLoginFlow } from '../raccoon-login-page.js'
+import { ZCODE, ZCODE_INTL } from '../zcode-product.js'
+import { parseZcodeCredential } from '../zcode.js'
+import type { StartedZcodeLoginFlow } from '../zcode-auth.js'
+import { AUTOCLAW, AUTOCLAW_INTL } from '../autoclaw-product.js'
+import { parseAutoclawCredential } from '../autoclaw.js'
+import { autoclawDisplayName } from '../autoclaw.js'
+import { ACCIO, ACCIO_CN } from '../accio-product.js'
+import { parseAccioCredential } from '../accio.js'
+import { startAutoclawLoginFlow } from '../autoclaw-login-page.js'
+import { CATPAW } from '../catpaw-product.js'
+import { parseCatpawCredential, catpawDisplayName } from '../catpaw.js'
 import { LOBSTERAI } from '../lobsterai-product.js'
 import { QODER, QODER_CN } from '../qoder-product.js'
 import { TRAE, TRAE_INTL } from '../trae-product.js'
@@ -36,7 +47,7 @@ import type { RpcResult, JetHubRpcContext, JetHubRpcServices, JetHubRegionRoutin
 
 /** `account.*` 端点处理器所需依赖（由 `src/jet-hub-rpc.ts` 装配）。 */
 export type AccountEndpointDeps = JetHubRpcContext
-  & Pick<JetHubRpcServices, 'codearts' | 'buddy' | 'buddyIntl' | 'workbuddy' | 'workbuddyCn' | 'lobsterai' | 'qoder' | 'qoderCn' | 'trae' | 'traeIntl' | 'cline' | 'loomy' | 'raccoon' | 'keyed'>
+  & Pick<JetHubRpcServices, 'codearts' | 'buddy' | 'buddyIntl' | 'workbuddy' | 'workbuddyCn' | 'lobsterai' | 'qoder' | 'qoderCn' | 'trae' | 'traeIntl' | 'cline' | 'loomy' | 'raccoon' | 'zcode' | 'zcodeIntl' | 'autoclaw' | 'autoclawIntl' | 'accio' | 'accioCn' | 'catpaw' | 'keyed'>
   & Pick<JetHubRegionRouting, 'buddyAuthForProduct' | 'qoderAuthForProduct' | 'traeAuthForProduct' | 'isQoderProvider' | 'isTraeProvider'>
   & Pick<JetHubCredentialHelpers, 'shortId' | 'parseBuddyCredential' | 'parseCodeArtsCredential' | 'parseLobsteraiCredential' | 'parseQoderCredential' | 'parseTraeCredential' | 'parseClineCredential' | 'buildRaccoonNickname'>
 
@@ -48,7 +59,10 @@ export async function handleAccountMethod(
   _signal: AbortSignal,
 ): Promise<RpcResult> {
   const { ctx, pool, codearts, buddy, buddyIntl, workbuddy, workbuddyCn, lobsterai, qoder,
-    qoderCn, trae, traeIntl, cline, loomy, raccoon, keyed, buddyAuthForProduct,
+    qoderCn, trae, traeIntl, cline, loomy, raccoon, zcode, zcodeIntl, autoclaw, autoclawIntl,
+    accio, accioCn,
+    catpaw,
+    keyed, buddyAuthForProduct,
     qoderAuthForProduct, traeAuthForProduct, isQoderProvider, isTraeProvider, shortId,
     parseBuddyCredential, parseCodeArtsCredential, parseLobsteraiCredential,
     parseQoderCredential, parseTraeCredential, parseClineCredential, buildRaccoonNickname, } = deps
@@ -402,6 +416,214 @@ export async function handleAccountMethod(
           })
 
           return { ok: true, value: { accountId: id, loginUrl: raccoonStarted.loginUrl } }
+        } else if (ZCODE.id === provider || ZCODE_INTL.id === provider) {
+          // ZCode 走**服务端中介的 CLI 轮询**登录（与 Qoder 的设备码轮询同型）：
+          // `startLogin` 立即返回指向 `zcode.z.ai` 的授权地址，后台按上游给的
+          // 间隔轮询；**不起本地回调端口**（造带 localhost redirect_uri 的
+          // 授权地址会被上游拒，见 `src/zcode.ts` 模块头）。
+          //
+          // ⚠️ 与 raccoon / loomy 一样先登记**占位条目**，使前端 `login.poll`
+          //    能立即看到该账号；登录成功后再回填昵称与有效期。失败则删除占位。
+          //
+          // ⚠️ 绝不能在用户授权完成后才返回 loginUrl —— `window.open` 只在
+          //    用户手势窗口内有效，那时手势早已过期、弹窗必被拦截。
+          const zcodeProduct = provider === ZCODE.id ? ZCODE : ZCODE_INTL
+          const zcodeService = provider === ZCODE.id ? zcode : zcodeIntl
+
+          await pool.addAccount({
+            id,
+            provider: zcodeProduct.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            // ⚠️ 恒不可续期：ZCode 没有 refresh 端点（见 `isZcodeRefreshable`）。
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let zcodeStarted: StartedZcodeLoginFlow
+          try {
+            zcodeStarted = await zcodeService.startLogin()
+          } catch (error) {
+            // 起登录流程失败（网络/上游拒绝）：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 ZCode 登录：${reason}`)
+          }
+
+          zcodeStarted.result.then(async (credential) => {
+            const result = await zcodeService.persistLogin(credential, { refName })
+            const saved = parseZcodeCredential(result.access)
+            if (saved === undefined) return
+            await pool.updateAccount(id, {
+              nickname: zcodeService.displayNameFor(saved),
+              ...result.expires > 0 ? { expiresAt: result.expires } : {},
+              // ⚠️ 恒 false：本家无续期端点。
+              refreshable: false,
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${zcodeProduct.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: zcodeStarted.loginUrl } }
+        } else if (provider === ACCIO.id || provider === ACCIO_CN.id) {
+          // Accio 走 **OAuth 2.0 授权码 + PKCE（S256）** 网页登录：与 AutoClaw
+          // 国际版同型（浏览器 302 回本机 loopback 端口），差异是**授权地址由
+          // 网关自己拼**（不需先过一次风控验证码）。
+          //
+          // ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到该账号；
+          //    登录成功后再回填昵称与有效期。失败则删除占位条目。
+          //
+          // ⚠️ 绝不能等用户授权完成才返回 loginUrl —— `window.open` 只在用户
+          //    手势窗口内有效，那时手势早已过期、弹窗必被拦截。
+          const accioProduct = provider === ACCIO.id ? ACCIO : ACCIO_CN
+          const accioService = provider === ACCIO.id ? accio : accioCn
+
+          await pool.addAccount({
+            id,
+            provider: accioProduct.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let accioStarted
+          try {
+            accioStarted = await accioService.startLogin()
+          } catch (error) {
+            // 起本地回调服务器失败（端口被占/网络）：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 Accio 登录（本地回调服务器启动失败）：${reason}`)
+          }
+
+          accioStarted.result.then(async (credential) => {
+            const result = await accioService.persistLogin(credential, { refName })
+            const saved = parseAccioCredential(result.access)
+            if (saved === undefined) return
+            await pool.updateAccount(id, {
+              nickname: accioService.displayNameFor(saved),
+              ...result.expires > 0 ? { expiresAt: result.expires } : {},
+              // Accio **有** refresh 端点（refresh_token 轮换）。
+              refreshable: result.refreshable,
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${accioProduct.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: accioStarted.loginUrl } }
+        } else if (provider === AUTOCLAW.id || provider === AUTOCLAW_INTL.id) {
+          // AutoClaw 两个地区**都需要浏览器**，而客户端只有「弹窗 + 轮询」：
+          //   · 国内版 = 手机验证码（需要表单填手机号与验证码）
+          //   · 国际版 = 网页 OAuth（**先要过一次阿里云滑块**才能拿到授权地址）
+          // 两者都不是「返回一个上游 URL 就能搞定」的形态，故走**本地登录页**
+          //（与 raccoon 同一模式：宿主侧起 127.0.0.1 上的页面，页面只做展示与
+          // 提交，凭据与令牌全留宿主侧）。
+          //
+          // ⚠️ 绝不能用 `AutoclawAuth.loginWithOAuth`（阻塞到授权完成）——
+          // 那会违反「两步式登录必须立即返回 loginUrl」的铁律，
+          // 导致 `window.open` 被浏览器弹窗拦截。
+          //
+          // ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到该账号。
+          const autoclawProduct = provider === AUTOCLAW.id ? AUTOCLAW : AUTOCLAW_INTL
+          const autoclawService = provider === AUTOCLAW.id ? autoclaw : autoclawIntl
+
+          await pool.addAccount({
+            id,
+            provider: autoclawProduct.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let autoclawStarted
+          try {
+            autoclawStarted = await startAutoclawLoginFlow({
+              product: autoclawProduct,
+              auth: autoclawService,
+            })
+          } catch (error) {
+            // 起本地服务器失败（端口被占）：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 AutoClaw 登录（本地登录页启动失败）：${reason}`)
+          }
+
+          autoclawStarted.result.then(async (credential) => {
+            const result = await autoclawService.persistLogin(credential, { refName })
+            const saved = parseAutoclawCredential(result.access)
+            if (saved === undefined) return
+            await pool.updateAccount(id, {
+              // 展示名由产品 + 凭据算出（`AutoClaw 国内版 · <user_id/email>`）。
+              nickname: autoclawDisplayName(autoclawProduct, saved),
+              ...result.expires > 0 ? { expiresAt: result.expires } : {},
+              // AutoClaw **有** refresh 端点（refresh_token 轮换）。
+              refreshable: result.refreshable,
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${autoclawProduct.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: autoclawStarted.loginUrl } }
+        } else if (provider === CATPAW.id) {
+          // CatPaw 走 **passport 会话 + loopback 回调** 网页登录：`startLogin`
+          // 立即返回拼好的登录入口地址（带 state / redirect / sid 三个 query），
+          // 后台等两条通道（浏览器 POST 回本机 / poll-token 兜底）里先到的那条。
+          //
+          // ⚠️ 上游 `login-callback` 页面会把 `{token,state}` **POST 到本机**，
+          //    那是一次「公网页面 → 127.0.0.1」的跨源请求，浏览器会做私有网络
+          //    检查（PNA）—— 回调响应里的 `Access-Control-Allow-Private-Network`
+          //    由 `CatpawAuth` 那边的本地服务器补上（见 `catpaw-auth.ts`）。
+          //
+          // ⚠️ 先登记**占位条目**，使前端 `login.poll` 能立即看到该账号。
+          await pool.addAccount({
+            id,
+            provider: CATPAW.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            // ⚠️ 恒不可续期：CatPaw 没有 refreshToken、没有续期端点。
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          let catpawStarted
+          try {
+            catpawStarted = await catpaw.startLogin()
+          } catch (error) {
+            // 取登录入口失败（网络）：删掉占位条目，不留幽灵账号。
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 CatPaw 登录（获取登录入口失败）：${reason}`)
+          }
+
+          catpawStarted.result.then(async (credential) => {
+            const result = await catpaw.persistLogin(credential, { refName })
+            const saved = parseCatpawCredential(result.access)
+            if (saved === undefined) return
+            await pool.updateAccount(id, {
+              nickname: catpawDisplayName(saved),
+              ...result.expires > 0 ? { expiresAt: result.expires } : {},
+              // ⚠️ 恒 false：本家无续期端点。
+              refreshable: false,
+            })
+          }).catch((error: unknown) => {
+            ctx.logger.warn(`[jet-hub] background ${CATPAW.id} login failed for ${id}: ${String(error)}`)
+            // 登录失败：移除占位条目，避免留下无凭据的幽灵账号
+            void pool.removeAccount(id).catch(() => {})
+          })
+
+          return { ok: true, value: { accountId: id, loginUrl: catpawStarted.loginUrl } }
         } else if (keyedProductById(provider) !== undefined) {
           // 「粘贴 API Key」族（`commandcode` / `opencode`）：**没有登录页也
           // 没有验证码**的渠道。凭据就是用户从平台控制台复制的 API Key，故这里
@@ -563,6 +785,38 @@ export async function handleAccountMethod(
               // 账号池，否则 UI 一直显示「已过期」（真实缺陷：JWT 已续到 15:09、
               // 账号池仍是 12:02，相差 3.1 小时，但功能完全正常）。
               await raccoon.refreshAccountCredential(entry.credentialRef, pool, entry.id)
+              break
+            case ZCODE.id:
+              // ⚠️ ZCode **没有** refresh 端点：这里只能做**有效性探测**，
+              // 失效时抛「请重新登录」。见 ZcodeAuth.refreshAccountCredential。
+              await zcode.refreshAccountCredential(entry.credentialRef)
+              break
+            case ZCODE_INTL.id:
+              // ⚠️ 早期漏这类分支会让账号卡片的「刷新」落到 default 抛
+              // `Unknown provider`（`buddy-intl` / `workbuddy-cn` 都因此坏过）。
+              await zcodeIntl.refreshAccountCredential(entry.credentialRef)
+              break
+            case AUTOCLAW.id:
+              // AutoClaw 国内版：`refresh_token` 轮换（`code 400002` 时降级到
+              // `agent-refresh` 再试一次，见 AutoclawAuth.refresh）。
+              await autoclaw.refreshAccountCredential(entry.credentialRef)
+              break
+            case AUTOCLAW_INTL.id:
+              await autoclawIntl.refreshAccountCredential(entry.credentialRef)
+              break
+            case ACCIO.id:
+              // ⚠️ Accio 的凭据可能「时间上还新但已被服务端失效」，
+              // 故这里传 force=true 不看临期窗口；同时传 pool + accountId
+              // 以便续期成功后把新的 expiresAt 写回账号池。
+              await accio.refreshAccountCredential(entry.credentialRef, pool, entry.id, true)
+              break
+            case ACCIO_CN.id:
+              await accioCn.refreshAccountCredential(entry.credentialRef, pool, entry.id, true)
+              break
+            case CATPAW.id:
+              // ⚠️ CatPaw **没有** refreshToken：这里只能做**有效性探测**，
+              // 失效时抛「请在客户端重新登录后重新导入登录态」。
+              await catpaw.refreshAccountCredential(entry.credentialRef)
               break
             default: {
               // 「粘贴 API Key」族（`commandcode` / `opencode`）：**没有** refresh
